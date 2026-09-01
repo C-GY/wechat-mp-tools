@@ -9,6 +9,7 @@ const ChannelsUserPage = {
     selectedIds: new Set(),
     isDownloadingBatch: false,
     isBatchDownloadingCanceled: false,
+    ossSyncPollTimer: null,
 
     render() {
         return `
@@ -35,7 +36,13 @@ const ChannelsUserPage = {
                                 <h2 id="channels-user-nickname" style="font-size: 1.4rem; font-weight: 700; margin: 0; display: flex; align-items: center; gap: 8px;">加载中...</h2>
                                 <p id="channels-user-id-text" style="font-family: monospace; font-size: 0.85rem; color: var(--text-muted); margin: 6px 0 0 0; word-break: break-all;">ID: -</p>
                             </div>
-                            <div style="display: flex; gap: var(--spacing-sm); align-items: center;">
+                            <div style="display: flex; gap: var(--spacing-sm); align-items: center; flex-wrap: wrap;">
+                                <button class="btn btn-primary" id="btn-sync-current-author-oss" onclick="ChannelsUserPage.syncCurrentAuthorToOSS()" style="font-weight: 500; display: flex; align-items: center; gap: 6px;">
+                                    ☁️ 同步当前作者 OSS
+                                </button>
+                                <button class="btn btn-secondary" id="btn-export-current-author" onclick="ChannelsUserPage.exportCurrentAuthor()" style="font-weight: 500; display: flex; align-items: center; gap: 6px;">
+                                    📊 导出当前创作者 Excel
+                                </button>
                                 <button class="btn btn-secondary" onclick="ChannelsUserPage.loadAuthorVideos()" style="font-weight: 500; display: flex; align-items: center; gap: 6px;">
                                     🔄 刷新作品
                                 </button>
@@ -108,9 +115,17 @@ const ChannelsUserPage = {
                             <h3 class="card-title" style="margin: 0; display: flex; align-items: center; gap: 8px;">
                                 👥 已收藏创作者
                             </h3>
-                            <button class="btn btn-secondary btn-sm" onclick="Router.navigate('channels_accounts')" style="font-size: 0.85rem; padding: 6px 12px; font-weight: 500;">
-                                ➕ 管理创作者/添加新作者
-                            </button>
+                            <div style="display: flex; gap: var(--spacing-sm); align-items: center; flex-wrap: wrap;">
+                                <button class="btn btn-primary btn-sm" id="btn-sync-all-authors-oss" onclick="ChannelsUserPage.syncFavoritesToOSS()" style="font-size: 0.85rem; padding: 6px 12px; font-weight: 500;">
+                                    ☁️ 一键同步 OSS
+                                </button>
+                                <button class="btn btn-secondary btn-sm" id="btn-export-all-authors" onclick="ChannelsUserPage.exportAllAuthors()" style="font-size: 0.85rem; padding: 6px 12px; font-weight: 500;">
+                                    📊 导出全部创作者 Excel
+                                </button>
+                                <button class="btn btn-secondary btn-sm" onclick="Router.navigate('channels_accounts')" style="font-size: 0.85rem; padding: 6px 12px; font-weight: 500;">
+                                    ➕ 管理创作者/添加新作者
+                                </button>
+                            </div>
                         </div>
 
                         <!-- 创作者选择列表 -->
@@ -139,6 +154,8 @@ const ChannelsUserPage = {
     },
 
     destroy() {
+        if (this.ossSyncPollTimer) clearTimeout(this.ossSyncPollTimer);
+        this.ossSyncPollTimer = null;
         this.username = '';
         this.authorInfo = null;
         this.videos = [];
@@ -292,6 +309,8 @@ const ChannelsUserPage = {
     async loadSelectorFavorites() {
         const grid = document.getElementById('selector-favorites-grid');
         const empty = document.getElementById('selector-favorites-empty');
+        const exportButton = document.getElementById('btn-export-all-authors');
+        const ossButton = document.getElementById('btn-sync-all-authors-oss');
         if (!grid || !empty) return;
 
         grid.innerHTML = '<div class="spinner" style="grid-column: 1/-1; margin: 40px auto;"></div>';
@@ -300,11 +319,15 @@ const ChannelsUserPage = {
         try {
             const favs = await API.channels.getFavorites();
             if (!favs || favs.length === 0) {
+                if (exportButton) exportButton.disabled = true;
+                if (ossButton) ossButton.disabled = true;
                 grid.style.display = 'none';
                 empty.style.display = 'block';
                 return;
             }
 
+            if (exportButton) exportButton.disabled = false;
+            if (ossButton) ossButton.disabled = false;
             empty.style.display = 'none';
             grid.style.display = 'grid';
 
@@ -333,6 +356,143 @@ const ChannelsUserPage = {
         }
     },
 
+    async exportAllAuthors() {
+        await this.exportAuthorsData('', 'btn-export-all-authors', '📊 导出全部创作者 Excel');
+    },
+
+    async syncFavoritesToOSS() {
+        const button = document.getElementById('btn-sync-all-authors-oss');
+        try {
+            if (button) { button.disabled = true; button.textContent = '⏳ 正在创建任务...'; }
+            const result = await API.oss.syncFavorites();
+            Toast.success(`${result.message || 'OSS 同步任务已创建'}，共 ${Number(result.total || 0)} 个作品`);
+            Router.navigate('channels_oss_progress');
+        } catch (error) {
+            const message = error.message || String(error);
+            if (message.includes('配置')) {
+                Toast.warning('请先完成 OSS 配置');
+                Router.navigate('channels_oss_config');
+            } else {
+                Toast.error(`OSS 同步启动失败：${message}`);
+            }
+        } finally {
+            if (button) { button.disabled = false; button.textContent = '☁️ 一键同步 OSS'; }
+        }
+    },
+
+    async syncCurrentAuthorToOSS() {
+        if (!this.username) {
+            Toast.warning('未找到当前创作者');
+            return;
+        }
+        const button = document.getElementById('btn-sync-current-author-oss');
+        const username = this.username;
+        try {
+            if (this.ossSyncPollTimer) clearTimeout(this.ossSyncPollTimer);
+            this.ossSyncPollTimer = null;
+            if (button) {
+                button.disabled = true;
+                button.textContent = '⏳ 正在创建 OSS 任务...';
+            }
+            const result = await API.oss.syncAuthor(username);
+            Toast.success(`${result.message || 'OSS 同步任务已创建'}，共 ${Number(result.total || 0)} 个作品`);
+            await this.pollCurrentAuthorOssSync(result.batch_id, username);
+        } catch (error) {
+            const message = error.message || String(error);
+            if (button) {
+                button.disabled = false;
+                button.textContent = '☁️ 同步当前作者 OSS';
+            }
+            if (message.includes('配置')) {
+                Toast.warning('请先完成 OSS 配置');
+                Router.navigate('channels_oss_config');
+            } else {
+                Toast.error(`当前作者 OSS 同步启动失败：${message}`);
+            }
+        }
+    },
+
+    async pollCurrentAuthorOssSync(batchId, username) {
+        if (!batchId || this.username !== username) return;
+        const button = document.getElementById('btn-sync-current-author-oss');
+        try {
+            const result = await API.oss.getUploads();
+            const items = (result.items || []).filter(item => item.batch_id === batchId);
+            const active = items.filter(item => ['pending', 'downloading', 'uploading'].includes(item.status));
+            const finished = items.length - active.length;
+            if (button) {
+                button.disabled = true;
+                button.textContent = `☁️ OSS 同步中 ${finished}/${items.length || '—'}`;
+            }
+
+            if (active.length > 0 || (result.running && items.length === 0)) {
+                this.ossSyncPollTimer = setTimeout(
+                    () => this.pollCurrentAuthorOssSync(batchId, username),
+                    1000
+                );
+                return;
+            }
+
+            this.ossSyncPollTimer = null;
+            const failed = items.filter(item => item.status === 'failed').length;
+            await this.loadAuthorVideos();
+            if (button) {
+                button.disabled = false;
+                button.textContent = '☁️ 同步当前作者 OSS';
+            }
+            if (failed) {
+                Toast.warning(`OSS 同步结束：成功 ${items.length - failed} 个，失败 ${failed} 个，可到“OSS 上传进度”查看原因`);
+            } else {
+                Toast.success(`当前作者 OSS 同步完成，共 ${items.length} 个作品`);
+            }
+        } catch (error) {
+            this.ossSyncPollTimer = null;
+            if (button) {
+                button.disabled = false;
+                button.textContent = '☁️ 同步当前作者 OSS';
+            }
+            Toast.error(`读取 OSS 同步进度失败：${error.message || error}`);
+        }
+    },
+
+    async exportCurrentAuthor() {
+        if (!this.username) {
+            Toast.warning('未找到当前创作者');
+            return;
+        }
+        await this.exportAuthorsData(
+            this.username,
+            'btn-export-current-author',
+            '📊 导出当前创作者 Excel'
+        );
+    },
+
+    async exportAuthorsData(username, buttonId, idleText) {
+        const button = document.getElementById(buttonId);
+        if (button) {
+            button.disabled = true;
+            button.textContent = '⏳ 正在导出...';
+        }
+
+        try {
+            const result = await API.channels.exportAuthors(username, { showError: false });
+            const summary = `Excel 已导出 ${Number(result.creator_count || 0)} 个创作者、${Number(result.video_count || 0)} 个作品`;
+            try {
+                await API.channels.openParent(result.path, { showError: false });
+                Toast.success(`${summary}，已打开文件位置`);
+            } catch (_) {
+                Toast.warning(`${summary}，但无法自动打开文件位置：${result.path}`);
+            }
+        } catch (err) {
+            Toast.error('导出创作者数据失败：' + (err.message || '未知错误'));
+        } finally {
+            if (button) {
+                button.disabled = false;
+                button.textContent = idleText;
+            }
+        }
+    },
+
     renderVideos() {
         const grid = document.getElementById('channels-user-videos-grid');
         const empty = document.getElementById('channels-user-videos-empty');
@@ -358,6 +518,8 @@ const ChannelsUserPage = {
 
         grid.innerHTML = this.videos.map((video, videoIndex) => {
             const isChecked = this.selectedIds.has(video.id);
+            const rawOssUrl = String(video.oss_video_url || '').trim();
+            const ossUrl = /^https?:\/\//i.test(rawOssUrl) ? rawOssUrl : '';
             const pubDate = this.formatDate(video.createtime);
             const durationSeconds = video.duration_seconds ?? video.duration ?? video.videoDuration ?? video.videoPlayLen ?? 0;
             const durationText = this.formatDuration(durationSeconds);
@@ -444,7 +606,12 @@ const ChannelsUserPage = {
                         </div>
 
                         <!-- 底部动作条 -->
-                        <div style="display: flex; gap: var(--spacing-xs); margin-top: auto; border-top: 1px solid rgba(0,0,0,0.05); padding-top: var(--spacing-sm);" onclick="event.stopPropagation()">
+                        <div style="display: flex; flex-wrap: wrap; gap: var(--spacing-xs); margin-top: auto; border-top: 1px solid rgba(0,0,0,0.05); padding-top: var(--spacing-sm);" onclick="event.stopPropagation()">
+                            ${ossUrl ? `
+                                <a class="btn btn-primary btn-sm" href="${this.attr(ossUrl)}" target="_blank" rel="noopener noreferrer" style="flex: 1 1 100%; font-size: 0.8rem; padding: 6px; border-radius: 6px; text-align: center;" title="打开 OSS 视频">
+                                    ☁️ 查看 OSS 视频
+                                </a>
+                            ` : ''}
                             ${isDownloaded && downloadedItem.path ? `
                                 <button class="btn btn-secondary btn-sm" data-action="open-local-parent" data-local-path-index="${videoIndex}" style="flex: 1; font-size: 0.8rem; padding: 6px; border-radius: 6px;">
                                     📂 定位文件夹
@@ -823,5 +990,9 @@ const ChannelsUserPage = {
         const div = document.createElement("div");
         div.textContent = s;
         return div.innerHTML;
+    },
+
+    attr(s) {
+        return this.esc(s).replace(/`/g, '&#96;');
     }
 };

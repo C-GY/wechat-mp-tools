@@ -3,6 +3,7 @@
 微信视频号视频在线解析与下载模块
 """
 
+import json
 import re
 import sys
 import time
@@ -21,6 +22,69 @@ channels_bp = Blueprint("channels", __name__, url_prefix="/api/channels")
 CHANNELS_HISTORY_FILE = DATA_DIR / "channels_history.json"
 CHANNELS_FAVORITES_FILE = DATA_DIR / "channels_favorites.json"
 CHANNELS_FEEDS_FILE = DATA_DIR / "channels_parsed_feeds.json"
+
+
+def build_authors_export_payload(favorites, feeds_db, username=None):
+    """Build a complete, portable export for all favorites or one author."""
+    favorites = favorites if isinstance(favorites, list) else []
+    feeds_db = feeds_db if isinstance(feeds_db, dict) else {}
+    requested_username = str(username or "").strip()
+
+    if requested_username:
+        selected = [
+            favorite for favorite in favorites
+            if str((favorite or {}).get("username") or "").strip() == requested_username
+        ]
+        if not selected:
+            if requested_username not in feeds_db:
+                raise ValueError("未找到当前创作者的数据")
+            selected = [{
+                "username": requested_username,
+                "nickname": requested_username,
+                "head_img_url": "",
+                "video_url": "",
+            }]
+    else:
+        selected = favorites
+        if not selected:
+            raise ValueError("暂无已收藏创作者可导出")
+
+    creators = []
+    total_videos = 0
+    seen_usernames = set()
+    for favorite in selected:
+        favorite = favorite if isinstance(favorite, dict) else {}
+        author_username = str(favorite.get("username") or "").strip()
+        if not author_username or author_username in seen_usernames:
+            continue
+        seen_usernames.add(author_username)
+
+        nickname = str(favorite.get("nickname") or author_username).strip()
+        videos = feeds_db.get(author_username)
+        if videos is None and nickname:
+            # Older data files may use the nickname as the feed database key.
+            videos = feeds_db.get(nickname)
+        videos = videos if isinstance(videos, list) else []
+
+        creator = dict(favorite)
+        creator["username"] = author_username
+        creator["nickname"] = nickname
+        creator["video_count"] = len(videos)
+        creator["videos"] = videos
+        creators.append(creator)
+        total_videos += len(videos)
+
+    if not creators:
+        raise ValueError("暂无有效的创作者数据可导出")
+
+    return {
+        "format_version": 1,
+        "scope": "single_author" if requested_username else "all_favorites",
+        "exported_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "creator_count": len(creators),
+        "video_count": total_videos,
+        "creators": creators,
+    }
 
 
 _INTERACTION_METRIC_KEYS = {
@@ -996,6 +1060,57 @@ def add_author_video(username):
 
     save_json(CHANNELS_FEEDS_FILE, feeds_db)
     return jsonify({"message": "视频已保存到作者作品列表", "videos": feeds_db[username]})
+
+
+@channels_bp.route("/export-authors", methods=["POST"])
+def export_authors():
+    """Export saved author metadata and all locally parsed works as Excel."""
+    from backend.channels_excel import write_channels_export_xlsx
+
+    data = request.get_json(silent=True) or {}
+    username = str(data.get("username") or "").strip()
+    favorites = load_json(CHANNELS_FAVORITES_FILE, [])
+    feeds_db = load_json(CHANNELS_FEEDS_FILE, {})
+
+    try:
+        payload = build_authors_export_payload(
+            favorites,
+            feeds_db,
+            username=username or None,
+        )
+    except ValueError as ex:
+        return jsonify({"error": str(ex)}), 404
+
+    from backend.oss import get_oss_config
+    payload["oss_configured"] = get_oss_config()["configured"]
+
+    base_download_dir = Path(get_settings().get("download_dir") or str(OUTPUT_DIR))
+    export_dir = base_download_dir / "channels" / "exports"
+    export_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    if username:
+        nickname = payload["creators"][0].get("nickname") or username
+        safe_name = re.sub(r'[\\/:*?"<>|\r\n]', "", str(nickname)).strip()[:60]
+        filename = f"视频号_{safe_name or '创作者'}_{timestamp}.xlsx"
+    else:
+        filename = f"视频号_全部收藏创作者_{timestamp}.xlsx"
+
+    export_path = export_dir / filename
+    suffix = 2
+    while export_path.exists():
+        export_path = export_dir / f"{Path(filename).stem}_{suffix}.xlsx"
+        suffix += 1
+    filename = export_path.name
+    write_channels_export_xlsx(payload, export_path)
+    return jsonify({
+        "message": "创作者数据已导出为 Excel",
+        "path": str(export_path),
+        "filename": filename,
+        "format": "xlsx",
+        "creator_count": payload["creator_count"],
+        "video_count": payload["video_count"],
+    })
 
 
 @channels_bp.route("/refresh-favorites/start", methods=["POST"])

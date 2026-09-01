@@ -1,4 +1,4 @@
-# 微信公众号 / 视频号 / 抖音 / 快手 / 小红书 / 哔哩哔哩 下载与转码工具箱
+# 自媒体内容采集工具
 
 一个本地运行的一站式多平台内容下载与管理工具，支持微信公众号、视频号、抖音、快手、小红书、哔哩哔哩资源离线下载、RSS 订阅及视频转码。
 
@@ -6,7 +6,7 @@
 
 > [!TIP]
 > **开箱即用，无需配置本地 Python 开发环境！**
-> 本项目已通过 GitHub Actions 自动构建 Windows 与 macOS 双平台客户端。请直接前往 [👉 GitHub Releases 下载最新版本](https://github.com/x554960766/wechat-mp-tools/releases)。
+> 本项目提供 Windows 与 macOS 双平台客户端，请从内部发布渠道获取最新版本。
 ### macOS 版本选择
 
 | Mac 类型 | 下载版本 |
@@ -80,9 +80,8 @@
 如果你需要直接运行源码或进行二次开发：
 
 ```bash
-# 1. 克隆代码
-git clone https://github.com/x554960766/wechat-mp-tools.git
-cd wechat-mp-tools
+# 1. 进入源码目录
+cd videoDownloadTools
 
 # 2. 安装依赖
 pip install -r requirements.txt

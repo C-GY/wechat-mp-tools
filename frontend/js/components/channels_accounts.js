@@ -77,6 +77,9 @@ const ChannelsAccountsPage = {
                         <button class="btn btn-primary btn-sm" id="btn-refresh-all-favorites" onclick="ChannelsAccountsPage.startFavoritesRefresh()" style="font-size: 0.85rem; padding: 6px 12px; font-weight: 500;">
                             ⚡ 一键刷新全部收藏
                         </button>
+                        <button class="btn btn-primary btn-sm" id="btn-sync-favorites-oss" onclick="ChannelsAccountsPage.syncFavoritesToOSS()" style="font-size: 0.85rem; padding: 6px 12px; font-weight: 500;">
+                            ☁️ 一键同步 OSS
+                        </button>
                         <button class="btn btn-secondary btn-sm" onclick="ChannelsAccountsPage.loadFavorites()" style="font-size: 0.85rem; padding: 6px 12px; font-weight: 500;">🔄 刷新列表</button>
                     </div>
                 </div>
@@ -89,7 +92,7 @@ const ChannelsAccountsPage = {
                     <div style="height: 6px; border-radius: 999px; overflow: hidden; background: rgba(0,0,0,0.08);">
                         <div id="favorites-refresh-progress-bar" style="width: 0%; height: 100%; background: var(--primary); transition: width 0.25s ease;"></div>
                     </div>
-                    <div id="favorites-refresh-detail" style="margin-top: 7px; font-size: 0.78rem; color: var(--text-muted);">请在微信中保持任意视频号页面打开。</div>
+                    <div id="favorites-refresh-detail" style="margin-top: 7px; font-size: 0.78rem; color: var(--text-muted);">系统将自动检测微信环境并打开视频号，无需手动准备。</div>
                 </div>
 
                 <!-- 创作者网格 -->
@@ -319,8 +322,22 @@ const ChannelsAccountsPage = {
         }
         if (this.activeRefreshTaskId) return;
 
-        this.setFavoritesRefreshButton(true);
+        this.setFavoritesRefreshButton(true, '⏳ 正在检测微信...');
+        this.updateFavoritesRefreshStatus({
+            status: 'preparing',
+            total_authors: this.favorites.length,
+            completed_authors: 0,
+            failed_authors: 0,
+            total_videos: 0,
+            message: '正在检测微信环境并自动打开视频号…',
+        });
         try {
+            const environment = await API.channels.openWechatChannels({ showError: false });
+            if (!environment.monitoring_active) {
+                Toast.warning(environment.message || '视频号已打开，正在等待页面联网');
+            }
+
+            this.setFavoritesRefreshButton(true, '⏳ 正在创建刷新任务...');
             const task = await API.channels.startFavoritesRefresh();
             this.activeRefreshTaskId = task.task_id;
             try {
@@ -332,16 +349,53 @@ const ChannelsAccountsPage = {
             }
             this.pollFavoritesRefresh(task.task_id);
         } catch (err) {
+            this.activeRefreshTaskId = null;
+            try {
+                localStorage.removeItem('channelsFavoritesRefreshTaskId');
+            } catch (_) {}
             this.setFavoritesRefreshButton(false);
-            Toast.error('启动刷新失败: ' + (err.message || '未知错误'));
+            const message = '自动刷新启动失败：' + (err.message || '未知错误');
+            this.updateFavoritesRefreshStatus({
+                status: 'failed',
+                total_authors: this.favorites.length,
+                completed_authors: 0,
+                failed_authors: 0,
+                total_videos: 0,
+                message,
+            });
+            Toast.error(message);
         }
     },
 
-    setFavoritesRefreshButton(running) {
+    async syncFavoritesToOSS() {
+        if (this.favorites.length === 0) {
+            Toast.warning('暂无已收藏创作者');
+            return;
+        }
+        const button = document.getElementById('btn-sync-favorites-oss');
+        try {
+            if (button) { button.disabled = true; button.textContent = '⏳ 正在创建任务...'; }
+            const result = await API.oss.syncFavorites();
+            Toast.success(`${result.message || 'OSS 同步任务已创建'}，共 ${Number(result.total || 0)} 个作品`);
+            Router.navigate('channels_oss_progress');
+        } catch (error) {
+            const message = error.message || String(error);
+            if (message.includes('配置')) {
+                Toast.warning('请先完成 OSS 配置');
+                Router.navigate('channels_oss_config');
+            } else {
+                Toast.error(`OSS 同步启动失败：${message}`);
+            }
+        } finally {
+            if (button) { button.disabled = false; button.textContent = '☁️ 一键同步 OSS'; }
+        }
+    },
+
+    setFavoritesRefreshButton(running, runningText = '⏳ 正在刷新收藏...') {
         const button = document.getElementById('btn-refresh-all-favorites');
         if (!button) return;
         button.disabled = running;
-        button.textContent = running ? '⏳ 正在刷新收藏...' : '⚡ 一键刷新全部收藏';
+        button.textContent = running ? runningText : '⚡ 一键刷新全部收藏';
     },
 
     updateFavoritesRefreshStatus(status) {
@@ -363,9 +417,15 @@ const ChannelsAccountsPage = {
         text.textContent = status.message || '正在刷新收藏创作者...';
         progressText.textContent = `${processed}/${total}`;
         progressBar.style.width = `${percent}%`;
-        detail.textContent = status.status === 'waiting'
-            ? '等待微信响应：请打开并保持任意微信视频号首页或作者页。'
-            : `已同步作品 ${Number(status.total_videos || 0)} 个${status.current_nickname ? ` · 当前：${status.current_nickname}` : ''}`;
+        if (status.status === 'preparing') {
+            detail.textContent = '正在启动同步助手、检测微信进程并打开视频号入口。';
+        } else if (status.status === 'waiting') {
+            detail.textContent = '视频号已自动打开，正在等待微信页面接收刷新任务。';
+        } else if (status.status === 'failed' || status.status === 'cancelled') {
+            detail.textContent = '请根据上方提示处理异常后重试。';
+        } else {
+            detail.textContent = `已同步作品 ${Number(status.total_videos || 0)} 个${status.current_nickname ? ` · 当前：${status.current_nickname}` : ''}`;
+        }
 
         if (status.status === 'failed' || status.status === 'cancelled') {
             container.style.background = 'rgba(245,87,108,0.06)';

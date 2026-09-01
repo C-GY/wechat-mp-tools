@@ -206,21 +206,38 @@ const API = {
         getHistory() { return API.get('/api/channels/history'); },
         clearHistory() { return API.delete('/api/channels/history'); },
         openFile(path) { return API.post('/api/channels/open-file', { path }); },
-        openParent(path) { return API.post('/api/channels/open-parent', { path }); },
+        openParent(path, opts) { return API.post('/api/channels/open-parent', { path }, opts); },
         getFavorites() { return API.get('/api/channels/favorites'); },
         addFavorite(author) { return API.post('/api/channels/favorites', author); },
         removeFavorite(username) { return API.delete(`/api/channels/favorites/${username}`); },
         getAuthorVideos(username) { return API.get(`/api/channels/author-videos/${username}`); },
         addAuthorVideo(username, feed) { return API.post(`/api/channels/author-videos/${username}`, feed); },
+        exportAuthors(username = '', opts) { return API.post('/api/channels/export-authors', username ? { username } : {}, opts); },
         startFavoritesRefresh() { return API.post('/api/channels/refresh-favorites/start'); },
         getFavoritesRefreshStatus(taskId) { return API.get(`/api/channels/refresh-favorites/status/${taskId}`, { showError: false }); },
-        openWechatChannels() { return API.post('/api/channels/wechat/open-channels'); },
+        openWechatChannels(opts) { return API.post('/api/channels/wechat/open-channels', null, opts); },
         getProxyStatus() { return API.get('/api/channels/proxy/status'); },
         startProxy() { return API.post('/api/channels/proxy/start'); },
         stopProxy() { return API.post('/api/channels/proxy/stop'); },
         installCert() { return API.post('/api/channels/proxy/install-cert'); },
         uninstallCert() { return API.post('/api/channels/proxy/uninstall-cert'); },
         clearCache() { return API.post('/api/channels/clear-cache'); },
+    },
+
+    // ── OSS API ─────────────────────────────────────
+    oss: {
+        getConfig() { return API.get('/api/oss/config', { showError: false }); },
+        saveConfig(accessKeyId, accessKeySecret = '') {
+            return API.post('/api/oss/config', {
+                access_key_id: accessKeyId,
+                access_key_secret: accessKeySecret,
+            });
+        },
+        clearConfig() { return API.delete('/api/oss/config'); },
+        syncFavorites() { return API.post('/api/oss/sync-favorites'); },
+        syncAuthor(username) { return API.post('/api/oss/sync-author', { username }); },
+        getUploads() { return API.get('/api/oss/uploads', { showError: false }); },
+        clearFinishedUploads() { return API.delete('/api/oss/uploads/finished'); },
     },
 
     // ── Video Transcoder API ─────────────────────────
@@ -291,14 +308,6 @@ const API = {
         openFolder(account = '')    { return API.post('/api/xhs/open-folder', { account }); },
         openFile(path)              { return API.post('/api/xhs/open-file', { path }); },
         openParent(path)            { return API.post('/api/xhs/open-parent', { path }); },
-    },
-
-    // ── Version Update API ──────────────────────────────
-    version: {
-        check()         { return API.get('/api/version/check', { showError: false }); },
-        download(url)   { return API.post('/api/version/download', { url }); },
-        progress()      { return API.get('/api/version/download-progress', { showError: false }); },
-        openFolder()    { return API.post('/api/version/open-update-folder'); },
     },
 
     // ── Bilibili Downloader API ──────────────────────────

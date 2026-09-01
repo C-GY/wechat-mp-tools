@@ -1,11 +1,10 @@
 /**
- * 微信公众号文章下载管理工具 — 全局应用管理器
+ * 自媒体内容采集工具 — 全局应用管理器
  */
 const App = {
     ffmpegAvailable: true,
     isDouyinLoggedIn: false,
     douyinAccountInfo: null,
-    _updateInfo: null,
 
     async init() {
         console.log('App initializing...');
@@ -13,6 +12,9 @@ const App = {
         // 初始化基础组件
         Toast.init();
         Modal.init();
+
+        // 固定侧边导航顺序，并移除历史 DOM 中遗留的分隔节点。
+        this.orderNavigationGroups();
 
         // 首次加载认证状态（非阻塞，不影响页面首屏渲染速度）
         this.checkAuthStatus();
@@ -33,8 +35,28 @@ const App = {
         // 启动定时状态检查 (每 30 秒检查一次登录态)
         setInterval(() => this.checkAuthStatus(), 30000);
 
-        // 延迟 3 秒检查版本更新（非阻塞）
-        setTimeout(() => this.checkForUpdates(), 3000);
+    },
+
+    orderNavigationGroups() {
+        const nav = document.querySelector('.sidebar-nav');
+        if (!nav) return;
+        nav.querySelectorAll(':scope > .nav-divider').forEach(divider => divider.remove());
+        const order = [
+            'wechat_channels', 'douyin', 'kuaishou', 'xiaohongshu',
+            'bilibili', 'wechat', 'common',
+        ];
+        order.forEach((group, index) => {
+            const title = nav.querySelector(`:scope > .nav-group-title[data-group="${group}"]`);
+            const items = document.getElementById(`items-${group}`);
+            if (!title || !items) return;
+            if (index > 0) {
+                const divider = document.createElement('div');
+                divider.className = 'nav-divider';
+                nav.appendChild(divider);
+            }
+            nav.appendChild(title);
+            nav.appendChild(items);
+        });
     },
 
     async checkAuthStatus() {
@@ -317,229 +339,6 @@ const App = {
                 console.error("Polling error:", err);
             }
         }, 1000);
-    },
-
-    async checkForUpdates() {
-        try {
-            const data = await API.version.check();
-            if (data) {
-                this._updateInfo = data;
-                if (data.has_update) {
-                    const dot = document.getElementById('update-dot');
-                    if (dot) dot.style.display = 'inline-block';
-                    const versionText = document.getElementById('version-text');
-                    if (versionText) {
-                        versionText.textContent = `Media Tools v${data.current_version} (有新版本)`;
-                        versionText.style.color = '#ff9500';
-                    }
-                } else {
-                    const dot = document.getElementById('update-dot');
-                    if (dot) dot.style.display = 'none';
-                    const versionText = document.getElementById('version-text');
-                    if (versionText) {
-                        versionText.textContent = `Media Tools v${data.current_version}`;
-                        versionText.style.color = '';
-                    }
-                }
-            }
-        } catch (e) {
-            console.log('Version check skipped:', e.message);
-        }
-    },
-
-    async showUpdateModal() {
-        // 打开加载中提示弹窗
-        Modal.open({
-            title: '🔄 正在检查更新',
-            content: `
-                <div style="padding: 30px 0; text-align: center;">
-                    <div class="loading-spinner" style="margin: 0 auto 16px; border: 3px solid var(--border-color); border-top: 3px solid var(--primary); border-radius: 50%; width: 32px; height: 32px; animation: spin 1s linear infinite;"></div>
-                    <p style="color: var(--text-secondary); font-size: 0.95rem;">正在获取 GitHub 最新版本信息，请稍候...</p>
-                </div>
-            `,
-            footer: '<button class="btn btn-secondary" onclick="Modal.close()" style="width: 100%;">取消</button>'
-        });
-
-        // 动态注入旋转动画的 CSS（如果不存在的话）
-        if (!document.getElementById('update-spinner-style')) {
-            const style = document.createElement('style');
-            style.id = 'update-spinner-style';
-            style.innerHTML = `@keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }`;
-            document.head.appendChild(style);
-        }
-
-        try {
-            const data = await API.version.check();
-            if (!data) {
-                throw new Error('未获取到版本响应数据');
-            }
-            if (data.error) {
-                throw new Error(data.error);
-            }
-
-            this._updateInfo = data;
-
-            // 同步更新侧边栏状态
-            if (data.has_update) {
-                const dot = document.getElementById('update-dot');
-                if (dot) dot.style.display = 'inline-block';
-                const versionText = document.getElementById('version-text');
-                if (versionText) {
-                    versionText.textContent = `Media Tools v${data.current_version} (有新版本)`;
-                    versionText.style.color = '#ff9500';
-                }
-            } else {
-                const dot = document.getElementById('update-dot');
-                if (dot) dot.style.display = 'none';
-                const versionText = document.getElementById('version-text');
-                if (versionText) {
-                    versionText.textContent = `Media Tools v${data.current_version}`;
-                    versionText.style.color = '';
-                }
-            }
-
-            // 先关闭加载弹窗
-            Modal.close();
-
-            // 若没有更新，展示“已是最新版本”
-            if (!data.has_update) {
-                Modal.open({
-                    title: '🔄 版本检查',
-                    content: `
-                        <div style="padding: 10px 0; text-align: center;">
-                            <p style="font-size: 1.1rem; font-weight: 600; color: var(--success); margin-bottom: 8px;">✅ 已是最新版本</p>
-                            <p style="color: var(--text-secondary);">当前版本 v${data.current_version || '1.3.0'}</p>
-                        </div>
-                    `,
-                    footer: '<button class="btn btn-primary" onclick="Modal.close()" style="width: 100%;">关闭</button>'
-                });
-                return;
-            }
-
-            // 发现更新，展示新版本说明
-            const notes = (data.release_notes || '暂无更新说明').replace(/\n/g, '<br>');
-            const sizeStr = data.asset_size ? `(${(data.asset_size / 1024 / 1024).toFixed(1)} MB)` : '';
-
-            Modal.open({
-                title: '🎉 发现新版本',
-                content: `
-                    <div style="padding: 10px 0;">
-                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; padding: 12px 16px; background: var(--bg-glass); border-radius: var(--radius-md); border: 1px solid var(--border-color);">
-                            <div>
-                                <div style="font-size: 0.8rem; color: var(--text-muted); margin-bottom: 4px;">当前版本</div>
-                                <div style="font-size: 1rem; font-weight: 600;">v${data.current_version}</div>
-                            </div>
-                            <div style="font-size: 1.2rem; color: var(--text-muted);">→</div>
-                            <div>
-                                <div style="font-size: 0.8rem; color: var(--text-muted); margin-bottom: 4px;">最新版本</div>
-                                <div style="font-size: 1rem; font-weight: 600; color: var(--success);">v${data.latest_version}</div>
-                            </div>
-                        </div>
-                        <div style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 16px; max-height: 150px; overflow-y: auto; padding: 12px; background: var(--bg-input); border-radius: var(--radius-sm); line-height: 1.6;">
-                            <strong style="color: var(--text-primary);">更新说明：</strong><br>${notes}
-                        </div>
-                        <div id="update-download-area">
-                            ${data.download_url ? `<button class="btn btn-primary" onclick="App.startUpdateDownload()" id="btn-start-update" style="width: 100%;">📥 下载更新包 ${sizeStr}</button>` : `<a href="${data.release_url}" target="_blank" class="btn btn-primary" style="width: 100%; text-decoration: none; text-align: center; display: block; line-height: 2.4;">前往 GitHub 下载</a>`}
-                        </div>
-                        <div id="update-progress-area" style="display: none;">
-                            <div style="background: var(--bg-input); border-radius: 8px; height: 16px; overflow: hidden; margin-bottom: 12px;">
-                                <div id="update-progress-bar" style="background: var(--gradient-primary); height: 100%; width: 0%; transition: width 0.3s; border-radius: 8px;"></div>
-                            </div>
-                            <div style="display: flex; justify-content: space-between; font-size: 0.85rem;">
-                                <span id="update-progress-text" style="color: var(--text-secondary);">准备下载...</span>
-                                <span id="update-progress-pct" style="font-weight: 600; color: var(--primary);">0%</span>
-                            </div>
-                        </div>
-                        <div id="update-done-area" style="display: none; text-align: center;">
-                            <p style="color: var(--success); font-weight: 600; margin-bottom: 12px;">✅ 下载完成！</p>
-                            <p style="color: var(--text-secondary); font-size: 0.85rem; margin-bottom: 16px;">请关闭当前程序后，解压新版本覆盖旧文件即可完成更新。</p>
-                            <button class="btn btn-primary" onclick="App.openUpdateFolder()" style="width: 100%;">📂 打开下载目录</button>
-                        </div>
-                    </div>
-                `,
-                footer: `
-                    <div style="display: flex; gap: 8px; width: 100%;">
-                        ${data.release_url ? `<a href="${data.release_url}" target="_blank" class="btn btn-secondary" style="flex: 1; text-decoration: none; text-align: center; line-height: 2.4;">GitHub 页面</a>` : ''}
-                        <button class="btn btn-secondary" onclick="Modal.close()" style="flex: 1;">关闭</button>
-                    </div>
-                `
-            });
-
-        } catch (err) {
-            console.error('Update check failed:', err);
-            Modal.close();
-            Modal.open({
-                title: '❌ 检查更新失败',
-                content: `
-                    <div style="padding: 10px 0; text-align: center;">
-                        <p style="font-size: 1.1rem; font-weight: 600; color: #ff3b30; margin-bottom: 8px;">检查更新时出错</p>
-                        <p style="color: var(--text-secondary); font-size: 0.85rem; word-break: break-all; margin-bottom: 12px;">${err.message || '网络连接超时，请检查网络或代理配置'}</p>
-                    </div>
-                `,
-                footer: `
-                    <div style="display: flex; gap: 8px; width: 100%;">
-                        <button class="btn btn-primary" onclick="App.showUpdateModal()" style="flex: 1;">重新检查</button>
-                        <button class="btn btn-secondary" onclick="Modal.close()" style="flex: 1;">关闭</button>
-                    </div>
-                `
-            });
-        }
-    },
-
-    async startUpdateDownload() {
-        const info = this._updateInfo;
-        if (!info || !info.download_url) return;
-
-        const btn = document.getElementById('btn-start-update');
-        if (btn) btn.style.display = 'none';
-        const progressArea = document.getElementById('update-progress-area');
-        if (progressArea) progressArea.style.display = 'block';
-
-        try {
-            await API.version.download(info.download_url);
-        } catch (e) {
-            Toast.error('启动下载失败: ' + e.message);
-            return;
-        }
-
-        const pollId = setInterval(async () => {
-            try {
-                const st = await API.version.progress();
-                const bar = document.getElementById('update-progress-bar');
-                const text = document.getElementById('update-progress-text');
-                const pct = document.getElementById('update-progress-pct');
-
-                if (st.status === 'downloading') {
-                    const p = st.progress || 0;
-                    if (bar) bar.style.width = `${p}%`;
-                    if (pct) pct.textContent = `${p}%`;
-                    const dlMB = (st.downloaded / 1024 / 1024).toFixed(1);
-                    const totalMB = st.total_size ? (st.total_size / 1024 / 1024).toFixed(1) : '?';
-                    if (text) text.textContent = `${dlMB} MB / ${totalMB} MB`;
-                } else if (st.status === 'done') {
-                    clearInterval(pollId);
-                    if (progressArea) progressArea.style.display = 'none';
-                    const doneArea = document.getElementById('update-done-area');
-                    if (doneArea) doneArea.style.display = 'block';
-                } else if (st.status === 'error') {
-                    clearInterval(pollId);
-                    Toast.error('下载失败: ' + (st.error || '未知错误'));
-                    if (progressArea) progressArea.style.display = 'none';
-                    const downloadArea = document.getElementById('update-download-area');
-                    if (downloadArea) downloadArea.innerHTML = `<button class="btn btn-primary" onclick="App.startUpdateDownload()" style="width: 100%;">🔄 重试下载</button>`;
-                }
-            } catch (e) {
-                console.error('Update progress poll error:', e);
-            }
-        }, 500);
-    },
-
-    async openUpdateFolder() {
-        try {
-            await API.version.openFolder();
-        } catch (e) {
-            Toast.error('打开目录失败');
-        }
     },
 
     async ensureFFmpeg(onSuccess) {

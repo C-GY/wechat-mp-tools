@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-微信公众号文章下载管理工具 — 桌面端应用启动器
+自媒体内容采集工具 — 桌面端应用启动器
 利用 pywebview 渲染原生窗口，彻底摆脱控制台黑窗口和外部浏览器跳转
 """
 
@@ -294,7 +294,7 @@ if __name__ == '__main__':
 
         # 创建桌面端原生容器窗口
         window = webview.create_window(
-            title='微信公众号文章下载管理工具',
+            title='自媒体内容采集工具',
             url=f'http://127.0.0.1:{port}/',
             width=1280,
             height=800,

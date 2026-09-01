@@ -1,5 +1,5 @@
 /* ============================================================
-   微信公众号文章下载管理工具 — 设计系统
+   自媒体内容采集工具 — 设计系统
    Premium Dark Theme with Glassmorphism
    ============================================================ */
 
@@ -154,6 +154,10 @@ body {
     gap: var(--spacing-md);
 }
 
+.logo-text {
+    min-width: 0;
+}
+
 .logo-icon {
     width: 40px;
     height: 40px;
@@ -173,9 +177,10 @@ body {
 }
 
 .logo-text h1 {
-    font-size: 1.15rem;
+    font-size: 0.88rem;
     font-weight: 700;
-    letter-spacing: -0.02em;
+    letter-spacing: -0.06em;
+    white-space: nowrap;
     background: var(--gradient-primary);
     -webkit-background-clip: text;
     -webkit-text-fill-color: transparent;
@@ -183,7 +188,8 @@ body {
 }
 
 .logo-subtitle {
-    font-size: 0.75rem;
+    font-size: 0.68rem;
+    white-space: nowrap;
     color: var(--text-muted);
     font-weight: 400;
 }
@@ -1157,6 +1163,29 @@ body {
     text-transform: uppercase;
     letter-spacing: 0.05em;
     font-weight: 600;
+}
+
+/* OSS 上传统计始终保持单行；窄窗口横向滚动，不拆成多行。 */
+.oss-stats-row {
+    display: grid;
+    grid-template-columns: repeat(6, minmax(92px, 1fr));
+    gap: var(--spacing-sm);
+    margin-top: var(--spacing-lg);
+    overflow-x: auto;
+    padding-bottom: 2px;
+}
+
+.oss-stats-row .stat-card {
+    min-width: 92px;
+    padding: var(--spacing-md);
+}
+
+.oss-stats-row .stat-label {
+    white-space: nowrap;
+}
+
+.oss-stats-row .stat-value {
+    font-size: 1.6rem;
 }
 
 /* ── 登录页面特殊样式 ──────────────────────────────────── */

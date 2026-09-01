@@ -20,6 +20,8 @@ const Router = {
             'channels_accounts': typeof ChannelsAccountsPage !== 'undefined' ? ChannelsAccountsPage : null,
             'channels_history': typeof ChannelsHistoryPage !== 'undefined' ? ChannelsHistoryPage : null,
             'channels_user': typeof ChannelsUserPage !== 'undefined' ? ChannelsUserPage : null,
+            'channels_oss_config': typeof ChannelsOSSConfigPage !== 'undefined' ? ChannelsOSSConfigPage : null,
+            'channels_oss_progress': typeof ChannelsOSSProgressPage !== 'undefined' ? ChannelsOSSProgressPage : null,
             'proxy': ProxyPage,
             'settings': SettingsPage,
             'transcode': typeof TranscodePage !== 'undefined' ? TranscodePage : null,
@@ -74,12 +76,12 @@ const Router = {
     },
 
     async handleRouting() {
-        const hash = window.location.hash.slice(1) || 'login';
+        const hash = window.location.hash.slice(1) || 'channels_login';
         const pageKey = hash.split('?')[0]; // 去掉查询参数
         const page = this.routes[pageKey];
 
         if (!page) {
-            window.location.hash = '#login';
+            window.location.hash = '#channels_login';
             return;
         }
 
@@ -278,7 +280,7 @@ const Router = {
             }
         });
 
-        let activeGroup = 'wechat'; // 默认微信
+        let activeGroup = 'wechat_channels';
         if (activeKey.startsWith('dy_')) {
             activeGroup = 'douyin';
         } else if (activeKey.startsWith('xhs_')) {

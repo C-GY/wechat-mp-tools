@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-微信公众号文章下载管理工具 — 桌面端应用
+自媒体内容采集工具 — 桌面端应用
 Flask 后端 + Web 前端
 
 启动方式：
@@ -62,7 +62,7 @@ from backend.xiaohongshu import xhs_bp
 from backend.xiaohongshu_login import xhs_login_bp
 from backend.bilibili import bilibili_bp
 from backend.bilibili_login import bilibili_login_bp
-from backend.updater import updater_bp
+from backend.oss import oss_bp
 
 # ── Flask 应用 ────────────────────────────────────────────
 static_folder_path = resource_dir() / "frontend"
@@ -91,7 +91,7 @@ app.register_blueprint(xhs_bp)
 app.register_blueprint(xhs_login_bp)
 app.register_blueprint(bilibili_bp)
 app.register_blueprint(bilibili_login_bp)
-app.register_blueprint(updater_bp)
+app.register_blueprint(oss_bp)
 
 
 # 账号池旧数据迁移
@@ -156,7 +156,7 @@ def open_browser(port: int):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="微信公众号文章下载管理工具")
+    parser = argparse.ArgumentParser(description="自媒体内容采集工具")
     parser.add_argument("--port", type=int, default=5200, help="服务端口 (默认 5200)")
     parser.add_argument("--host", type=str, default="127.0.0.1", help="监听地址")
     parser.add_argument("--no-browser", action="store_true", help="不自动打开浏览器")
@@ -167,7 +167,7 @@ def main():
 
     print()
     print("=" * 56)
-    print("  📱 微信公众号文章下载管理工具")
+    print("  📱 自媒体内容采集工具")
     print(f"  🌐 http://{args.host}:{args.port}")
     print("=" * 56)
     print()
