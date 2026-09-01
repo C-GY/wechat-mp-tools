@@ -84,8 +84,10 @@ const ChannelsLoginPage = {
                         </p>
                         <div style="font-size: 0.8rem; color: var(--text-muted); line-height: 1.5;">
                             1. 点击“启动助手”并允许添加/信任本地 CA 根证书。<br>
-                            2. 启动后，在 PC/Mac 微信中打开任意视频号作者的个人主页。<br>
-                            3. 微信页面内会自动浮现【同步当前作者作品到系统】按钮，点击即可极速同步！
+                            2. Windows 用户可点击“检测并打开视频号”，系统会自动激活正在运行的微信并点击视频号入口。<br>
+                            3. 视频号网页打开后即进入监听，可继续同步作者作品。
+                        </div>
+                        <div id="wechat-environment-status" style="display: none; margin-top: 10px; padding: 8px 10px; border-radius: 8px; font-size: 0.8rem; line-height: 1.45;"></div>
                         </div>
                     </div>
                     
@@ -98,6 +100,9 @@ const ChannelsLoginPage = {
                         </button>
                         <button class="btn btn-primary" id="btn-toggle-proxy" onclick="ChannelsLoginPage.toggleProxy()" style="min-width: 140px; font-weight: 600; padding: 10px 20px;">
                             🚀 启动同步助手
+                        </button>
+                        <button class="btn btn-secondary" id="btn-open-wechat-channels" onclick="ChannelsLoginPage.openWechatChannels()" title="检测微信环境并自动打开视频号网页" style="font-size: 0.85rem; padding: 10px 16px; display: flex; align-items: center; gap: 6px;">
+                            📡 检测并打开视频号
                         </button>
                         <button class="btn btn-secondary" onclick="ChannelsLoginPage.clearWechatCache()" id="btn-clear-cache" title="解决视频号页面打不开或 API 未初始化" style="font-size: 0.85rem; padding: 10px 14px; color: var(--error, #e53e3e); border-color: rgba(229, 62, 62, 0.3); display: flex; align-items: center; gap: 6px;">
                             🧹 清理缓存
@@ -312,6 +317,48 @@ const ChannelsLoginPage = {
             Toast.error('同步助手操作失败: ' + err.message);
         } finally {
             if (toggleBtn) toggleBtn.disabled = false;
+        }
+    },
+
+    async openWechatChannels() {
+        const btn = document.getElementById('btn-open-wechat-channels');
+        const statusBox = document.getElementById('wechat-environment-status');
+        if (!btn) return;
+
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner" style="width: 14px; height: 14px; border-width: 2px; display: inline-block;"></span> 正在检测微信...';
+        if (statusBox) {
+            statusBox.style.display = 'block';
+            statusBox.style.color = '#805ad5';
+            statusBox.style.background = 'rgba(128, 90, 213, 0.08)';
+            statusBox.textContent = '正在检查同步代理、微信进程和视频号入口…';
+        }
+
+        try {
+            const result = await API.channels.openWechatChannels();
+            if (statusBox) {
+                statusBox.textContent = result.message;
+                statusBox.style.color = result.monitoring_active ? '#07a652' : '#b7791f';
+                statusBox.style.background = result.monitoring_active
+                    ? 'rgba(7, 193, 96, 0.08)'
+                    : 'rgba(214, 158, 46, 0.1)';
+            }
+            if (result.monitoring_active) {
+                Toast.success('微信环境正常，视频号监听已就绪');
+            } else {
+                Toast.warning(result.message);
+            }
+            await this.checkProxyStatus();
+        } catch (err) {
+            if (statusBox) {
+                statusBox.style.display = 'block';
+                statusBox.style.color = 'var(--error, #e53e3e)';
+                statusBox.style.background = 'rgba(229, 62, 62, 0.08)';
+                statusBox.textContent = err.message || '微信环境检测失败';
+            }
+        } finally {
+            btn.disabled = false;
+            btn.innerHTML = '📡 检测并打开视频号';
         }
     },
 

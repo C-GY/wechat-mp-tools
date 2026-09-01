@@ -5,6 +5,8 @@ const ChannelsAccountsPage = {
     favorites: [],
     resolvedAuthor: null,
     isParsing: false,
+    activeRefreshTaskId: null,
+    refreshPollTimer: null,
 
     render() {
         return `
@@ -71,7 +73,23 @@ const ChannelsAccountsPage = {
                         👥 已收藏创作者
                         <span id="favorites-count-badge" class="badge" style="background: var(--primary); color: white; font-size: 0.8rem; border-radius: 20px; padding: 2px 8px;">0</span>
                     </h3>
-                    <button class="btn btn-secondary btn-sm" onclick="ChannelsAccountsPage.loadFavorites()" style="font-size: 0.85rem; padding: 6px 12px; font-weight: 500;">🔄 刷新列表</button>
+                    <div style="display: flex; gap: var(--spacing-sm); align-items: center; flex-wrap: wrap;">
+                        <button class="btn btn-primary btn-sm" id="btn-refresh-all-favorites" onclick="ChannelsAccountsPage.startFavoritesRefresh()" style="font-size: 0.85rem; padding: 6px 12px; font-weight: 500;">
+                            ⚡ 一键刷新全部收藏
+                        </button>
+                        <button class="btn btn-secondary btn-sm" onclick="ChannelsAccountsPage.loadFavorites()" style="font-size: 0.85rem; padding: 6px 12px; font-weight: 500;">🔄 刷新列表</button>
+                    </div>
+                </div>
+
+                <div id="favorites-refresh-status" style="display: none; margin-bottom: var(--spacing-md); padding: 12px 14px; border-radius: 10px; background: rgba(7,193,96,0.06); border: 1px solid rgba(7,193,96,0.16);">
+                    <div style="display: flex; justify-content: space-between; gap: 12px; align-items: center; margin-bottom: 8px;">
+                        <strong id="favorites-refresh-status-text" style="font-size: 0.9rem; color: var(--text-primary);">准备刷新...</strong>
+                        <span id="favorites-refresh-progress-text" style="font-size: 0.8rem; color: var(--text-muted); white-space: nowrap;">0/0</span>
+                    </div>
+                    <div style="height: 6px; border-radius: 999px; overflow: hidden; background: rgba(0,0,0,0.08);">
+                        <div id="favorites-refresh-progress-bar" style="width: 0%; height: 100%; background: var(--primary); transition: width 0.25s ease;"></div>
+                    </div>
+                    <div id="favorites-refresh-detail" style="margin-top: 7px; font-size: 0.78rem; color: var(--text-muted);">请在微信中保持任意视频号页面打开。</div>
                 </div>
 
                 <!-- 创作者网格 -->
@@ -95,9 +113,14 @@ const ChannelsAccountsPage = {
     },
 
     destroy() {
+        if (this.refreshPollTimer) {
+            clearTimeout(this.refreshPollTimer);
+            this.refreshPollTimer = null;
+        }
         this.favorites = [];
         this.resolvedAuthor = null;
         this.isParsing = false;
+        this.activeRefreshTaskId = null;
     },
 
     async onShow() {
@@ -106,6 +129,14 @@ const ChannelsAccountsPage = {
 
     async init() {
         await this.loadFavorites();
+        try {
+            const savedTaskId = localStorage.getItem('channelsFavoritesRefreshTaskId');
+            if (savedTaskId) {
+                this.activeRefreshTaskId = savedTaskId;
+                this.setFavoritesRefreshButton(true);
+                this.pollFavoritesRefresh(savedTaskId);
+            }
+        } catch (_) {}
     },
 
     async pasteFromClipboard() {
@@ -279,6 +310,115 @@ const ChannelsAccountsPage = {
         } catch (err) {
             Toast.error('手动收藏失败: ' + err.message);
         }
+    },
+
+    async startFavoritesRefresh() {
+        if (this.favorites.length === 0) {
+            Toast.warning('暂无已收藏创作者');
+            return;
+        }
+        if (this.activeRefreshTaskId) return;
+
+        this.setFavoritesRefreshButton(true);
+        try {
+            const task = await API.channels.startFavoritesRefresh();
+            this.activeRefreshTaskId = task.task_id;
+            try {
+                localStorage.setItem('channelsFavoritesRefreshTaskId', task.task_id);
+            } catch (_) {}
+            this.updateFavoritesRefreshStatus(task);
+            if (!task.created) {
+                Toast.warning('已有刷新任务正在运行，已继续显示其进度');
+            }
+            this.pollFavoritesRefresh(task.task_id);
+        } catch (err) {
+            this.setFavoritesRefreshButton(false);
+            Toast.error('启动刷新失败: ' + (err.message || '未知错误'));
+        }
+    },
+
+    setFavoritesRefreshButton(running) {
+        const button = document.getElementById('btn-refresh-all-favorites');
+        if (!button) return;
+        button.disabled = running;
+        button.textContent = running ? '⏳ 正在刷新收藏...' : '⚡ 一键刷新全部收藏';
+    },
+
+    updateFavoritesRefreshStatus(status) {
+        const container = document.getElementById('favorites-refresh-status');
+        const text = document.getElementById('favorites-refresh-status-text');
+        const progressText = document.getElementById('favorites-refresh-progress-text');
+        const progressBar = document.getElementById('favorites-refresh-progress-bar');
+        const detail = document.getElementById('favorites-refresh-detail');
+        if (!container || !text || !progressText || !progressBar || !detail) return;
+
+        const total = Number(status.total_authors || 0);
+        const completed = Number(status.completed_authors || 0);
+        const failed = Number(status.failed_authors || 0);
+        const processed = Math.min(total, completed + failed);
+        const percent = total > 0 ? Math.round((processed / total) * 100) : 0;
+
+        container.style.display = 'block';
+        container.dataset.state = status.status || '';
+        text.textContent = status.message || '正在刷新收藏创作者...';
+        progressText.textContent = `${processed}/${total}`;
+        progressBar.style.width = `${percent}%`;
+        detail.textContent = status.status === 'waiting'
+            ? '等待微信响应：请打开并保持任意微信视频号首页或作者页。'
+            : `已同步作品 ${Number(status.total_videos || 0)} 个${status.current_nickname ? ` · 当前：${status.current_nickname}` : ''}`;
+
+        if (status.status === 'failed' || status.status === 'cancelled') {
+            container.style.background = 'rgba(245,87,108,0.06)';
+            container.style.borderColor = 'rgba(245,87,108,0.2)';
+        } else {
+            container.style.background = 'rgba(7,193,96,0.06)';
+            container.style.borderColor = 'rgba(7,193,96,0.16)';
+        }
+    },
+
+    pollFavoritesRefresh(taskId) {
+        if (this.refreshPollTimer) {
+            clearTimeout(this.refreshPollTimer);
+            this.refreshPollTimer = null;
+        }
+
+        const poll = async () => {
+            if (this.activeRefreshTaskId !== taskId) return;
+            try {
+                const status = await API.channels.getFavoritesRefreshStatus(taskId);
+                this.updateFavoritesRefreshStatus(status);
+
+                if (['completed', 'failed', 'cancelled'].includes(status.status)) {
+                    this.activeRefreshTaskId = null;
+                    this.setFavoritesRefreshButton(false);
+                    try {
+                        localStorage.removeItem('channelsFavoritesRefreshTaskId');
+                    } catch (_) {}
+
+                    if (status.status === 'completed') {
+                        await this.loadFavorites();
+                        if (Number(status.failed_authors || 0) > 0) {
+                            Toast.warning(status.message || '刷新完成，部分作者失败');
+                        } else {
+                            Toast.success(status.message || '全部收藏创作者刷新完成');
+                        }
+                    } else {
+                        Toast.error(status.message || '收藏创作者刷新失败');
+                    }
+                    return;
+                }
+                this.refreshPollTimer = setTimeout(poll, 1500);
+            } catch (err) {
+                this.activeRefreshTaskId = null;
+                this.setFavoritesRefreshButton(false);
+                try {
+                    localStorage.removeItem('channelsFavoritesRefreshTaskId');
+                } catch (_) {}
+                Toast.error('查询刷新进度失败: ' + (err.message || '未知错误'));
+            }
+        };
+
+        poll();
     },
 
     async loadFavorites() {

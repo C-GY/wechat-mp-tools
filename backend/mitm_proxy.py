@@ -38,6 +38,29 @@ PROXY_SESSION_ID = str(int(time.time()))
 # 保存 MITM 启动前的 NO_PROXY 环境变量，用于停止时还原
 _original_no_proxy = None
 
+_channels_activity_condition = threading.Condition()
+_last_channels_activity = {"timestamp": 0.0, "path": ""}
+
+
+def record_channels_activity(path=""):
+    """Record traffic observed from the WeChat Video Channels webview."""
+    with _channels_activity_condition:
+        _last_channels_activity["timestamp"] = time.time()
+        _last_channels_activity["path"] = path or ""
+        _channels_activity_condition.notify_all()
+
+
+def wait_for_channels_activity(since, timeout=8.0):
+    """Wait until Video Channels web traffic is observed after ``since``."""
+    deadline = time.time() + max(0.0, timeout)
+    with _channels_activity_condition:
+        while _last_channels_activity["timestamp"] < since:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return None
+            _channels_activity_condition.wait(timeout=remaining)
+        return dict(_last_channels_activity)
+
 # ── 证书管理 (Certificate Management) ──────────────────────────
 
 def ensure_ca_certificates():
@@ -443,6 +466,7 @@ class ChannelsAddon:
         path = flow.request.path.split("?", 1)[0]
 
         if host == "channels.weixin.qq.com":
+            record_channels_activity(path)
             if path == "/__wx_channels_api/sync-feed":
                 try:
                     payload = json.loads(flow.request.get_text())
@@ -523,6 +547,34 @@ class ChannelsAddon:
                 except Exception as ex:
                     print(f"Error handling synced-feed-ids: {ex}")
                     self._local_json(flow, 200, b'{"code":0,"data":{}}')
+                return
+            if path == "/__wx_channels_api/refresh-command":
+                from backend.channels_refresh import claim_refresh_command
+
+                command = claim_refresh_command()
+                body = json.dumps(
+                    {"code": 0, "data": command}, ensure_ascii=False
+                ).encode("utf-8")
+                self._local_json(flow, 200, body)
+                return
+            if path == "/__wx_channels_api/refresh-progress":
+                try:
+                    from backend.channels_refresh import update_refresh_task
+
+                    payload = json.loads(flow.request.get_text())
+                    task = update_refresh_task(payload)
+                    body = json.dumps(
+                        {"code": 0, "data": task}, ensure_ascii=False
+                    ).encode("utf-8")
+                    self._local_json(flow, 200, body)
+                except Exception as ex:
+                    self._local_json(
+                        flow,
+                        400,
+                        json.dumps(
+                            {"code": -1, "error": str(ex)}, ensure_ascii=False
+                        ).encode("utf-8"),
+                    )
                 return
             if path == "/__wx_channels_api/call-log":
                 # 采集脚本的调用埋点：每次 finder API 调用追加一行 jsonl，
@@ -726,7 +778,12 @@ class ChannelsAddon:
 def save_synced_feeds(username, feeds):
     import urllib.parse
     from backend.config import load_json, save_json
-    from backend.channels import CHANNELS_FEEDS_FILE, CHANNELS_FAVORITES_FILE
+    from backend.channels import (
+        CHANNELS_FEEDS_FILE,
+        CHANNELS_FAVORITES_FILE,
+        extract_interaction_metrics,
+        extract_video_duration,
+    )
     
     if not username or not feeds:
         return
@@ -878,6 +935,10 @@ def save_synced_feeds(username, feeds):
             "createtime": createtime,
             "decode_key": decode_key
         }
+        item.update(extract_interaction_metrics(feed))
+        duration_seconds = extract_video_duration(feed)
+        if duration_seconds is not None:
+            item["duration_seconds"] = duration_seconds
         
         found = False
         for ex_item in feeds_db[username]:

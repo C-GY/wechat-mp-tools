@@ -23,6 +23,93 @@ CHANNELS_FAVORITES_FILE = DATA_DIR / "channels_favorites.json"
 CHANNELS_FEEDS_FILE = DATA_DIR / "channels_parsed_feeds.json"
 
 
+_INTERACTION_METRIC_KEYS = {
+    "like_count": ("like_count", "likeCount", "likeCountFmt"),
+    "share_count": (
+        "share_count", "forward_count", "forwardCount", "forwardCountFmt",
+        "shareCount", "shareCountFmt",
+    ),
+    "favorite_count": (
+        "favorite_count", "fav_count", "favCount", "favCountFmt", "favoriteCount",
+    ),
+    "comment_count": ("comment_count", "commentCount", "commentCountFmt"),
+}
+
+
+def normalize_interaction_count(value):
+    """Convert numeric or formatted WeChat interaction counts to an integer."""
+    if value is None or value == "":
+        return 0
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float)):
+        return max(0, int(value))
+
+    text = str(value).strip().lower().replace(",", "").replace("+", "")
+    multiplier = 1
+    if text.endswith("万") or text.endswith("w"):
+        multiplier = 10000
+        text = text[:-1]
+    elif text.endswith("k"):
+        multiplier = 1000
+        text = text[:-1]
+    try:
+        return max(0, int(float(text) * multiplier))
+    except (TypeError, ValueError):
+        return 0
+
+
+def extract_interaction_metrics(feed):
+    """Extract only interaction metrics actually present in a feed payload."""
+    metrics = {}
+    source = feed or {}
+    for target, candidates in _INTERACTION_METRIC_KEYS.items():
+        for key in candidates:
+            if key in source and source.get(key) is not None:
+                metrics[target] = normalize_interaction_count(source.get(key))
+                break
+    return metrics
+
+
+def normalize_video_duration(value):
+    """Normalize a WeChat video duration to whole seconds."""
+    if value is None or value == "" or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return max(0, int(value))
+
+    text = str(value).strip()
+    if ":" in text:
+        try:
+            parts = [float(part) for part in text.split(":")]
+            if len(parts) == 2:
+                return max(0, int(parts[0] * 60 + parts[1]))
+            if len(parts) == 3:
+                return max(0, int(parts[0] * 3600 + parts[1] * 60 + parts[2]))
+        except ValueError:
+            return None
+    try:
+        return max(0, int(float(text)))
+    except (TypeError, ValueError):
+        return None
+
+
+def extract_video_duration(feed):
+    """Extract video duration from flattened or raw Finder feed payloads."""
+    source = feed or {}
+    for key in ("duration_seconds", "duration", "videoDuration", "videoPlayLen"):
+        if key in source and source.get(key) is not None:
+            return normalize_video_duration(source.get(key))
+
+    media_list = (source.get("objectDesc") or {}).get("media") or []
+    if media_list and isinstance(media_list[0], dict):
+        media = media_list[0]
+        for key in ("videoPlayLen", "duration", "videoDuration"):
+            if key in media and media.get(key) is not None:
+                return normalize_video_duration(media.get(key))
+    return None
+
+
 class ISAAC64:
     def __init__(self, key_uint64: int):
         self.rand_cnt = 255
@@ -452,6 +539,10 @@ def save_parsed_video_to_db(result):
                 "createtime": createtime,
                 "decode_key": decode_key
             }
+            item.update(extract_interaction_metrics(fi))
+            duration_seconds = extract_video_duration(fi)
+            if duration_seconds is not None:
+                item["duration_seconds"] = duration_seconds
             
             exists = False
             for ex_item in feeds_db[username]:
@@ -907,6 +998,36 @@ def add_author_video(username):
     return jsonify({"message": "视频已保存到作者作品列表", "videos": feeds_db[username]})
 
 
+@channels_bp.route("/refresh-favorites/start", methods=["POST"])
+def start_favorites_refresh():
+    """Queue all locally saved authors for refresh inside an active WeChat page."""
+    from backend.channels_refresh import start_refresh_task
+    from backend.mitm_proxy import ProxyManager
+
+    if not ProxyManager.get_instance().running:
+        return jsonify({"error": "请先启动微信极速同步助手"}), 409
+
+    favorites = load_json(CHANNELS_FAVORITES_FILE, [])
+    try:
+        task, created = start_refresh_task(favorites)
+    except ValueError as ex:
+        return jsonify({"error": str(ex)}), 400
+
+    task["created"] = created
+    return jsonify(task)
+
+
+@channels_bp.route("/refresh-favorites/status/<task_id>", methods=["GET"])
+def favorites_refresh_status(task_id):
+    """Return progress for a queued favorites refresh task."""
+    from backend.channels_refresh import get_refresh_status
+
+    task = get_refresh_status(task_id)
+    if not task:
+        return jsonify({"error": "刷新任务不存在或已失效"}), 404
+    return jsonify(task)
+
+
 # ── Interceptor Proxy Admin Endpoints ──────────────────────────
 
 @channels_bp.route("/proxy/status", methods=["GET"])
@@ -919,6 +1040,48 @@ def get_proxy_status():
         "cert_installed": check_cert_trusted(),
         "proxy_port": manager.port
     })
+
+
+@channels_bp.route("/wechat/open-channels", methods=["POST"])
+def open_wechat_channels_page():
+    """Validate the local WeChat environment and open its Video Channels webview."""
+    if sys.platform != "win32":
+        return jsonify({"error": "当前自动打开流程仅支持 Windows 微信客户端"}), 400
+
+    from backend.mitm_proxy import ProxyManager, wait_for_channels_activity
+    from backend.wechat_automation import open_wechat_video_channels
+
+    manager = ProxyManager.get_instance()
+    proxy_started = False
+    try:
+        if not manager.running:
+            proxy_started = bool(manager.start())
+            if not proxy_started:
+                return jsonify({"error": "同步助手启动失败，请检查本地代理端口"}), 500
+
+        watch_started_at = time.time() - 1.0
+        result = open_wechat_video_channels()
+        activity = wait_for_channels_activity(watch_started_at, timeout=8.0)
+        monitoring_active = activity is not None
+        result.update({
+            "proxy_running": manager.running,
+            "proxy_started": proxy_started,
+            "monitoring_active": monitoring_active,
+            "message": (
+                "微信视频号已打开，监听已就绪"
+                if monitoring_active
+                else "已点击视频号入口，正在等待页面联网，请保持视频号页面打开"
+            ),
+        })
+        return jsonify(result)
+    except RuntimeError as ex:
+        return jsonify({
+            "error": str(ex),
+            "proxy_running": manager.running,
+            "proxy_started": proxy_started,
+        }), 400
+    except Exception as ex:
+        return jsonify({"error": f"自动打开微信视频号失败：{ex}"}), 500
 
 
 @channels_bp.route("/proxy/start", methods=["POST"])

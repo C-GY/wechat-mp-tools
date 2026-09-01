@@ -203,6 +203,197 @@
     return { total: total, capped: capped };
   }
 
+  // ---- 工具箱远程触发：全量刷新「已收藏创作者」----
+  async function reportRemoteProgress(taskId, progress) {
+    var body = progress || {};
+    body.task_id = taskId;
+    try {
+      await WXU.request({
+        method: "POST",
+        url: "/__wx_channels_api/refresh-progress",
+        body: body,
+      });
+    } catch (_) {}
+  }
+
+  // 与作者主页「同步作品」保持一致：从第一页开始翻到末页，后端按 feed id 合并更新。
+  async function refreshFavoriteAuthor(author, taskId, authorIndex, authorCount, totals) {
+    var marker = "";
+    var authorVideos = 0;
+    var pageNumber = 0;
+    var hasMore = true;
+    var label = author.nickname || author.username;
+
+    while (hasMore && !cancelled && !circuitOpen) {
+      pageNumber++;
+      var headline =
+        "正在刷新 " + authorIndex + "/" + authorCount + "：" + esc(label) +
+        "<br>第 " + pageNumber + " 页 · 已同步 " + authorVideos + " 个作品";
+      setPanel("running", headline);
+      await reportRemoteProgress(taskId, {
+        status: "running",
+        completed_authors: totals.completed,
+        failed_authors: totals.failed,
+        total_videos: totals.videos + authorVideos,
+        current_username: author.username,
+        current_nickname: label,
+        message: "正在刷新 " + authorIndex + "/" + authorCount + "：" + label + "（第 " + pageNumber + " 页）",
+      });
+
+      var r = await callWithRetry("finderUserPage", function () {
+        return WXU.API.finderUserPage({
+          username: author.username,
+          finderUsername: my_username || author.username,
+          lastBuffer: marker,
+          needFansCount: 0,
+          objectId: "0",
+        });
+      }, { author: label, remoteRefresh: true });
+
+      if (!r || r.errCode !== 0) {
+        noteFailure();
+        throw new Error((r && r.errMsg) || "作者作品接口调用失败");
+      }
+
+      var raw = (r.data && r.data.object) || [];
+      var rawVideoObjects = raw.filter(function (obj) {
+        return obj.objectDesc && obj.objectDesc.mediaType === 4;
+      });
+      if (rawVideoObjects.length > 0) {
+        await WXU.request({
+          method: "POST",
+          url: "/__wx_channels_api/sync-feed",
+          body: { username: author.username, feeds: rawVideoObjects },
+        });
+        authorVideos += rawVideoObjects.length;
+      }
+
+      marker = (r.data && r.data.lastBuffer) || "";
+      hasMore = !!(marker && raw.length >= 15);
+      if (hasMore && !cancelled) await jitterSleep(PAGE_JITTER_MS);
+    }
+
+    return authorVideos;
+  }
+
+  async function runRemoteFavoritesRefresh(command) {
+    if (running || !command || !command.task_id) return;
+    running = true;
+    cancelled = false;
+    circuitFails = 0;
+    circuitOpen = false;
+
+    var authors = Array.isArray(command.authors) ? command.authors : [];
+    var totals = { completed: 0, failed: 0, videos: 0 };
+    var heartbeatTimer = setInterval(function () {
+      reportRemoteProgress(command.task_id, {
+        status: "running",
+      });
+    }, 15000);
+    function stopHeartbeat() {
+      if (heartbeatTimer) {
+        clearInterval(heartbeatTimer);
+        heartbeatTimer = null;
+      }
+    }
+
+    try {
+      var waited = 0;
+      setPanel("running", "正在等待视频号作者接口就绪…");
+      while ((!WXU.API || typeof WXU.API.finderUserPage !== "function") && waited < 60) {
+        await sleep(500);
+        waited++;
+      }
+      if (!WXU.API || typeof WXU.API.finderUserPage !== "function") {
+        throw new Error("视频号接口未就绪，请在微信里重新打开视频号页面");
+      }
+      if (authors.length === 0) {
+        throw new Error("刷新任务中没有收藏创作者");
+      }
+
+      for (var i = 0; i < authors.length; i++) {
+        if (cancelled || circuitOpen) break;
+        var author = authors[i];
+        try {
+          var count = await refreshFavoriteAuthor(
+            author, command.task_id, i + 1, authors.length, totals
+          );
+          totals.videos += count;
+          totals.completed++;
+        } catch (_) {
+          totals.failed++;
+        }
+
+        await reportRemoteProgress(command.task_id, {
+          status: "running",
+          completed_authors: totals.completed,
+          failed_authors: totals.failed,
+          total_videos: totals.videos,
+          current_username: author.username,
+          current_nickname: author.nickname || author.username,
+          message:
+            "已处理 " + (totals.completed + totals.failed) + "/" + authors.length +
+            "，同步作品 " + totals.videos + " 个",
+        });
+
+        if (!cancelled && !circuitOpen && i < authors.length - 1) {
+          await jitterSleep(AUTHOR_JITTER_MS);
+        }
+      }
+
+      if (cancelled) {
+        stopHeartbeat();
+        await reportRemoteProgress(command.task_id, {
+          status: "cancelled",
+          completed_authors: totals.completed,
+          failed_authors: totals.failed,
+          total_videos: totals.videos,
+          message: "刷新已停止",
+        });
+        finish("已停止 · 已刷新 " + totals.completed + " 个作者");
+      } else if (circuitOpen) {
+        stopHeartbeat();
+        await reportRemoteProgress(command.task_id, {
+          status: "failed",
+          completed_authors: totals.completed,
+          failed_authors: totals.failed,
+          total_videos: totals.videos,
+          message: "接口连续异常，任务已暂停，请稍后重试",
+        });
+        finish("接口连续异常，任务已暂停");
+      } else {
+        var finalMessage =
+          "刷新完成：成功 " + totals.completed + " 个作者，失败 " + totals.failed +
+          " 个，同步作品 " + totals.videos + " 个";
+        stopHeartbeat();
+        await reportRemoteProgress(command.task_id, {
+          status: "completed",
+          completed_authors: totals.completed,
+          failed_authors: totals.failed,
+          total_videos: totals.videos,
+          current_username: "",
+          current_nickname: "",
+          message: finalMessage,
+        });
+        finish(finalMessage);
+      }
+    } catch (ex) {
+      var errorMessage = ex && ex.message ? ex.message : String(ex);
+      stopHeartbeat();
+      await reportRemoteProgress(command.task_id, {
+        status: "failed",
+        completed_authors: totals.completed,
+        failed_authors: totals.failed,
+        total_videos: totals.videos,
+        message: errorMessage,
+      });
+      finish("刷新失败：" + errorMessage);
+    } finally {
+      stopHeartbeat();
+      running = false;
+    }
+  }
+
   var running = false;
   var cancelled = false;
 
@@ -349,10 +540,33 @@
     setPanel("done", msg);
   }
 
+  var remotePollBusy = false;
+  async function pollRemoteRefreshCommand() {
+    if (running || remotePollBusy) return;
+    remotePollBusy = true;
+    try {
+      var ret = await WXU.request({
+        method: "GET",
+        url: "/__wx_channels_api/refresh-command",
+      });
+      var command = ret && ret[1];
+      // 兼容 request 包装器返回 data 或完整响应对象两种形式。
+      if (command && command.code === 0 && Object.prototype.hasOwnProperty.call(command, "data")) {
+        command = command.data;
+      }
+      if (command && command.task_id) runRemoteFavoritesRefresh(command);
+    } catch (_) {
+    } finally {
+      remotePollBusy = false;
+    }
+  }
+
   var iv = setInterval(function () {
     if (document.body) {
       clearInterval(iv);
       setPanel("idle", "");
+      pollRemoteRefreshCommand();
+      setInterval(pollRemoteRefreshCommand, 2000);
     }
   }, 100);
 })();

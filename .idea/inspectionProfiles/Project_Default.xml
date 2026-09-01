@@ -1,0 +1,39 @@
+<component name="InspectionProjectProfileManager">
+  <profile version="1.0">
+    <option name="myName" value="Project Default" />
+    <inspection_tool class="Eslint" enabled="true" level="WARNING" enabled_by_default="true" />
+    <inspection_tool class="PyPackageRequirementsInspection" enabled="true" level="WARNING" enabled_by_default="true">
+      <option name="ignoredPackages">
+        <list>
+          <option value="Flask" />
+          <option value="Requests" />
+          <option value="sqlalchemy" />
+          <option value="pyyaml" />
+          <option value="minio" />
+          <option value="urllib3" />
+          <option value="opencv-python" />
+          <option value="Pillow" />
+          <option value="moviepy" />
+          <option value="numpy" />
+          <option value="pydantic" />
+          <option value="APScheduler" />
+          <option value="flask-restful" />
+          <option value="pandas" />
+          <option value="openpyxl" />
+          <option value="opencv-python-headless" />
+          <option value="pymysql" />
+          <option value="pymupdf" />
+          <option value="cryptography" />
+          <option value="faiss-cpu" />
+          <option value="beautifulsoup4" />
+          <option value="DBUtils" />
+          <option value="python-dateutil" />
+          <option value="google-genai" />
+          <option value="flask-cors" />
+          <option value="openai" />
+        </list>
+      </option>
+    </inspection_tool>
+    <inspection_tool class="SqlNoDataSourceInspection" enabled="false" level="WARNING" enabled_by_default="false" />
+  </profile>
+</component>

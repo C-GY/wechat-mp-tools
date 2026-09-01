@@ -352,14 +352,29 @@ const ChannelsUserPage = {
         grid.style.display = 'grid';
         empty.style.display = 'none';
 
-        grid.innerHTML = this.videos.map(video => {
+        // Keep filesystem paths out of inline JavaScript. Backslashes in Windows
+        // paths are escape characters inside an onclick string and would be lost.
+        const downloadedPaths = new Map();
+
+        grid.innerHTML = this.videos.map((video, videoIndex) => {
             const isChecked = this.selectedIds.has(video.id);
             const pubDate = this.formatDate(video.createtime);
+            const durationSeconds = video.duration_seconds ?? video.duration ?? video.videoDuration ?? video.videoPlayLen ?? 0;
+            const durationText = this.formatDuration(durationSeconds);
+            const interactionStats = [
+                { icon: '👍', label: '点赞', value: video.favorite_count ?? video.favCount ?? 0 },
+                { icon: '↗️', label: '分享', value: video.share_count ?? video.forwardCount ?? video.shareCount ?? 0 },
+                { icon: '❤️', label: '喜欢', value: video.like_count ?? video.likeCount ?? 0 },
+                { icon: '💬', label: '评论', value: video.comment_count ?? video.commentCount ?? 0 },
+            ];
             const downloadedItem = this.history.find(h => {
                 return h.title === (video.description || video.id) || 
                        (h.path && video.description && h.path.includes(video.description));
             });
             const isDownloaded = !!downloadedItem;
+            if (downloadedItem?.path) {
+                downloadedPaths.set(String(videoIndex), downloadedItem.path);
+            }
 
             return `
                 <div class="video-card card" 
@@ -389,10 +404,16 @@ const ChannelsUserPage = {
                                 已下载
                             </span>
                         ` : ''}
+
+                        ${durationText ? `
+                            <span class="channels-video-duration" title="视频时长" style="position: absolute; right: 10px; bottom: 10px; z-index: 5; padding: 3px 7px; border-radius: 5px; background: rgba(0,0,0,0.72); color: #fff; font-size: 0.75rem; font-variant-numeric: tabular-nums; line-height: 1.2;">
+                                ⏱ ${durationText}
+                            </span>
+                        ` : ''}
  
                         <!-- 播放角标 (如果已下载且有本地路径) -->
                         ${isDownloaded && downloadedItem.path ? `
-                            <div class="action-btn" onclick="event.stopPropagation(); ChannelsUserPage.playLocalVideo('${this.esc(downloadedItem.path)}')" 
+                            <div class="action-btn" data-action="play-local-video" data-local-path-index="${videoIndex}"
                                  style="position: absolute; top: calc(50% - 22px); left: calc(50% - 22px); width: 44px; height: 44px; background: rgba(7,193,96,0.9); border-radius: 50%; display: flex; align-items: center; justify-content: center; color: white; cursor: pointer; box-shadow: 0 4px 10px rgba(0,0,0,0.3); transition: transform 0.2s;"
                                  onmouseenter="this.style.transform='scale(1.1)';" onmouseleave="this.style.transform='scale(1)';">
                                 <svg viewBox="0 0 24 24" fill="currentColor" width="24" height="24">
@@ -411,12 +432,21 @@ const ChannelsUserPage = {
                             <div style="font-size: 0.75rem; color: var(--text-muted); margin-bottom: 12px;">
                                 📅 发布时间: ${pubDate}
                             </div>
+                            <div class="channels-video-stats" style="display: flex; flex-wrap: wrap; gap: 6px 10px; margin-bottom: 12px; padding: 8px 10px; border-radius: 8px; background: rgba(0,0,0,0.025); color: var(--text-muted); font-size: 0.75rem;">
+                                ${interactionStats.map(stat => `
+                                    <span title="${stat.label}" style="display: inline-flex; align-items: center; gap: 3px; white-space: nowrap;">
+                                        <span>${stat.icon}</span>
+                                        <span>${stat.label}</span>
+                                        <strong style="color: var(--text-primary); font-weight: 600;">${this.formatCount(stat.value)}</strong>
+                                    </span>
+                                `).join('')}
+                            </div>
                         </div>
 
                         <!-- 底部动作条 -->
                         <div style="display: flex; gap: var(--spacing-xs); margin-top: auto; border-top: 1px solid rgba(0,0,0,0.05); padding-top: var(--spacing-sm);" onclick="event.stopPropagation()">
                             ${isDownloaded && downloadedItem.path ? `
-                                <button class="btn btn-secondary btn-sm" onclick="ChannelsUserPage.openLocalParent('${this.esc(downloadedItem.path)}')" style="flex: 1; font-size: 0.8rem; padding: 6px; border-radius: 6px;">
+                                <button class="btn btn-secondary btn-sm" data-action="open-local-parent" data-local-path-index="${videoIndex}" style="flex: 1; font-size: 0.8rem; padding: 6px; border-radius: 6px;">
                                     📂 定位文件夹
                                 </button>
                             ` : `
@@ -432,6 +462,20 @@ const ChannelsUserPage = {
                 </div>
             `;
         }).join('');
+
+        grid.querySelectorAll('[data-local-path-index]').forEach(element => {
+            element.addEventListener('click', event => {
+                event.stopPropagation();
+                const path = downloadedPaths.get(element.dataset.localPathIndex);
+                if (!path) return;
+
+                if (element.dataset.action === 'play-local-video') {
+                    this.playLocalVideo(path);
+                } else if (element.dataset.action === 'open-local-parent') {
+                    this.openLocalParent(path);
+                }
+            });
+        });
 
         this.updateBatchButtonState();
     },
@@ -698,7 +742,7 @@ const ChannelsUserPage = {
 
     async openLocalParent(path) {
         try {
-            await API.articles.openParent(path);
+            await API.channels.openParent(path);
             Toast.success('已在文件夹中定位视频文件');
         } catch (e) {
             Toast.error('定位文件夹失败');
@@ -752,6 +796,26 @@ const ChannelsUserPage = {
         } catch (e) {
             return '时间格式错误';
         }
+    },
+
+    formatCount(value) {
+        const count = Number(value);
+        if (!Number.isFinite(count) || count < 0) return '0';
+        return new Intl.NumberFormat('zh-CN').format(Math.trunc(count));
+    },
+
+    formatDuration(value) {
+        const parsed = Number(value);
+        if (!Number.isFinite(parsed) || parsed <= 0) return '';
+
+        const totalSeconds = Math.floor(parsed);
+        const hours = Math.floor(totalSeconds / 3600);
+        const minutes = Math.floor((totalSeconds % 3600) / 60);
+        const seconds = totalSeconds % 60;
+        const pad = number => String(number).padStart(2, '0');
+
+        if (hours > 0) return `${pad(hours)}:${pad(minutes)}:${pad(seconds)}`;
+        return `${pad(minutes)}:${pad(seconds)}`;
     },
 
     esc(s) {
