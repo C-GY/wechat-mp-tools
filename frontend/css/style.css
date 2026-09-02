@@ -1188,6 +1188,45 @@ body {
     font-size: 1.6rem;
 }
 
+/* 品创中枢共 7 项：桌面端固定两行，并让 4 项 / 3 项各自铺满整行。 */
+.pinchuang-stats-row {
+    display: grid;
+    grid-template-columns: repeat(12, minmax(0, 1fr));
+    gap: var(--spacing-sm);
+    margin-top: var(--spacing-lg);
+}
+
+.pinchuang-stats-row .stat-card {
+    grid-column: span 3;
+    min-width: 0;
+    padding: var(--spacing-md);
+}
+
+.pinchuang-stats-row .stat-card:nth-child(n + 5) {
+    grid-column: span 4;
+}
+
+.pinchuang-stats-row .stat-label {
+    white-space: nowrap;
+}
+
+@media (max-width: 900px) {
+    .pinchuang-stats-row {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .pinchuang-stats-row .stat-card,
+    .pinchuang-stats-row .stat-card:nth-child(n + 5) {
+        grid-column: span 1;
+    }
+}
+
+@media (max-width: 520px) {
+    .pinchuang-stats-row {
+        grid-template-columns: 1fr;
+    }
+}
+
 /* ── 登录页面特殊样式 ──────────────────────────────────── */
 .login-container {
     max-width: 600px;

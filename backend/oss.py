@@ -428,6 +428,26 @@ class OSSUploadManager:
             raise ValueError("当前创作者暂无可同步作品")
         return self._start_candidates(batch_id, candidates)
 
+    def start_selected_sync(self, author: dict, videos: list[dict]):
+        """Sync only selected works for one author.
+
+        The Pinchuang pipeline uses this interface after its database diff so
+        an existing database record never causes an unnecessary OSS upload.
+        """
+        author = dict(author or {})
+        username = str(author.get("username") or "").strip()
+        if not username:
+            raise ValueError("作者 ID 不能为空")
+        selected = [dict(video) for video in videos or [] if isinstance(video, dict)]
+        if not selected:
+            raise ValueError("当前创作者没有需要同步的新增作品")
+        candidates, batch_id = self._build_candidates(
+            [author], {username: selected}
+        )
+        if not candidates:
+            raise ValueError("新增作品缺少可同步的视频 ID")
+        return self._start_candidates(batch_id, candidates)
+
     @staticmethod
     def _build_candidates(authors, feeds_db):
         candidates = []

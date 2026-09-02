@@ -63,6 +63,7 @@ from backend.xiaohongshu_login import xhs_login_bp
 from backend.bilibili import bilibili_bp
 from backend.bilibili_login import bilibili_login_bp
 from backend.oss import oss_bp
+from backend.pinchuang import pinchuang_bp
 
 # ── Flask 应用 ────────────────────────────────────────────
 static_folder_path = resource_dir() / "frontend"
@@ -92,6 +93,7 @@ app.register_blueprint(xhs_login_bp)
 app.register_blueprint(bilibili_bp)
 app.register_blueprint(bilibili_login_bp)
 app.register_blueprint(oss_bp)
+app.register_blueprint(pinchuang_bp)
 
 
 # 账号池旧数据迁移
@@ -101,6 +103,10 @@ migrate_legacy_config()
 # 启动 RSS 自动抓取调度器
 from backend.rss_scheduler import rss_scheduler
 rss_scheduler.start()
+
+# 启动品创中枢多时点调度器（配置保存在系统用户目录）
+from backend.pinchuang import pinchuang_hub
+pinchuang_hub.start()
 
 
 

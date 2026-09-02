@@ -240,6 +240,18 @@ const API = {
         clearFinishedUploads() { return API.delete('/api/oss/uploads/finished'); },
     },
 
+    // ── Pinchuang Hub API ────────────────────────────
+    pinchuang: {
+        getConfig() { return API.get('/api/pinchuang/config', { showError: false }); },
+        saveConfig(config) { return API.post('/api/pinchuang/config', config); },
+        testDatabase() { return API.post('/api/pinchuang/test-database'); },
+        testFeishu() { return API.post('/api/pinchuang/test-feishu'); },
+        startRun() { return API.post('/api/pinchuang/runs'); },
+        pauseRun() { return API.post('/api/pinchuang/runs/pause'); },
+        resumeRun() { return API.post('/api/pinchuang/runs/resume'); },
+        getStatus() { return API.get('/api/pinchuang/status', { showError: false }); },
+    },
+
     // ── Video Transcoder API ─────────────────────────
     transcode: {
         checkFFmpeg() { return API.get('/api/transcode/check-ffmpeg', { showError: false }); },

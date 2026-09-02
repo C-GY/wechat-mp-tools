@@ -183,6 +183,20 @@ def _run_certutil(args, check=False):
     return subprocess.run(["certutil"] + list(args), capture_output=True, check=check)
 
 
+def _current_ca_thumbprint():
+    """Return the SHA-1 thumbprint Windows uses to identify the current CA."""
+    ensure_ca_certificates()
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes
+
+    cert_bytes = CA_CERT_PATH.read_bytes()
+    try:
+        certificate = x509.load_pem_x509_certificate(cert_bytes)
+    except ValueError:
+        certificate = x509.load_der_x509_certificate(cert_bytes)
+    return certificate.fingerprint(hashes.SHA1()).hex().upper()
+
+
 def check_cert_trusted():
     if sys.platform == "darwin":
         try:
@@ -236,12 +250,15 @@ def check_cert_trusted():
             return False
     elif sys.platform == "win32":
         try:
-            # Check user store first
-            out = _run_certutil(["-verifystore", "-user", "root", "Channels Interceptor CA"])
+            # Several historical CA files share the same display name. Checking
+            # only that name can accept a stale CA whose key cannot verify the
+            # certificates currently issued by mitmproxy.
+            thumbprint = _current_ca_thumbprint()
+            out = _run_certutil(["-verifystore", "-user", "root", thumbprint])
             if out.returncode == 0:
                 return True
-            # Also check LocalMachine store (some tools like dev-sidecar install there)
-            out2 = _run_certutil(["-verifystore", "root", "Channels Interceptor CA"])
+            # Also check LocalMachine store (some tools like dev-sidecar install there).
+            out2 = _run_certutil(["-verifystore", "root", thumbprint])
             if out2.returncode == 0:
                 return True
             return False
@@ -299,6 +316,12 @@ def install_system_cert(ca_cert_path):
                 return False
     elif sys.platform == "win32":
         try:
+            # Remove same-name user certificates after the exact-thumbprint
+            # check failed. They are stale project CAs and can make Windows
+            # select an invalid chain for the newly issued leaf certificate.
+            _run_certutil(
+                ["-delstore", "-user", "root", "Channels Interceptor CA"]
+            )
             _run_certutil(["-addstore", "-user", "root", str(ca_cert_path)], check=True)
             return True
         except Exception as e:
