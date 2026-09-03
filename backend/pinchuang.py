@@ -606,6 +606,16 @@ def ensure_wechat_channels_available(detection_timeout=20.0, open_timeout=8.0) -
 
 
 class PinchuangHub:
+    module_name = "品创中枢"
+    config_backup_format = "pinchuang_config"
+    storage_label = "数据库"
+    thread_prefix = "pinchuang"
+    processed_suffix = "（含无变化）"
+    failure_items_label = "失败作品"
+    _merge_config = staticmethod(_merged_config)
+    _normalize_config = staticmethod(normalize_config)
+    _public_config = staticmethod(public_config)
+
     def __init__(
         self,
         config_path: Path = PINCHUANG_CONFIG_FILE,
@@ -623,7 +633,7 @@ class PinchuangHub:
         self._pause_context: dict[str, tuple[str, str]] = {}
         self.worker: threading.Thread | None = None
         self.scheduler_thread: threading.Thread | None = None
-        self.config = _merged_config(load_json(self.config_path, {}))
+        self.config = self._merge_config(load_json(self.config_path, {}))
         self.state = load_json(self.state_path, {})
         if not isinstance(self.state, dict):
             self.state = {}
@@ -659,17 +669,63 @@ class PinchuangHub:
 
     def get_config(self) -> dict:
         with self.lock:
-            return public_config(self.config)
+            return self._public_config(self.config)
 
     def save_config(self, payload: dict) -> dict:
         with self.lock:
-            updated = normalize_config(payload, self.config)
+            updated = self._normalize_config(payload, self.config)
             _atomic_save_json(self.config_path, updated)
             self.config = updated
-            return public_config(updated)
+            return self._public_config(updated)
 
-    def _database_adapter(self) -> MySQLSnapshotAdapter:
-        return MySQLSnapshotAdapter(self.config["database"])
+    def export_config_backup(self) -> dict:
+        """Explicit backups include secrets; ordinary config responses stay masked."""
+        with self.lock:
+            return {
+                "format": self.config_backup_format,
+                "format_version": 1,
+                "exported_at": format_beijing(self.now()),
+                "config": json.loads(json.dumps(self.config)),
+            }
+
+    def import_config_backup(self, payload: dict) -> dict:
+        if not isinstance(payload, dict):
+            raise ValueError("配置 JSON 必须是一个对象")
+        if "format" in payload or "config" in payload:
+            if payload.get("format") != self.config_backup_format:
+                raise ValueError(f"请选择{self.module_name}导出的配置 JSON")
+            version = payload.get("format_version")
+            if type(version) is not int or version != 1:
+                raise ValueError("不支持此配置备份版本")
+            config = payload.get("config")
+        else:
+            # Accept a complete original config file pasted as JSON, too.
+            config = payload
+
+        schema = self._merge_config({})
+        if not isinstance(config, dict) or set(config) != set(schema):
+            raise ValueError(f"请粘贴完整的{self.module_name}配置，包含：{', '.join(schema)}")
+        for section, fields in schema.items():
+            values = config[section]
+            if not isinstance(values, dict) or set(values) != set(fields):
+                raise ValueError(f"{section} 配置字段不完整或不受支持，请使用完整备份")
+            for key, default in fields.items():
+                value = values[key]
+                if type(value) is not type(default):
+                    raise ValueError(f"{section}.{key} 的数据类型不正确")
+                if isinstance(value, list) and any(not isinstance(item, str) for item in value):
+                    raise ValueError(f"{section}.{key} 必须是文本数组")
+
+        with self.lock:
+            # A backup is a full replacement. Blank secrets must not inherit the
+            # target machine's credentials as they do during ordinary form saves.
+            updated = self._normalize_config(config)
+            _atomic_save_json(self.config_path, updated)
+            self.config = updated
+            return self._public_config(updated)
+
+    def _database_adapter(self, config: dict | None = None) -> MySQLSnapshotAdapter:
+        return MySQLSnapshotAdapter((config if config is not None else self.config)["database"])
 
     def _notifier(self) -> FeishuNotifier:
         config = self.config.get("feishu", {})
@@ -679,7 +735,7 @@ class PinchuangHub:
         with self.lock:
             config = json.loads(json.dumps(self.config))
         self._validate_database_config(config)
-        return MySQLSnapshotAdapter(config["database"]).test_connection()
+        return self._database_adapter(config).test_connection()
 
     def test_feishu(self) -> dict:
         with self.lock:
@@ -689,7 +745,7 @@ class PinchuangHub:
         result = notifier.send(
             "飞书机器人发送测试消息",
             "应用：【自媒体内容采集工具】\n"
-            "模块：【品创中枢系统】\n"
+            f"模块：【{self.module_name}系统】\n"
             "内容：机器人连接测试成功\n"
             f"时间：{format_beijing_seconds(self.now())}",
         )
@@ -721,7 +777,7 @@ class PinchuangHub:
             self.scheduler_thread = threading.Thread(
                 target=self._scheduler_loop,
                 daemon=True,
-                name="pinchuang-scheduler",
+                name=f"{self.thread_prefix}-scheduler",
             )
             self.scheduler_thread.start()
             interrupted = self.interrupted_run
@@ -730,12 +786,12 @@ class PinchuangHub:
             threading.Thread(
                 target=self._notifier().send,
                 args=(
-                    "品创中枢任务中断",
+                    f"{self.module_name}任务中断",
                     f"批次：{interrupted.get('sync_batch_id', '')}\n"
                     f"原因：软件在任务完成前退出",
                 ),
                 daemon=True,
-                name="pinchuang-interrupted-notice",
+                name=f"{self.thread_prefix}-interrupted-notice",
             ).start()
 
     def stop(self):
@@ -776,7 +832,7 @@ class PinchuangHub:
         except Exception as exc:
             self._record_schedule_failure(minute, str(exc))
             self._notifier().send(
-                "品创中枢计划任务未运行",
+                f"{self.module_name}计划任务未运行",
                 f"计划时间：{date_key} {minute}\n原因：{exc}",
             )
 
@@ -848,7 +904,7 @@ class PinchuangHub:
             if not self._notifier().configured():
                 raise ValueError("请先配置飞书机器人 Webhook")
             if self.worker and self.worker.is_alive():
-                raise RuntimeError("已有品创中枢同步任务正在运行")
+                raise RuntimeError(f"已有{self.module_name}同步任务正在运行")
             self.resume_event.set()
             self._pause_context.clear()
             now_text = format_beijing(self.now())
@@ -883,7 +939,7 @@ class PinchuangHub:
                 target=self._run_pipeline,
                 args=(run_id,),
                 daemon=True,
-                name=f"pinchuang-run-{run_id[:8]}",
+                name=f"{self.thread_prefix}-run-{run_id[:8]}",
             )
             self.worker.start()
             return dict(run)
@@ -892,7 +948,7 @@ class PinchuangHub:
         with self.lock:
             run = self.state.get("current_run")
             if not isinstance(run, dict) or not self.worker or not self.worker.is_alive():
-                raise RuntimeError("当前没有正在执行的品创中枢任务")
+                raise RuntimeError(f"当前没有正在执行的{self.module_name}任务")
             if run.get("status") in {"pausing", "paused"}:
                 return dict(run)
             self._pause_context[run["run_id"]] = (
@@ -913,7 +969,7 @@ class PinchuangHub:
         with self.lock:
             run = self.state.get("current_run")
             if not isinstance(run, dict) or not self.worker or not self.worker.is_alive():
-                raise RuntimeError("当前没有可继续的品创中枢任务")
+                raise RuntimeError(f"当前没有可继续的{self.module_name}任务")
             if run.get("status") not in {"pausing", "paused"}:
                 raise RuntimeError("当前任务没有暂停")
             was_paused = run.get("status") == "paused"
@@ -1175,12 +1231,12 @@ class PinchuangHub:
                 run_id,
                 status="running",
                 phase="preflight",
-                message="正在检查数据库、OSS 和微信视频号环境",
+                message=f"正在检查{self.storage_label}、OSS 和微信视频号环境",
             )
             self._validate_database_config(config)
             if not get_oss_config().get("configured"):
                 raise ValueError("OSS 尚未配置")
-            adapter = MySQLSnapshotAdapter(config["database"])
+            adapter = self._database_adapter(config)
             adapter.test_connection()
             ensure_wechat_channels_available()
 
@@ -1239,9 +1295,9 @@ class PinchuangHub:
                     else:
                         totals["failed_creators"] += 1
                         notifier.send(
-                            "品创中枢创作者部分失败",
+                            f"{self.module_name}创作者部分失败",
                             f"创作者：{author_name}\n批次：{run['sync_batch_id']}\n"
-                            f"失败作品：{result['failed_items']} 条",
+                            f"{self.failure_items_label}：{result['failed_items']} 条",
                         )
                 except Exception as exc:
                     totals["failed_creators"] += 1
@@ -1261,7 +1317,7 @@ class PinchuangHub:
                         "failures": [{"error": str(exc)}],
                     }
                     notifier.send(
-                        "品创中枢创作者同步失败",
+                        f"{self.module_name}创作者同步失败",
                         f"创作者：{author_name}\n批次：{run['sync_batch_id']}\n原因：{exc}",
                     )
                 self._creator_result(run_id, result)
@@ -1292,13 +1348,13 @@ class PinchuangHub:
             message = (
                 f"同步完成：成功 {totals['completed_creators']} 个，"
                 f"失败/部分失败 {totals['failed_creators']} 个，"
-                f"数据库处理 {totals['database_written']} 条作品（含无变化）"
+                f"{self.storage_label}处理 {totals['database_written']} 条作品{self.processed_suffix}"
             )
             self._finish_run(run_id, status, message)
         except Exception as exc:
             self._finish_run(run_id, "failed", f"任务执行失败：{exc}")
             notifier.send(
-                "品创中枢任务异常",
+                f"{self.module_name}任务异常",
                 f"批次：{run.get('sync_batch_id', run_id)}\n"
                 f"时间：{format_beijing(self.now())}\n原因：{exc}",
             )
@@ -1319,6 +1375,24 @@ def save_config_endpoint():
         return jsonify({**config, "message": "品创中枢配置已保存"})
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
+
+
+@pinchuang_bp.post("/config/export")
+def export_config_endpoint():
+    response = jsonify(pinchuang_hub.export_config_backup())
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@pinchuang_bp.post("/config/import")
+def import_config_endpoint():
+    try:
+        config = pinchuang_hub.import_config_backup(request.get_json(silent=True))
+        return jsonify({**config, "message": "品创中枢配置已导入并保存"})
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except OSError:
+        return jsonify({"error": "配置保存失败，原配置未更改，请检查文件权限或磁盘空间"}), 500
 
 
 @pinchuang_bp.route("/test-database", methods=["POST"])

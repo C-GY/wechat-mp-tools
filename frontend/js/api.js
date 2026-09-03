@@ -208,6 +208,8 @@ const API = {
         openFile(path) { return API.post('/api/channels/open-file', { path }); },
         openParent(path, opts) { return API.post('/api/channels/open-parent', { path }, opts); },
         getFavorites() { return API.get('/api/channels/favorites'); },
+        exportFavoritesConfig(opts) { return API.post('/api/channels/favorites/export-config', {}, opts); },
+        importFavoritesConfig(config, opts) { return API.post('/api/channels/favorites/import-config', config, opts); },
         addFavorite(author) { return API.post('/api/channels/favorites', author); },
         removeFavorite(username) { return API.delete(`/api/channels/favorites/${username}`); },
         getAuthorVideos(username) { return API.get(`/api/channels/author-videos/${username}`); },
@@ -227,10 +229,11 @@ const API = {
     // ── OSS API ─────────────────────────────────────
     oss: {
         getConfig() { return API.get('/api/oss/config', { showError: false }); },
-        saveConfig(accessKeyId, accessKeySecret = '') {
+        saveConfig(accessKeyId, accessKeySecret = '', bucket) {
             return API.post('/api/oss/config', {
                 access_key_id: accessKeyId,
                 access_key_secret: accessKeySecret,
+                bucket,
             });
         },
         clearConfig() { return API.delete('/api/oss/config'); },
@@ -240,9 +243,25 @@ const API = {
         clearFinishedUploads() { return API.delete('/api/oss/uploads/finished'); },
     },
 
+    // ── Creative Radar API ───────────────────────────
+    creativeRadar: {
+        getConfig() { return API.get('/api/creative-radar/config', { showError: false }); },
+        exportConfig() { return API.post('/api/creative-radar/config/export', {}, { showError: false }); },
+        importConfig(config) { return API.post('/api/creative-radar/config/import', config, { showError: false }); },
+        saveConfig(config) { return API.post('/api/creative-radar/config', config); },
+        testApi() { return API.post('/api/creative-radar/test-api', null, { showError: false }); },
+        testFeishu() { return API.post('/api/creative-radar/test-feishu'); },
+        startRun() { return API.post('/api/creative-radar/runs'); },
+        pauseRun() { return API.post('/api/creative-radar/runs/pause'); },
+        resumeRun() { return API.post('/api/creative-radar/runs/resume'); },
+        getStatus() { return API.get('/api/creative-radar/status', { showError: false }); },
+    },
+
     // ── Pinchuang Hub API ────────────────────────────
     pinchuang: {
         getConfig() { return API.get('/api/pinchuang/config', { showError: false }); },
+        exportConfig() { return API.post('/api/pinchuang/config/export', {}, { showError: false }); },
+        importConfig(config) { return API.post('/api/pinchuang/config/import', config, { showError: false }); },
         saveConfig(config) { return API.post('/api/pinchuang/config', config); },
         testDatabase() { return API.post('/api/pinchuang/test-database'); },
         testFeishu() { return API.post('/api/pinchuang/test-feishu'); },

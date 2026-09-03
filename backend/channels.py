@@ -12,11 +12,16 @@ import subprocess
 import urllib.parse
 import requests
 import struct
+from datetime import datetime
 from pathlib import Path
 from flask import Blueprint, jsonify, request
 
 from backend.config import DATA_DIR, OUTPUT_DIR, get_settings, load_json, save_json
 from backend.runtime import launch_chromium
+from backend.channels_favorites import (
+    FAVORITES_LOCK, build_favorites_backup, merge_favorites,
+    parse_favorites_backup, save_favorites_atomic,
+)
 
 channels_bp = Blueprint("channels", __name__, url_prefix="/api/channels")
 CHANNELS_HISTORY_FILE = DATA_DIR / "channels_history.json"
@@ -549,24 +554,25 @@ def save_parsed_video_to_db(result):
         
     # 1. 自动把作者加到收藏列表 (CHANNELS_FAVORITES_FILE)
     try:
-        favorites = load_json(CHANNELS_FAVORITES_FILE, [])
-        found_fav = False
-        for fav in favorites:
-            if fav.get("username") == username:
-                if head_img_url:
-                    fav["head_img_url"] = head_img_url
-                if nickname and nickname != "未命名作者":
-                    fav["nickname"] = nickname
-                found_fav = True
-                break
-        if not found_fav:
-            favorites.append({
-                "username": username,
-                "nickname": nickname,
-                "head_img_url": head_img_url,
-                "added_time": int(time.time())
-            })
-        save_json(CHANNELS_FAVORITES_FILE, favorites)
+        with FAVORITES_LOCK:
+            favorites = load_json(CHANNELS_FAVORITES_FILE, [])
+            found_fav = False
+            for fav in favorites:
+                if fav.get("username") == username:
+                    if head_img_url:
+                        fav["head_img_url"] = head_img_url
+                    if nickname and nickname != "未命名作者":
+                        fav["nickname"] = nickname
+                    found_fav = True
+                    break
+            if not found_fav:
+                favorites.append({
+                    "username": username,
+                    "nickname": nickname,
+                    "head_img_url": head_img_url,
+                    "added_time": int(time.time())
+                })
+            save_favorites_atomic(CHANNELS_FAVORITES_FILE, favorites)
     except Exception as ef:
         print(f"自动保存作者到收藏失败: {ef}")
         
@@ -966,28 +972,77 @@ def add_favorite():
     if not username:
         return jsonify({"error": "作者 ID 不能为空"}), 400
 
-    favorites = load_json(CHANNELS_FAVORITES_FILE, [])
-    # 检查是否已存在
-    for fav in favorites:
-        if fav.get("username") == username:
-            if nickname and nickname != "已同步作者":
-                fav["nickname"] = nickname
-            if head_img_url:
-                fav["head_img_url"] = head_img_url
-            if video_url:
-                fav["video_url"] = video_url
-            save_json(CHANNELS_FAVORITES_FILE, favorites)
-            return jsonify({"message": "作者已在收藏列表中", "favorites": favorites})
+    with FAVORITES_LOCK:
+        favorites = load_json(CHANNELS_FAVORITES_FILE, [])
+        # 检查是否已存在
+        for fav in favorites:
+            if fav.get("username") == username:
+                if nickname and nickname != "已同步作者":
+                    fav["nickname"] = nickname
+                if head_img_url:
+                    fav["head_img_url"] = head_img_url
+                if video_url:
+                    fav["video_url"] = video_url
+                save_favorites_atomic(CHANNELS_FAVORITES_FILE, favorites)
+                return jsonify({"message": "作者已在收藏列表中", "favorites": favorites})
 
-    favorites.append({
-        "username": username,
-        "nickname": nickname or "未命名",
-        "head_img_url": head_img_url,
-        "video_url": video_url,
-        "added_time": int(time.time())
+        favorites.append({
+            "username": username,
+            "nickname": nickname or "未命名",
+            "head_img_url": head_img_url,
+            "video_url": video_url,
+            "added_time": int(time.time())
+        })
+        save_favorites_atomic(CHANNELS_FAVORITES_FILE, favorites)
+        return jsonify({"message": "收藏成功", "favorites": favorites})
+
+
+@channels_bp.route("/favorites/export-config", methods=["POST"])
+def export_favorites_config():
+    """Save every favorite's full metadata as a restorable JSON backup."""
+    try:
+        with FAVORITES_LOCK:
+            payload = build_favorites_backup(load_json(CHANNELS_FAVORITES_FILE, []))
+        export_dir = (
+            Path(get_settings().get("download_dir") or str(OUTPUT_DIR))
+            / "channels" / "exports"
+        )
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        export_path = export_dir / f"视频号_创作者收藏配置_{timestamp}.json"
+        save_favorites_atomic(export_path, payload)
+    except ValueError as ex:
+        return jsonify({"error": str(ex)}), 400
+    except OSError as ex:
+        return jsonify({"error": f"保存配置文件失败：{ex}"}), 500
+    return jsonify({
+        "message": "创作者收藏配置已导出",
+        "path": str(export_path),
+        "filename": export_path.name,
+        "creator_count": payload["creator_count"],
     })
-    save_json(CHANNELS_FAVORITES_FILE, favorites)
-    return jsonify({"message": "收藏成功", "favorites": favorites})
+
+
+@channels_bp.route("/favorites/import-config", methods=["POST"])
+def import_favorites_config():
+    """Merge a validated backup without clearing or overwriting favorites."""
+    try:
+        incoming = parse_favorites_backup(request.get_json(silent=True))
+        with FAVORITES_LOCK:
+            favorites, imported_count, skipped_count = merge_favorites(
+                load_json(CHANNELS_FAVORITES_FILE, []), incoming,
+            )
+            if imported_count:
+                save_favorites_atomic(CHANNELS_FAVORITES_FILE, favorites)
+    except ValueError as ex:
+        return jsonify({"error": str(ex)}), 400
+    except OSError as ex:
+        return jsonify({"error": f"保存收藏配置失败，原收藏未更改：{ex}"}), 500
+    return jsonify({
+        "message": f"导入完成：新增 {imported_count} 个，已存在 {skipped_count} 个",
+        "imported_count": imported_count,
+        "skipped_count": skipped_count,
+        "creator_count": len(favorites),
+    })
 
 
 @channels_bp.route("/favorites/<username>", methods=["DELETE"])
@@ -997,17 +1052,18 @@ def remove_favorite(username):
         return jsonify({"error": "作者 ID 不能为空"}), 400
 
     username = urllib.parse.unquote(username)
-    favorites = load_json(CHANNELS_FAVORITES_FILE, [])
+    with FAVORITES_LOCK:
+        favorites = load_json(CHANNELS_FAVORITES_FILE, [])
     
-    # 查找作者的 nickname，用于清理任何以 nickname 为键的数据
-    nickname = None
-    for fav in favorites:
-        if fav.get("username") == username:
-            nickname = fav.get("nickname")
-            break
+        # 查找作者的 nickname，用于清理任何以 nickname 为键的数据
+        nickname = None
+        for fav in favorites:
+            if fav.get("username") == username:
+                nickname = fav.get("nickname")
+                break
 
-    new_favorites = [fav for fav in favorites if fav.get("username") != username]
-    save_json(CHANNELS_FAVORITES_FILE, new_favorites)
+        new_favorites = [fav for fav in favorites if fav.get("username") != username]
+        save_favorites_atomic(CHANNELS_FAVORITES_FILE, new_favorites)
 
     # 从 Feeds 数据库移除该作者的所有视频/同步数据
     feeds_db = load_json(CHANNELS_FEEDS_FILE, {})

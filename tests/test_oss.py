@@ -44,10 +44,11 @@ class _Session:
 
 
 class OSSConfigTests(unittest.TestCase):
-    def test_bucket_and_storage_url_follow_saved_access_key_id(self):
+    def test_bucket_and_storage_url_are_independent_from_access_key_id(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             with patch.object(oss, "OSS_CONFIG_FILE", Path(temp_dir) / "oss.json"):
-                saved = oss.save_oss_config("creator-library", "test-secret")
+                saved = oss.save_oss_config("upload-user", "test-secret", bucket="creator-library")
+                self.assertEqual(saved["access_key_id"], "upload-user")
                 self.assertEqual(saved["bucket"], "creator-library")
                 self.assertEqual(saved["storage_base_url"], "https://oss.fandow.com/creator-library")
                 self.assertEqual(oss.get_oss_config()["bucket"], "creator-library")
@@ -56,11 +57,41 @@ class OSSConfigTests(unittest.TestCase):
                     "https://oss.fandow.com/creator-library/wechat_channel/video-1.mp4",
                 )
                 self.assertNotIn("access_key_secret", saved)
+                changed = oss.save_oss_config("upload-user", "", bucket="next-library")
+                self.assertEqual(changed["bucket"], "next-library")
+                self.assertEqual(oss.get_oss_config(include_secret=True)["access_key_secret"], "test-secret")
                 with self.assertRaisesRegex(ValueError, "OSS_ACCESS_KEY_SECRET"):
-                    oss.save_oss_config("another-library", "")
-                self.assertEqual(oss.get_oss_config()["bucket"], "creator-library")
+                    oss.save_oss_config("another-user", "")
+                # Omitted bucket on a credential-only update preserves the target.
+                rotated = oss.save_oss_config("another-user", "next-secret")
+                self.assertEqual(rotated["bucket"], "next-library")
 
-    def test_access_key_id_cannot_escape_its_storage_path(self):
+    def test_old_configuration_keeps_its_original_bucket(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_file = Path(temp_dir) / "oss.json"
+            config_file.write_text(json.dumps({
+                "access_key_id": "legacy-library", "access_key_secret": "test-secret",
+            }), encoding="utf-8")
+            with patch.object(oss, "OSS_CONFIG_FILE", config_file):
+                config = oss.get_oss_config()
+                self.assertTrue(config["configured"])
+                self.assertEqual(config["bucket"], "legacy-library")
+                self.assertEqual(oss.OSSService.from_saved_config().bucket, "legacy-library")
+                oss.save_oss_config("legacy-library", "")
+                self.assertEqual(json.loads(config_file.read_text(encoding="utf-8"))["bucket"], "legacy-library")
+
+    def test_bucket_cannot_escape_its_storage_path(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.object(oss, "OSS_CONFIG_FILE", Path(temp_dir) / "oss.json"):
+                oss.save_oss_config("upload-user", "test-secret", bucket="original-library")
+                for value in ("", "../other", "..", ".", "a/b", "a\\b", "a?b", "a#b", "a%b", "a b", "a\tb", "a" * 257):
+                    with self.subTest(bucket=value), self.assertRaisesRegex(ValueError, "OSS_BUCKET"):
+                        oss.save_oss_config("upload-user", "", bucket=value)
+                    with self.subTest(service_bucket=value), self.assertRaisesRegex(ValueError, "OSS_BUCKET"):
+                        oss.OSSService("upload-user", "test-secret", bucket=value)
+                self.assertEqual(oss.get_oss_config()["bucket"], "original-library")
+
+    def test_access_key_id_validation(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             with patch.object(oss, "OSS_CONFIG_FILE", Path(temp_dir) / "oss.json"):
                 for value in ("../other", "..", ".", "a/b", "a\\b", "a?b", "a#b", "a%b", "a b", "a\tb"):
@@ -85,12 +116,12 @@ class OSSConfigTests(unittest.TestCase):
                     oss.OSSService.from_saved_config()
                 self.assertTrue(oss.save_oss_config("fixed-library", "new-secret")["configured"])
 
-    def test_valid_ids_are_not_rewritten_and_clear_restores_default(self):
+    def test_valid_bucket_names_are_not_rewritten_and_clear_restores_default(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             with patch.object(oss, "OSS_CONFIG_FILE", Path(temp_dir) / "oss.json"):
                 for value in ("Library_01.v2", "library-02", "a" * 256):
                     with self.subTest(value=value):
-                        config = oss.save_oss_config(value, "test-secret")
+                        config = oss.save_oss_config("upload-user", "test-secret", bucket=value)
                         self.assertEqual(config["storage_base_url"], f"https://oss.fandow.com/{value}")
                 with self.assertRaises(ValueError):
                     oss.save_oss_config("a" * 257, "test-secret")
@@ -133,12 +164,21 @@ class OSSConfigTests(unittest.TestCase):
                     json={
                         "access_key_id": "marketing-video-dashboard",
                         "access_key_secret": "top-secret",
+                        "bucket": "independent-library",
                     },
                 )
                 self.assertEqual(response.status_code, 200)
                 self.assertTrue(response.get_json()["has_secret"])
+                self.assertEqual(response.get_json()["bucket"], "independent-library")
+                self.assertEqual(client.get("/api/oss/config").get_json()["storage_base_url"],
+                                 "https://oss.fandow.com/independent-library")
                 self.assertNotIn("top-secret", response.get_data(as_text=True))
                 self.assertNotIn("top-secret", client.get("/api/oss/config").get_data(as_text=True))
+                invalid = client.post("/api/oss/config", json={
+                    "access_key_id": "marketing-video-dashboard", "bucket": "../wrong",
+                })
+                self.assertEqual(invalid.status_code, 400)
+                self.assertEqual(oss.get_oss_config()["bucket"], "independent-library")
 
 
 class OSSUploadTests(unittest.TestCase):
@@ -148,7 +188,7 @@ class OSSUploadTests(unittest.TestCase):
             video.write_bytes(b"video-content")
             session = _Session(video.stat().st_size)
             progress = []
-            service = oss.OSSService("access-id", "access-secret", session=session)
+            service = oss.OSSService("access-id", "access-secret", session=session, bucket="video-library")
 
             result = service.upload_video(
                 video,
@@ -160,9 +200,9 @@ class OSSUploadTests(unittest.TestCase):
             self.assertEqual(result["object_key"], "wechat_channel/2024-07-17/video-1.mp4")
             self.assertEqual(
                 result["url"],
-                "https://oss.fandow.com/access-id/wechat_channel/2024-07-17/video-1.mp4",
+                "https://oss.fandow.com/video-library/wechat_channel/2024-07-17/video-1.mp4",
             )
-            self.assertEqual(result["bucket"], "access-id")
+            self.assertEqual(result["bucket"], "video-library")
             self.assertEqual([call[0] for call in session.calls], ["PUT", "HEAD", "GET"])
             self.assertTrue(all(call[1] == result["url"] for call in session.calls))
             self.assertIn("Authorization", session.calls[0][2])
@@ -175,15 +215,16 @@ class OSSUploadTests(unittest.TestCase):
             video = root / "video.mp4"
             video.write_bytes(b"video-content")
             with patch.object(oss, "OSS_CONFIG_FILE", root / "oss.json"):
-                oss.save_oss_config("first-library", "first-secret")
+                oss.save_oss_config("upload-user", "first-secret", bucket="first-library")
                 existing_service = oss.OSSService.from_saved_config()
                 existing_service.session = _Session(video.stat().st_size)
-                oss.save_oss_config("next-library", "next-secret")
+                oss.save_oss_config("upload-user", "", bucket="next-library")
                 next_service = oss.OSSService.from_saved_config()
                 next_service.session = _Session(video.stat().st_size)
                 for service, bucket in ((existing_service, "first-library"), (next_service, "next-library")):
                     result = service.upload_video(video, "video-1")
                     self.assertEqual(result["url"], f"https://oss.fandow.com/{bucket}/wechat_channel/video-1.mp4")
+                    self.assertIn("Credential=upload-user/", service.session.calls[0][2]["Authorization"])
 
     def test_queue_completion_is_persisted_back_to_the_video_feed(self):
         class _Uploader:

@@ -26,6 +26,7 @@ class ChannelsOSSConfigUiTests(unittest.TestCase):
         self.page.evaluate("""async () => {
             window.__config = {
                 access_key_id: 'saved-library', has_secret: true, configured: true,
+                bucket: 'saved-bucket',
                 endpoint: 'https://oss.fandow.com',
             };
             window.__saves = [];
@@ -35,14 +36,15 @@ class ChannelsOSSConfigUiTests(unittest.TestCase):
             };
             window.API = { oss: {
                 getConfig: async () => ({ ...window.__config }),
-                saveConfig: async (id, secret) => {
-                    window.__saves.push({ id, secret });
-                    window.__config = { ...window.__config, access_key_id: id };
+                saveConfig: async (id, secret, bucket) => {
+                    window.__saves.push({ id, secret, bucket });
+                    window.__config = { ...window.__config, access_key_id: id, bucket };
                     return { message: 'saved' };
                 },
                 clearConfig: async () => {
                     window.__config = {
                         ...window.__config, access_key_id: 'marketing-video-dashboard',
+                        bucket: 'marketing-video-dashboard',
                         has_secret: false, configured: false,
                     };
                     return { message: 'cleared' };
@@ -57,9 +59,11 @@ class ChannelsOSSConfigUiTests(unittest.TestCase):
 
     def test_preview_follows_input_but_only_save_changes_config(self):
         preview = self.page.locator("#oss-storage-base-url")
-        self.assertEqual(preview.text_content(), "https://oss.fandow.com/saved-library")
+        self.assertEqual(preview.text_content(), "https://oss.fandow.com/saved-bucket")
         self.assertEqual(self.page.locator("#oss-access-key-secret").input_value(), "")
         self.page.fill("#oss-access-key-id", "Creator_02.v2")
+        self.assertEqual(preview.text_content(), "https://oss.fandow.com/saved-bucket")
+        self.page.fill("#oss-bucket", "Creator_02.v2")
         self.assertEqual(preview.text_content(), "https://oss.fandow.com/Creator_02.v2")
         self.assertEqual(self.page.evaluate("window.__saves"), [])
         self.assertEqual(self.page.evaluate("window.__config.access_key_id"), "saved-library")
@@ -67,7 +71,7 @@ class ChannelsOSSConfigUiTests(unittest.TestCase):
         self.page.fill("#oss-access-key-secret", "new-test-secret")
         self.page.evaluate("() => ChannelsOSSConfigPage.save()")
         self.assertEqual(self.page.evaluate("window.__saves"), [
-            {"id": "Creator_02.v2", "secret": "new-test-secret"},
+            {"id": "Creator_02.v2", "secret": "new-test-secret", "bucket": "Creator_02.v2"},
         ])
         self.assertEqual(preview.text_content(), "https://oss.fandow.com/Creator_02.v2")
         self.assertEqual(self.page.locator("#oss-access-key-secret").input_value(), "")
@@ -80,22 +84,26 @@ class ChannelsOSSConfigUiTests(unittest.TestCase):
         self.assertEqual(self.page.evaluate("window.__saves"), [])
         self.assertIn("OSS_ACCESS_KEY_SECRET", self.page.evaluate("window.__warnings[0]"))
         self.page.fill("#oss-access-key-id", "saved-library")
+        self.page.fill("#oss-bucket", "changed-bucket")
         self.page.evaluate("() => ChannelsOSSConfigPage.save()")
-        self.assertEqual(self.page.evaluate("window.__saves"), [{"id": "saved-library", "secret": ""}])
+        self.assertEqual(self.page.evaluate("window.__saves"), [{"id": "saved-library", "secret": "", "bucket": "changed-bucket"}])
+        self.assertEqual(self.page.locator("#oss-bucket").input_value(), "changed-bucket")
+        self.assertEqual(self.page.locator("#oss-storage-base-url").text_content(), "https://oss.fandow.com/changed-bucket")
 
     def test_reload_and_clear_reset_the_preview(self):
-        self.page.fill("#oss-access-key-id", "unsaved-library")
+        self.page.fill("#oss-bucket", "unsaved-library")
         self.page.evaluate("() => ChannelsOSSConfigPage.load()")
-        self.assertEqual(self.page.locator("#oss-storage-base-url").text_content(), "https://oss.fandow.com/saved-library")
+        self.assertEqual(self.page.locator("#oss-storage-base-url").text_content(), "https://oss.fandow.com/saved-bucket")
         self.page.evaluate("() => ChannelsOSSConfigPage.clear()")
         self.assertEqual(self.page.locator("#oss-storage-base-url").text_content(), "https://oss.fandow.com/marketing-video-dashboard")
         self.assertEqual(self.page.locator("#oss-access-key-id").input_value(), "marketing-video-dashboard")
+        self.assertEqual(self.page.locator("#oss-bucket").input_value(), "marketing-video-dashboard")
         self.assertIn("请填写", self.page.locator("#oss-config-status").text_content())
 
     def test_invalid_paths_are_not_previewed_or_sent(self):
         for invalid in ("", "../other", "..", ".", "a/b", "a\\b", "a?b", "a#b", "a%b", "a b", '<img id="injected">'):
             with self.subTest(value=invalid):
-                self.page.fill("#oss-access-key-id", invalid)
+                self.page.fill("#oss-bucket", invalid)
                 self.assertIn("请填写有效", self.page.locator("#oss-storage-base-url").text_content())
                 self.page.evaluate("() => ChannelsOSSConfigPage.save()")
                 self.assertEqual(self.page.evaluate("window.__saves"), [])
@@ -103,12 +111,12 @@ class ChannelsOSSConfigUiTests(unittest.TestCase):
 
     def test_legacy_invalid_config_displays_error_and_allows_correction(self):
         self.page.evaluate("""async () => {
-            window.__config = { ...window.__config, access_key_id: 'old/invalid',
-                configured: false, configuration_error: 'OSS_ACCESS_KEY_ID 格式不合法' };
+            window.__config = { ...window.__config, bucket: 'old/invalid',
+                configured: false, configuration_error: 'OSS_BUCKET 格式不合法' };
             await ChannelsOSSConfigPage.load();
         }""")
-        self.assertIn("OSS_ACCESS_KEY_ID 格式不合法", self.page.locator("#oss-config-status").text_content())
-        self.page.fill("#oss-access-key-id", "fixed-library")
+        self.assertIn("OSS_BUCKET 格式不合法", self.page.locator("#oss-config-status").text_content())
+        self.page.fill("#oss-bucket", "fixed-library")
         self.assertEqual(self.page.locator("#oss-storage-base-url").text_content(), "https://oss.fandow.com/fixed-library")
 
 

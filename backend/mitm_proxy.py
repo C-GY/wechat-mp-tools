@@ -852,6 +852,7 @@ class ChannelsAddon:
 def save_synced_feeds(username, feeds):
     import urllib.parse
     from backend.config import load_json, save_json
+    from backend.channels_favorites import FAVORITES_LOCK, save_favorites_atomic
     from backend.channels import (
         CHANNELS_FEEDS_FILE,
         CHANNELS_FAVORITES_FILE,
@@ -882,44 +883,45 @@ def save_synced_feeds(username, feeds):
             break
     
     # 1. Update/Merge Favorites list
-    favs = load_json(CHANNELS_FAVORITES_FILE, [])
-    found_fav = False
+    with FAVORITES_LOCK:
+        favs = load_json(CHANNELS_FAVORITES_FILE, [])
+        found_fav = False
     
-    # Check if there is an existing favorite item with the real username (e.g. v2_xxx@finder)
-    for fav in favs:
-        if fav.get("username") == username:
-            if head_img_url:
-                fav["head_img_url"] = head_img_url
-            if nickname and nickname != "已同步作者":
-                fav["nickname"] = nickname
-            if first_video_url:
-                fav["video_url"] = first_video_url
-            found_fav = True
-            break
-            
-    # If not found by real username, check if there is a placeholder favorite with the nickname as username
-    if not found_fav:
+        # Check if there is an existing favorite item with the real username (e.g. v2_xxx@finder)
         for fav in favs:
-            if fav.get("username") == nickname or fav.get("nickname") == nickname:
-                # Upgrade this placeholder favorite to the real username!
-                fav["username"] = username
+            if fav.get("username") == username:
                 if head_img_url:
                     fav["head_img_url"] = head_img_url
+                if nickname and nickname != "已同步作者":
+                    fav["nickname"] = nickname
                 if first_video_url:
                     fav["video_url"] = first_video_url
                 found_fav = True
                 break
+
+        # If not found by real username, check if there is a placeholder favorite with the nickname as username
+        if not found_fav:
+            for fav in favs:
+                if fav.get("username") == nickname or fav.get("nickname") == nickname:
+                    # Upgrade this placeholder favorite to the real username!
+                    fav["username"] = username
+                    if head_img_url:
+                        fav["head_img_url"] = head_img_url
+                    if first_video_url:
+                        fav["video_url"] = first_video_url
+                    found_fav = True
+                    break
                 
-    # If still not found, append a new favorite
-    if not found_fav:
-        favs.append({
-            "username": username,
-            "nickname": nickname,
-            "head_img_url": head_img_url,
-            "video_url": first_video_url,
-            "added_time": int(time.time())
-        })
-    save_json(CHANNELS_FAVORITES_FILE, favs)
+        # If still not found, append a new favorite
+        if not found_fav:
+            favs.append({
+                "username": username,
+                "nickname": nickname,
+                "head_img_url": head_img_url,
+                "video_url": first_video_url,
+                "added_time": int(time.time())
+            })
+        save_favorites_atomic(CHANNELS_FAVORITES_FILE, favs)
     
     # 2. Update/Merge Feeds DB
     feeds_db = load_json(CHANNELS_FEEDS_FILE, {})

@@ -10,6 +10,7 @@ const ChannelsUserPage = {
     isDownloadingBatch: false,
     isBatchDownloadingCanceled: false,
     ossSyncPollTimer: null,
+    isImportingFavoritesConfig: false,
 
     render() {
         return `
@@ -111,7 +112,7 @@ const ChannelsUserPage = {
                     </div>
 
                     <div class="card animate-fade-in" style="margin-top: var(--spacing-lg);">
-                        <div class="card-header" style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border-color); padding-bottom: var(--spacing-md); margin-bottom: var(--spacing-md);">
+                        <div class="card-header" style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: var(--spacing-sm); border-bottom: 1px solid var(--border-color); padding-bottom: var(--spacing-md); margin-bottom: var(--spacing-md);">
                             <h3 class="card-title" style="margin: 0; display: flex; align-items: center; gap: 8px;">
                                 👥 已收藏创作者
                             </h3>
@@ -122,11 +123,20 @@ const ChannelsUserPage = {
                                 <button class="btn btn-secondary btn-sm" id="btn-export-all-authors" onclick="ChannelsUserPage.exportAllAuthors()" style="font-size: 0.85rem; padding: 6px 12px; font-weight: 500;">
                                     📊 导出全部创作者 Excel
                                 </button>
+                                <button class="btn btn-secondary btn-sm" id="btn-export-favorites-config" onclick="ChannelsUserPage.exportFavoritesConfig()" style="font-size: 0.85rem; padding: 6px 12px; font-weight: 500;" disabled>
+                                    💾 导出配置
+                                </button>
+                                <button class="btn btn-secondary btn-sm" id="btn-import-favorites-config" onclick="document.getElementById('favorites-config-file').click()" style="font-size: 0.85rem; padding: 6px 12px; font-weight: 500;">
+                                    📂 导入配置
+                                </button>
+                                <input type="file" id="favorites-config-file" accept=".json,application/json" aria-label="选择创作者收藏配置文件" onchange="ChannelsUserPage.importFavoritesConfig(this)" hidden>
                                 <button class="btn btn-secondary btn-sm" onclick="Router.navigate('channels_accounts')" style="font-size: 0.85rem; padding: 6px 12px; font-weight: 500;">
                                     ➕ 管理创作者/添加新作者
                                 </button>
                             </div>
                         </div>
+
+                        <p style="font-size: 0.8rem; color: var(--text-muted); margin: 0;">配置备份保存全部创作者的收藏信息，导入时按作者 ID 合并去重，保留现有收藏。</p>
 
                         <!-- 创作者选择列表 -->
                         <div id="selector-favorites-grid" class="card-grid" style="display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: var(--spacing-md); margin-top: var(--spacing-lg);">
@@ -310,6 +320,7 @@ const ChannelsUserPage = {
         const grid = document.getElementById('selector-favorites-grid');
         const empty = document.getElementById('selector-favorites-empty');
         const exportButton = document.getElementById('btn-export-all-authors');
+        const configButton = document.getElementById('btn-export-favorites-config');
         const ossButton = document.getElementById('btn-sync-all-authors-oss');
         if (!grid || !empty) return;
 
@@ -320,6 +331,7 @@ const ChannelsUserPage = {
             const favs = await API.channels.getFavorites();
             if (!favs || favs.length === 0) {
                 if (exportButton) exportButton.disabled = true;
+                if (configButton) configButton.disabled = true;
                 if (ossButton) ossButton.disabled = true;
                 grid.style.display = 'none';
                 empty.style.display = 'block';
@@ -327,6 +339,7 @@ const ChannelsUserPage = {
             }
 
             if (exportButton) exportButton.disabled = false;
+            if (configButton) configButton.disabled = false;
             if (ossButton) ossButton.disabled = false;
             empty.style.display = 'none';
             grid.style.display = 'grid';
@@ -339,20 +352,80 @@ const ChannelsUserPage = {
                          style="display: flex; gap: var(--spacing-sm); align-items: center; padding: var(--spacing-md); cursor: pointer; transition: transform 0.2s, border-color 0.2s, box-shadow 0.2s; border-radius: 12px; border: 1.5px solid var(--border-color); background: var(--bg-card);"
                          onmouseenter="this.style.transform='translateY(-4px)'; this.style.borderColor='var(--primary)'; this.style.boxShadow='var(--shadow-md)';"
                          onmouseleave="this.style.transform=''; this.style.borderColor='var(--border-color)'; this.style.boxShadow='';"
-                         onclick="Router.navigate('channels_user?username=${this.esc(fav.username)}')">
-                        <img src="${this.esc(fav.head_img_url)}" alt="${this.esc(fav.nickname)}" 
+                         data-username="${this.attr(fav.username)}"
+                         onclick="Router.navigate('channels_user?username=' + encodeURIComponent(this.dataset.username))">
+                        <img src="${this.attr(fav.head_img_url || defaultAvatar)}" alt="${this.attr(fav.nickname)}"
                              style="width: 52px; height: 52px; border-radius: 50%; object-fit: cover; border: 1.5px solid rgba(0,0,0,0.05);" 
-                             onerror="this.src='${defaultAvatar}'">
+                             data-fallback="${this.attr(defaultAvatar)}" onerror="this.onerror=null; this.src=this.dataset.fallback">
                         <div style="flex: 1; overflow: hidden;">
                             <h4 style="margin: 0; font-size: 1.05rem; font-weight: 600; color: var(--text-primary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${this.esc(fav.nickname)}</h4>
-                            <p style="margin: 4px 0 0 0; font-family: monospace; font-size: 0.75rem; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="${this.esc(fav.username)}">ID: ${this.esc(fav.username)}</p>
+                            <p style="margin: 4px 0 0 0; font-family: monospace; font-size: 0.75rem; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="${this.attr(fav.username)}">ID: ${this.esc(fav.username)}</p>
                         </div>
                     </div>
                 `;
             }).join('');
         } catch (err) {
             console.error('加载选择列表失败:', err);
-            grid.innerHTML = `<div style="grid-column: 1/-1; text-align: center; color: var(--error); padding: var(--spacing-xl);">加载收藏作者列表失败: ${err.message}</div>`;
+            grid.style.display = 'grid';
+            grid.innerHTML = `<div style="grid-column: 1/-1; text-align: center; color: var(--error); padding: var(--spacing-xl);">加载收藏作者列表失败: ${this.esc(err.message)}</div>`;
+        }
+    },
+
+    async exportFavoritesConfig() {
+        const button = document.getElementById('btn-export-favorites-config');
+        if (button?.disabled) return;
+        if (button) {
+            button.disabled = true;
+            button.textContent = '⏳ 正在导出...';
+        }
+        try {
+            const result = await API.channels.exportFavoritesConfig({ showError: false });
+            const summary = `已备份 ${Number(result.creator_count || 0)} 个创作者的收藏配置`;
+            try {
+                await API.channels.openParent(result.path, { showError: false });
+                Toast.success(`${summary}，已打开文件位置`);
+            } catch (_) {
+                Toast.warning(`${summary}，文件位置：${result.path}`);
+            }
+        } catch (err) {
+            Toast.error('导出配置失败：' + (err.message || '未知错误'));
+        } finally {
+            if (button) {
+                button.disabled = false;
+                button.textContent = '💾 导出配置';
+            }
+        }
+    },
+
+    async importFavoritesConfig(input) {
+        const file = input.files?.[0];
+        input.value = '';
+        if (!file || this.isImportingFavoritesConfig) return;
+        const button = document.getElementById('btn-import-favorites-config');
+        this.isImportingFavoritesConfig = true;
+        if (button) {
+            button.disabled = true;
+            button.textContent = '⏳ 正在导入...';
+        }
+        try {
+            const text = await file.text();
+            let config;
+            try {
+                config = JSON.parse(text.replace(/^\uFEFF/, ''));
+            } catch (_) {
+                throw new Error('文件不是有效的 JSON 配置，请重新选择导出的配置文件');
+            }
+            const result = await API.channels.importFavoritesConfig(config, { showError: false });
+            Toast.success(`导入完成：新增 ${Number(result.imported_count || 0)} 个，已存在 ${Number(result.skipped_count || 0)} 个，当前共 ${Number(result.creator_count || 0)} 个创作者`);
+            await this.loadSelectorFavorites();
+        } catch (err) {
+            Toast.error('导入配置失败：' + (err.message || '未知错误'));
+        } finally {
+            this.isImportingFavoritesConfig = false;
+            if (button) {
+                button.disabled = false;
+                button.textContent = '📂 导入配置';
+            }
         }
     },
 
@@ -993,6 +1066,6 @@ const ChannelsUserPage = {
     },
 
     attr(s) {
-        return this.esc(s).replace(/`/g, '&#96;');
+        return this.esc(s).replace(/"/g, '&quot;').replace(/'/g, '&#39;').replace(/`/g, '&#96;');
     }
 };
