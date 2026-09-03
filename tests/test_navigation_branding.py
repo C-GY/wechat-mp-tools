@@ -31,7 +31,7 @@ def test_product_ui_uses_new_brand_and_has_no_source_repository_link():
     assert "<h1>自媒体内容采集工具</h1>" in index
     assert "微信公众号文章下载管理工具" not in index
     assert "Media Tools" not in index
-    assert "github.com/x554960766/wechat-mp-tools" not in index.lower()
+    assert "github.com/" not in index.lower()
     assert "GitHub 地址" not in index
     assert 'data-page="channels_oss_config"' in index
     assert 'data-page="channels_oss_progress"' in index
