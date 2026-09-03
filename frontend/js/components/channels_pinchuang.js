@@ -8,7 +8,7 @@ const ChannelsPinchuangPage = {
             <div class="page-header animate-fade-in" style="display:flex; justify-content:space-between; align-items:flex-start; gap:16px; flex-wrap:wrap;">
                 <div>
                     <h2 class="page-title">品创中枢系统</h2>
-                    <p class="page-description">按创作者逐个刷新作品、增量同步 OSS；数据库每个视频只保留一行，仅业务数据变化时更新同步时间和批次。</p>
+                    <p class="page-description">按创作者逐个刷新作品、增量同步 OSS；按同步批次保留视频快照，同批次重试更新原快照。</p>
                 </div>
                 <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
                     <button class="btn btn-secondary" id="btn-pinchuang-export-config" onclick="ChannelsPinchuangPage.exportConfig()" title="复制已保存的完整配置，包含数据库密码和飞书密钥">📋 导出配置</button>
@@ -43,7 +43,7 @@ const ChannelsPinchuangPage = {
                     ${this.statCard('数据库处理', 'pinchuang-stat-written')}
                     ${this.statCard('失败项', 'pinchuang-stat-failed')}
                 </div>
-                <div style="font-size:.78rem; color:var(--text-muted); margin-top:8px;">数据库处理包含新增、更新和无变化的作品；无变化时保留原同步时间和批次。</div>
+                <div style="font-size:.78rem; color:var(--text-muted); margin-top:8px;">数据库处理包含本批次新增快照及同批次重试；业务数据无变化也会生成新批次快照，历史批次继续保留。</div>
             </div>
 
             <div class="card animate-fade-in" style="margin-top:var(--spacing-lg);">
@@ -113,7 +113,7 @@ const ChannelsPinchuangPage = {
                 </div>
                 <div style="overflow:auto;">
                     <table class="data-table" style="min-width:1100px; width:100%;">
-                        <thead><tr><th>创作者</th><th>状态</th><th>刷新</th><th>已有</th><th>新增</th><th>OSS</th><th title="包含新增、更新和无变化的作品">数据库处理</th><th>失败</th><th>结果</th></tr></thead>
+                        <thead><tr><th>创作者</th><th>状态</th><th>刷新</th><th>已有</th><th>新增</th><th>OSS</th><th title="包含本批次新增快照及同批次重试">数据库处理</th><th>失败</th><th>结果</th></tr></thead>
                         <tbody id="pinchuang-creator-rows"><tr><td colspan="9" style="text-align:center; padding:32px; color:var(--text-muted);">暂无执行记录</td></tr></tbody>
                     </table>
                 </div>

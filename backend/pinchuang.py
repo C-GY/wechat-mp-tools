@@ -340,7 +340,7 @@ def build_snapshot_row(
 
 
 class MySQLSnapshotAdapter:
-    """Store the latest state of each video in the legacy-named snapshot table."""
+    """Store one video snapshot per platform, source key, and sync batch."""
 
     def __init__(self, config: dict):
         self.config = dict(config or {})
@@ -397,24 +397,41 @@ class MySQLSnapshotAdapter:
                 for row in cursor.fetchall() or []:
                     if not row["Non_unique"]:
                         indexes.setdefault(row["Key_name"], []).append(row)
-            has_video_identity = any(
-                len(parts) == 2
+            has_batch_identity = any(
+                len(parts) == 3
                 and {part["Column_name"] for part in parts}
-                == {"platform", "source_video_key"}
+                == {"platform", "source_video_key", "sync_batch_id"}
                 and all(part.get("Sub_part") is None for part in parts)
                 for parts in indexes.values()
             )
-            if not has_video_identity:
+            if not has_batch_identity:
                 raise RuntimeError(
-                    f"目标表 {TARGET_TABLE} 尚未升级为每个视频一行："
-                    "请先备份并迁移数据库，建立 (platform, source_video_key) 唯一索引。"
-                    "为避免重复入库，本次同步已停止。"
+                    f"目标表 {TARGET_TABLE} 缺少按批次保存快照所需的完整唯一索引："
+                    "(platform, source_video_key, sync_batch_id)。"
+                    "请核对表结构；为避免同批次重复入库，本次同步已停止。"
+                )
+            # A leftover two-column unique key would still turn a new batch's
+            # INSERT into an UPDATE, overwriting history despite the batch key.
+            video_only_indexes = [
+                name for name, parts in indexes.items()
+                if len(parts) == 2
+                and {part["Column_name"] for part in parts}
+                == {"platform", "source_video_key"}
+            ]
+            if video_only_indexes:
+                raise RuntimeError(
+                    f"目标表 {TARGET_TABLE} 存在阻止跨批次保存快照的两字段唯一索引："
+                    f"{', '.join(video_only_indexes)}。请先备份并移除 "
+                    "(platform, source_video_key) 唯一约束，保留 "
+                    "(platform, source_video_key, sync_batch_id) 唯一索引。"
+                    "本次同步已停止。"
                 )
             return {"version": version, "table": TARGET_TABLE}
         finally:
             connection.close()
 
     def latest_rows(self, source_keys: Iterable[str]) -> dict[str, dict]:
+        """Find the latest snapshot per video for OSS reuse across batches."""
         keys = list(dict.fromkeys(str(key) for key in source_keys if key))
         if not keys:
             return {}
@@ -426,9 +443,13 @@ class MySQLSnapshotAdapter:
                     chunk = keys[offset : offset + 500]
                     placeholders = ",".join(["%s"] * len(chunk))
                     cursor.execute(
-                        "SELECT source_video_key, video_url, synced_at "
+                        "SELECT source_video_key, video_url, synced_at FROM ("
+                        "SELECT source_video_key, video_url, synced_at, "
+                        "ROW_NUMBER() OVER (PARTITION BY platform, source_video_key "
+                        "ORDER BY synced_at DESC, snapshot_id DESC) AS row_num "
                         f"FROM {TARGET_TABLE} WHERE platform=%s "
-                        f"AND source_video_key IN ({placeholders})",
+                        f"AND source_video_key IN ({placeholders})"
+                        ") AS ranked WHERE row_num=1",
                         [PLATFORM, *chunk],
                     )
                     for row in cursor.fetchall() or []:
@@ -440,7 +461,7 @@ class MySQLSnapshotAdapter:
             connection.close()
 
     def write_snapshots(self, rows: list[dict]) -> int:
-        """Upsert changed videos; return successfully processed rows, including no-ops."""
+        """Insert this batch's snapshots; retries update only the same batch."""
         if not rows:
             return 0
         columns = (
@@ -462,10 +483,9 @@ class MySQLSnapshotAdapter:
             "raw_payload",
         )
         placeholders = ",".join(["%s"] * len(columns))
-        # Only persisted business fields define a change. Raw payloads include
-        # rotating source URLs and collection timestamps, which must not advance
-        # the last-change markers by themselves. The OSS URL remains immutable.
-        business_columns = (
+        # The three-column unique key scopes retries to this batch. Refresh its
+        # metadata/time while retaining identity, created_at, and the OSS URL.
+        update_columns = (
             "external_video_id",
             "author_id",
             "author_name",
@@ -476,23 +496,10 @@ class MySQLSnapshotAdapter:
             "share_count",
             "favorite_count",
             "comment_count",
+            "synced_at",
+            "raw_payload",
         )
-        text_columns = {"external_video_id", "author_id", "author_name", "video_title"}
-        comparisons = [
-            f"(CAST({name} AS BINARY) <=> CAST(VALUES({name}) AS BINARY))"
-            if name in text_columns else f"({name} <=> VALUES({name}))"
-            for name in business_columns
-        ]
-        changed = "NOT (" + " AND ".join(comparisons) + ")"
-        # MySQL evaluates assignments against the row as it is updated. All
-        # guarded assignments MUST precede business-column assignments, so each
-        # comparison still sees the old values. <=> handles NULL vs zero/empty;
-        # binary text comparisons detect case/accent changes under ai_ci schemas.
-        updates = ",".join([
-            *(f"{name}=IF({changed},VALUES({name}),{name})"
-              for name in ("sync_batch_id", "synced_at", "raw_payload")),
-            *(f"{name}=VALUES({name})" for name in business_columns),
-        ])
+        updates = ",".join(f"{name}=VALUES({name})" for name in update_columns)
         sql = (
             f"INSERT INTO {TARGET_TABLE} ({','.join(columns)}) VALUES ({placeholders}) "
             f"ON DUPLICATE KEY UPDATE {updates}"
@@ -610,7 +617,7 @@ class PinchuangHub:
     config_backup_format = "pinchuang_config"
     storage_label = "数据库"
     thread_prefix = "pinchuang"
-    processed_suffix = "（含无变化）"
+    processed_suffix = "（含同批次重试）"
     failure_items_label = "失败作品"
     _merge_config = staticmethod(_merged_config)
     _normalize_config = staticmethod(normalize_config)
@@ -1202,7 +1209,7 @@ class PinchuangHub:
                     video_id, {"video_id": video_id, "error": str(exc)}
                 )
 
-        self._update_run(run_id, phase="writing_database", message="正在核对并入库，仅更新有变化的作品")
+        self._update_run(run_id, phase="writing_database", message="正在写入本批次视频快照，同批次重试更新原快照")
         written = adapter.write_snapshots(rows)
         item_failures = list(failure_by_video.values())
         return {

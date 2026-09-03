@@ -127,22 +127,18 @@ python app.py    # 浏览器模式（访问 http://localhost:5200）
 - 配置页输入 Bucket 会实时预览地址，点击“保存配置”后生效。只更换 Bucket 可保留原 Secret；更换 ID 必须填写对应 Secret。正在上传的批次沿用启动时的配置，后续新批次读取新配置。
 - 旧配置没有 `bucket` 字段时沿用原 Access Key ID 对应的桶，保存后独立记录桶名。已上传视频不会因切换桶或凭证而迁移、重传或替换链接；导出保留原地址。新上传记录保存所属桶，兼容仅有对象键的旧记录时仍使用旧固定桶。
 
-### 品创中枢数据库：每个视频一行
+### 品创中枢数据库：按同步批次保留视频快照
 
-`competitor_video_snapshots` 保留原表名，但现在保存视频的最新状态，不再每批次追加历史快照：
+`competitor_video_snapshots` 按同步批次记录视频状态，保留历史快照：
 
-- 唯一键为 `(platform, source_video_key)`，不包含 `sync_batch_id`。
-- 新视频上传 OSS 后插入；已有视频只有业务字段变化才更新。比较范围为平台侧视频 ID、作者 ID/名称、标题、发布时间、时长，以及点赞、分享、喜欢、评论数；支持空值与 0 的区分、文本大小写/重音差异和统计值下降。
-- `synced_at`、`sync_batch_id` 表示最后一次业务数据入库/变更的时间与批次，而非最后一次检查时间。业务字段不变时整行保持不变，包括 `raw_payload`；临时源链接、原始载荷中的采集时间/头像等变化不会单独触发更新。已有视频不重新上传或替换 `video_url`，也不修改 `created_at`。
-- 看板的“数据库处理”表示本次成功处理的作品数，包含新增、更新、无变化，不代表实际变更行数。旧字段 `database_written` 保留作为兼容接口，其含义仍是成功处理数。
-- 此规则从升级后的同步开始生效；不会回写历史 `synced_at` 或 `sync_batch_id`。数据库连接配置无需修改，也无需再次迁移表结构。
-- 旧数据库必须先迁移唯一索引，否则连接测试和同步前检查会明确报错，防止继续累积重复行。
+- 唯一键为 `(platform, source_video_key, sync_batch_id)`：同一视频在同一批次最多一行，不同批次分别保存，业务字段无变化也会新增本批次快照。
+- 同批次重试更新该快照的作者、标题、发布时间、时长、互动指标、`synced_at` 和 `raw_payload`；保留其主键、`sync_batch_id`、`created_at` 和 OSS `video_url`，不会更新其他批次。
+- 每轮任务生成新的 `sync_batch_id`；暂停后继续沿用当前批次。`synced_at` 表示该快照最近一次入库/重试的时间。
+- 新视频上传 OSS 后入库；已有视频按 `synced_at DESC, snapshot_id DESC` 选择最新快照并复用 OSS 链接，不重复上传。
+- 看板的“数据库处理”统计成功处理的快照数，包含本批次新增及同批次重试，不等于新增视频数；接口字段仍为 `database_written`。
+- 连接测试和同步前检查要求完整的三字段唯一索引（不接受普通索引或前缀索引）。若同时存在 `(platform, source_video_key)` 两字段唯一索引，会停止同步，避免跨批次写入覆盖历史。已有三字段唯一索引且无冲突约束的数据库无需迁移。
 
-旧表迁移工具：`scripts/migrate_pinchuang_single_video.py`。先退出客户端并停止其他写入程序，再操作；配置文件位于 Windows 的 `%APPDATA%\Fandow\SelfMediaContentCollector\pinchuang_hub_config.json`。先用 `--config <配置文件路径>` 只读预览，确认后追加 `--apply --writers-stopped` 执行。
-
-迁移按 `synced_at DESC, snapshot_id DESC` 保留每个视频的最新完整记录，并保留原主键和 OSS 链接。原表会完整保留为数据库中的 `competitor_video_snapshots_backup_<时间戳>`，本地 `data/backups/pinchuang_single_video/<时间戳>/` 另存 SQL 恢复文件与校验清单；不会自动删除备份。恢复文件导入独立的 `*_recovery_*` 表，不覆盖正在使用的主表。恢复或回退前必须停止写入，并核对迁移后新增数据，避免覆盖新数据。
-
-迁移使用 [MySQL 8.0.13+ 支持的写锁下多表原子重命名](https://dev.mysql.com/doc/refman/8.0/en/rename-table.html)，仅支持无外键、无触发器的 InnoDB 目标表；不符合时停止，不能绕过检查直接执行。
+历史工具 `scripts/migrate_pinchuang_single_video.py` 已停用，运行会直接退出，避免把批次历史合并为每个视频一行。如果曾执行过该迁移，应停止写入、备份当前表，再核对两字段索引和原迁移备份，恢复三字段唯一约束；已合并的历史快照只能从备份恢复，不能通过重新添加索引恢复。
 
 ---
 

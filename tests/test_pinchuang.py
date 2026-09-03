@@ -110,7 +110,7 @@ class SnapshotMappingTests(unittest.TestCase):
 
 
 class MySQLAdapterTests(unittest.TestCase):
-    def test_upsert_updates_latest_batch_and_time_without_replacing_video_url(self):
+    def test_batch_retry_updates_metadata_without_replacing_identity_or_video_url(self):
         class Cursor:
             def __init__(self):
                 self.sql = ""
@@ -153,20 +153,14 @@ class MySQLAdapterTests(unittest.TestCase):
         self.assertNotIn("created_at=", update_clause)
         self.assertNotIn("source_video_key=", update_clause)
         self.assertNotIn("platform=", update_clause)
+        self.assertNotIn("sync_batch_id=", update_clause)
         self.assertIn("like_count=VALUES(like_count)", update_clause)
-        self.assertIn("sync_batch_id=IF(NOT (", update_clause)
-        self.assertIn("synced_at=IF(NOT (", update_clause)
-        self.assertIn("raw_payload=IF(NOT (", update_clause)
-        self.assertIn("(like_count <=> VALUES(like_count))", update_clause)
-        self.assertIn("CAST(video_title AS BINARY) <=> CAST(VALUES(video_title) AS BINARY)", update_clause)
-        self.assertNotIn("video_url <=>", update_clause)
-        self.assertNotIn("raw_payload <=>", update_clause)
-        for field in ("sync_batch_id", "synced_at", "raw_payload"):
-            self.assertLess(update_clause.index(f"{field}=IF("), update_clause.index("external_video_id=VALUES("))
+        self.assertIn("synced_at=VALUES(synced_at)", update_clause)
+        self.assertIn("raw_payload=VALUES(raw_payload)", update_clause)
         self.assertEqual(count, 1)
         self.assertTrue(connection.committed)
 
-    def _connection_with_index(self, columns, *, non_unique=0, sub_part=None):
+    def _connection_with_index(self, columns, *, non_unique=0, sub_part=None, extra_unique_columns=()):
         connection = MagicMock()
         cursor = connection.cursor.return_value.__enter__.return_value
         cursor.fetchone.return_value = {"version": "8.0.24"}
@@ -176,33 +170,49 @@ class MySQLAdapterTests(unittest.TestCase):
                 {"Key_name": "video_identity", "Column_name": name,
                  "Non_unique": non_unique, "Sub_part": sub_part}
                 for name in columns
+            ] + [
+                {"Key_name": "video_only", "Column_name": name,
+                 "Non_unique": 0, "Sub_part": None}
+                for name in extra_unique_columns
             ],
         ]
         return connection
 
-    def test_connection_accepts_full_video_identity_unique_index_in_either_order(self):
+    def test_connection_accepts_full_batch_identity_unique_index_in_either_order(self):
         adapter = pinchuang.MySQLSnapshotAdapter({"database": "test"})
-        for columns in (("platform", "source_video_key"), ("source_video_key", "platform")):
+        for columns in (("platform", "source_video_key", "sync_batch_id"), ("sync_batch_id", "source_video_key", "platform")):
             with self.subTest(columns=columns):
                 connection = self._connection_with_index(columns)
                 with patch.object(adapter, "connect", return_value=connection):
                     self.assertEqual(adapter.test_connection()["table"], pinchuang.TARGET_TABLE)
                 connection.close.assert_called_once()
 
-    def test_connection_rejects_legacy_batch_nonunique_or_prefix_index(self):
+    def test_connection_requires_full_batch_identity(self):
         adapter = pinchuang.MySQLSnapshotAdapter({"database": "test"})
         for columns, options in (
-            (("platform", "source_video_key", "sync_batch_id"), {}),
-            (("platform", "source_video_key"), {"non_unique": 1}),
-            (("platform", "source_video_key"), {"sub_part": 10}),
+            (("platform", "source_video_key"), {}),
+            (("platform", "source_video_key", "sync_batch_id"), {"non_unique": 1}),
+            (("platform", "source_video_key", "sync_batch_id"), {"sub_part": 10}),
+            (("platform", "source_video_key", "sync_batch_id", "author_id"), {}),
             ((), {}),
         ):
             with self.subTest(columns=columns, options=options):
                 connection = self._connection_with_index(columns, **options)
                 with patch.object(adapter, "connect", return_value=connection):
-                    with self.assertRaisesRegex(RuntimeError, "每个视频一行"):
+                    with self.assertRaisesRegex(RuntimeError, "sync_batch_id"):
                         adapter.test_connection()
                 connection.close.assert_called_once()
+
+    def test_connection_rejects_video_only_constraint_even_with_batch_index(self):
+        adapter = pinchuang.MySQLSnapshotAdapter({"database": "test"})
+        connection = self._connection_with_index(
+            ("platform", "source_video_key", "sync_batch_id"),
+            extra_unique_columns=("source_video_key", "platform"),
+        )
+        with patch.object(adapter, "connect", return_value=connection):
+            with self.assertRaisesRegex(RuntimeError, "跨批次"):
+                adapter.test_connection()
+        connection.close.assert_called_once()
 
 
 class FeishuNotifierTests(unittest.TestCase):
