@@ -44,6 +44,61 @@ class _Session:
 
 
 class OSSConfigTests(unittest.TestCase):
+    def test_bucket_and_storage_url_follow_saved_access_key_id(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.object(oss, "OSS_CONFIG_FILE", Path(temp_dir) / "oss.json"):
+                saved = oss.save_oss_config("creator-library", "test-secret")
+                self.assertEqual(saved["bucket"], "creator-library")
+                self.assertEqual(saved["storage_base_url"], "https://oss.fandow.com/creator-library")
+                self.assertEqual(oss.get_oss_config()["bucket"], "creator-library")
+                self.assertEqual(
+                    oss.build_oss_public_url("wechat_channel/video-1.mp4"),
+                    "https://oss.fandow.com/creator-library/wechat_channel/video-1.mp4",
+                )
+                self.assertNotIn("access_key_secret", saved)
+                with self.assertRaisesRegex(ValueError, "OSS_ACCESS_KEY_SECRET"):
+                    oss.save_oss_config("another-library", "")
+                self.assertEqual(oss.get_oss_config()["bucket"], "creator-library")
+
+    def test_access_key_id_cannot_escape_its_storage_path(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.object(oss, "OSS_CONFIG_FILE", Path(temp_dir) / "oss.json"):
+                for value in ("../other", "..", ".", "a/b", "a\\b", "a?b", "a#b", "a%b", "a b", "a\tb"):
+                    with self.subTest(value=value), self.assertRaises(ValueError):
+                        oss.save_oss_config(value, "test-secret")
+                    with self.subTest(service_id=value), self.assertRaises(ValueError):
+                        oss.OSSService(value, "test-secret")
+
+    def test_invalid_legacy_config_can_be_read_and_corrected(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_file = Path(temp_dir) / "oss.json"
+            config_file.write_text(json.dumps({
+                "access_key_id": "old/invalid", "access_key_secret": "test-secret",
+            }), encoding="utf-8")
+            with patch.object(oss, "OSS_CONFIG_FILE", config_file):
+                config = oss.get_oss_config()
+                self.assertFalse(config["configured"])
+                self.assertEqual(config["storage_base_url"], "")
+                self.assertIn("OSS_ACCESS_KEY_ID", config["configuration_error"])
+                self.assertNotIn("access_key_secret", config)
+                with self.assertRaisesRegex(ValueError, "OSS_ACCESS_KEY_ID"):
+                    oss.OSSService.from_saved_config()
+                self.assertTrue(oss.save_oss_config("fixed-library", "new-secret")["configured"])
+
+    def test_valid_ids_are_not_rewritten_and_clear_restores_default(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.object(oss, "OSS_CONFIG_FILE", Path(temp_dir) / "oss.json"):
+                for value in ("Library_01.v2", "library-02", "a" * 256):
+                    with self.subTest(value=value):
+                        config = oss.save_oss_config(value, "test-secret")
+                        self.assertEqual(config["storage_base_url"], f"https://oss.fandow.com/{value}")
+                with self.assertRaises(ValueError):
+                    oss.save_oss_config("a" * 257, "test-secret")
+                oss.clear_oss_config()
+                config = oss.get_oss_config()
+                self.assertFalse(config["configured"])
+                self.assertEqual(config["storage_base_url"], "https://oss.fandow.com/marketing-video-dashboard")
+
     def test_config_is_saved_outside_installation_and_secret_is_not_returned(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             config_file = Path(temp_dir) / "profile" / "oss_config.json"
@@ -105,11 +160,30 @@ class OSSUploadTests(unittest.TestCase):
             self.assertEqual(result["object_key"], "wechat_channel/2024-07-17/video-1.mp4")
             self.assertEqual(
                 result["url"],
-                "https://oss.fandow.com/marketing-video-dashboard/wechat_channel/2024-07-17/video-1.mp4",
+                "https://oss.fandow.com/access-id/wechat_channel/2024-07-17/video-1.mp4",
             )
+            self.assertEqual(result["bucket"], "access-id")
             self.assertEqual([call[0] for call in session.calls], ["PUT", "HEAD", "GET"])
+            self.assertTrue(all(call[1] == result["url"] for call in session.calls))
             self.assertIn("Authorization", session.calls[0][2])
+            self.assertIn("Credential=access-id/", session.calls[0][2]["Authorization"])
             self.assertEqual(progress[-1], (video.stat().st_size, video.stat().st_size))
+
+    def test_running_service_keeps_its_own_target_when_saved_config_changes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            video = root / "video.mp4"
+            video.write_bytes(b"video-content")
+            with patch.object(oss, "OSS_CONFIG_FILE", root / "oss.json"):
+                oss.save_oss_config("first-library", "first-secret")
+                existing_service = oss.OSSService.from_saved_config()
+                existing_service.session = _Session(video.stat().st_size)
+                oss.save_oss_config("next-library", "next-secret")
+                next_service = oss.OSSService.from_saved_config()
+                next_service.session = _Session(video.stat().st_size)
+                for service, bucket in ((existing_service, "first-library"), (next_service, "next-library")):
+                    result = service.upload_video(video, "video-1")
+                    self.assertEqual(result["url"], f"https://oss.fandow.com/{bucket}/wechat_channel/video-1.mp4")
 
     def test_queue_completion_is_persisted_back_to_the_video_feed(self):
         class _Uploader:
@@ -117,6 +191,7 @@ class OSSUploadTests(unittest.TestCase):
                 callback(5, 10)
                 callback(10, 10)
                 return {
+                    "bucket": "creator-library",
                     "object_key": "wechat_channel/2024-07-17/video-1.mp4",
                     "url": "https://oss.example/video-1.mp4",
                     "size": 10,
@@ -160,6 +235,27 @@ class OSSUploadTests(unittest.TestCase):
             saved_video = json.loads(feeds_file.read_text(encoding="utf-8"))["author-1"][0]
             self.assertEqual(saved_video["oss_video_url"], "https://oss.example/video-1.mp4")
             self.assertEqual(saved_video["oss_upload_status"], "completed")
+            self.assertEqual(saved_video["oss_bucket"], "creator-library")
+
+    def test_config_change_does_not_reupload_a_video_with_an_existing_url(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                patch.object(oss, "OSS_UPLOAD_TASKS_FILE", Path(temp_dir) / "tasks.json"),
+                patch.object(oss.OSSService, "from_saved_config") as service_factory,
+            ):
+                manager = oss.OSSUploadManager()
+                old_url = "https://oss.fandow.com/old-library/wechat_channel/video-1.mp4"
+                video = {"id": "video-1", "oss_video_url": old_url, "oss_upload_status": "completed"}
+                candidates, batch_id = manager._build_candidates(
+                    [{"username": "author-1"}], {"author-1": [video]},
+                )
+                manager.tasks = [task for task, _ in candidates]
+                with patch.object(manager, "_download_video") as download:
+                    manager._run_batch(batch_id, candidates)
+                download.assert_not_called()
+                service_factory.return_value.upload_video.assert_not_called()
+                self.assertEqual(manager.tasks[0]["status"], "skipped")
+                self.assertEqual(manager.tasks[0]["oss_url"], old_url)
 
     def test_single_author_sync_only_queues_that_authors_works(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -222,7 +318,7 @@ class OSSUploadTests(unittest.TestCase):
 
 
 class OSSExcelTests(unittest.TestCase):
-    def _sheet(self, configured):
+    def _sheet(self, configured, videos=None):
         with tempfile.TemporaryDirectory() as temp_dir:
             workbook_path = Path(temp_dir) / "export.xlsx"
             write_channels_export_xlsx(
@@ -231,7 +327,7 @@ class OSSExcelTests(unittest.TestCase):
                     "creators": [{
                         "username": "author-1",
                         "nickname": "作者",
-                        "videos": [{
+                        "videos": videos if videos is not None else [{
                             "id": "video-1",
                             "video_url": "https://source.example/video.mp4",
                             "oss_video_url": "https://oss.example/video.mp4",
@@ -250,6 +346,18 @@ class OSSExcelTests(unittest.TestCase):
         self.assertIn("https://oss.example/video.mp4", configured)
         self.assertIn("OSS视频链接", unconfigured)
         self.assertNotIn("https://oss.example/video.mp4", unconfigured)
+
+    def test_export_preserves_recorded_and_legacy_buckets_after_config_change(self):
+        with patch.object(oss, "get_oss_config", return_value={"access_key_id": "new-library"}):
+            sheet = self._sheet(True, videos=[
+                {"id": "stored", "oss_video_url": "https://oss.fandow.com/original/wechat_channel/stored.mp4", "oss_bucket": "ignored-library", "oss_object_key": "wechat_channel/stored.mp4"},
+                {"id": "legacy", "oss_object_key": "wechat_channel/legacy.mp4"},
+                {"id": "recorded", "oss_bucket": "recorded-library", "oss_object_key": "wechat_channel/recorded.mp4"},
+            ])
+        self.assertIn("https://oss.fandow.com/original/wechat_channel/stored.mp4", sheet)
+        self.assertIn("https://oss.fandow.com/marketing-video-dashboard/wechat_channel/legacy.mp4", sheet)
+        self.assertIn("https://oss.fandow.com/recorded-library/wechat_channel/recorded.mp4", sheet)
+        self.assertNotIn("https://oss.fandow.com/new-library/", sheet)
 
 
 if __name__ == "__main__":

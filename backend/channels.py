@@ -1157,43 +1157,32 @@ def get_proxy_status():
     })
 
 
+@channels_bp.route("/wechat/environment", methods=["GET"])
+def wechat_channels_environment_status():
+    """Inspect browser presence and collection connectivity without UI actions."""
+    from backend.wechat_automation import inspect_wechat_channels_environment
+
+    return jsonify(inspect_wechat_channels_environment())
+
+
 @channels_bp.route("/wechat/open-channels", methods=["POST"])
 def open_wechat_channels_page():
     """Validate the local WeChat environment and open its Video Channels webview."""
     if sys.platform != "win32":
         return jsonify({"error": "当前自动打开流程仅支持 Windows 微信客户端"}), 400
 
-    from backend.mitm_proxy import ProxyManager, wait_for_channels_activity
-    from backend.wechat_automation import open_wechat_video_channels
+    from backend.mitm_proxy import ProxyManager
+    from backend.wechat_automation import ensure_wechat_channels_available
 
     manager = ProxyManager.get_instance()
-    proxy_started = False
+    was_running = manager.running
     try:
-        if not manager.running:
-            proxy_started = bool(manager.start())
-            if not proxy_started:
-                return jsonify({"error": "同步助手启动失败，请检查本地代理端口"}), 500
-
-        watch_started_at = time.time() - 1.0
-        result = open_wechat_video_channels()
-        activity = wait_for_channels_activity(watch_started_at, timeout=8.0)
-        monitoring_active = activity is not None
-        result.update({
-            "proxy_running": manager.running,
-            "proxy_started": proxy_started,
-            "monitoring_active": monitoring_active,
-            "message": (
-                "微信视频号已打开，监听已就绪"
-                if monitoring_active
-                else "已点击视频号入口，正在等待页面联网，请保持视频号页面打开"
-            ),
-        })
-        return jsonify(result)
+        return jsonify(ensure_wechat_channels_available())
     except RuntimeError as ex:
         return jsonify({
             "error": str(ex),
             "proxy_running": manager.running,
-            "proxy_started": proxy_started,
+            "proxy_started": not was_running and manager.running,
         }), 400
     except Exception as ex:
         return jsonify({"error": f"自动打开微信视频号失败：{ex}"}), 500

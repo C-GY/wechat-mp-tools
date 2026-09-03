@@ -1,9 +1,8 @@
 """OSS configuration, upload service, and WeChat Channels sync queue.
 
-The target storage settings intentionally match the companion ``wx_channel``
-project.  Only the two credentials are user-configurable; credentials live in
-the user's profile so replacing or reinstalling the application does not wipe
-them together with the application directory.
+The endpoint is fixed, while this application's storage convention uses the
+configured access key ID as the bucket name. Credentials live in the user's
+profile so reinstalling the application does not wipe them.
 """
 
 from __future__ import annotations
@@ -32,10 +31,12 @@ oss_bp = Blueprint("oss", __name__, url_prefix="/api/oss")
 DEFAULT_OSS_ACCESS_KEY_ID = "marketing-video-dashboard"
 DEFAULT_OSS_ENDPOINT = "https://oss.fandow.com"
 DEFAULT_OSS_REGION = "oss-cn-hangzhou"
-DEFAULT_OSS_BUCKET = "marketing-video-dashboard"
+# Object-key-only records from older versions used this fixed bucket.
+LEGACY_OSS_BUCKET = "marketing-video-dashboard"
 DEFAULT_OSS_OBJECT_PREFIX = "wechat_channel"
 OSS_UPLOAD_TASKS_FILE = DATA_DIR / "oss_upload_tasks.json"
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9_-]+$")
+_SAFE_ACCESS_KEY_ID = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
 def persistent_config_dir() -> Path:
@@ -61,12 +62,21 @@ def get_oss_config(*, include_secret: bool = False) -> dict:
     raw = _read_raw_config()
     access_key_id = str(raw.get("access_key_id") or DEFAULT_OSS_ACCESS_KEY_ID).strip()
     secret = str(raw.get("access_key_secret") or "").strip()
+    configuration_error = ""
+    try:
+        storage_base_url = build_oss_storage_url(access_key_id)
+    except ValueError as exc:
+        # Keep old invalid configurations readable so the user can correct them.
+        storage_base_url = ""
+        configuration_error = str(exc)
     result = {
         "access_key_id": access_key_id,
         "has_secret": bool(secret),
-        "configured": bool(access_key_id and secret),
+        "configured": bool(storage_base_url and secret),
         "endpoint": DEFAULT_OSS_ENDPOINT,
-        "bucket": DEFAULT_OSS_BUCKET,
+        "bucket": access_key_id,
+        "storage_base_url": storage_base_url,
+        "configuration_error": configuration_error,
     }
     if include_secret:
         result["access_key_secret"] = secret
@@ -82,8 +92,21 @@ def _validate_credential(value: str, label: str, max_length: int) -> str:
     return value
 
 
+def _validate_access_key_id(value: str) -> str:
+    value = _validate_credential(value, "OSS_ACCESS_KEY_ID", 256)
+    if value in {".", ".."} or not _SAFE_ACCESS_KEY_ID.fullmatch(value):
+        raise ValueError(
+            "OSS_ACCESS_KEY_ID 用作存储桶路径，只能包含 ASCII 字母、数字、点、下划线和连字符，且不能为 . 或 .."
+        )
+    return value
+
+
+def build_oss_storage_url(access_key_id: str) -> str:
+    return f"{DEFAULT_OSS_ENDPOINT}/{_validate_access_key_id(access_key_id)}"
+
+
 def save_oss_config(access_key_id: str, access_key_secret: str = "") -> dict:
-    access_key_id = _validate_credential(access_key_id, "OSS_ACCESS_KEY_ID", 256)
+    access_key_id = _validate_access_key_id(access_key_id)
     current = get_oss_config(include_secret=True)
     secret = str(access_key_secret or "").strip()
     if not secret:
@@ -134,9 +157,11 @@ def build_oss_object_key(material_id: str, scraped_at=None) -> str:
     return f"{DEFAULT_OSS_OBJECT_PREFIX}/{material_id}.mp4"
 
 
-def build_oss_public_url(object_key: str) -> str:
+def build_oss_public_url(object_key: str, access_key_id: str | None = None) -> str:
+    if access_key_id is None:
+        access_key_id = get_oss_config()["access_key_id"]
     encoded_key = quote(str(object_key).strip("/"), safe="/-_.~")
-    return f"{DEFAULT_OSS_ENDPOINT}/{DEFAULT_OSS_BUCKET}/{encoded_key}"
+    return f"{build_oss_storage_url(access_key_id)}/{encoded_key}"
 
 
 class _ProgressFile:
@@ -162,7 +187,7 @@ class OSSService:
     """Small dependency-free S3-compatible uploader using AWS Signature V4."""
 
     def __init__(self, access_key_id: str, access_key_secret: str, session=None):
-        self.access_key_id = _validate_credential(access_key_id, "OSS_ACCESS_KEY_ID", 256)
+        self.access_key_id = _validate_access_key_id(access_key_id)
         self.access_key_secret = _validate_credential(
             access_key_secret, "OSS_ACCESS_KEY_SECRET", 1024
         )
@@ -171,6 +196,8 @@ class OSSService:
     @classmethod
     def from_saved_config(cls):
         config = get_oss_config(include_secret=True)
+        if config.get("configuration_error"):
+            raise ValueError(config["configuration_error"])
         if not config["configured"]:
             raise ValueError("请先配置 OSS_ACCESS_KEY_SECRET")
         return cls(config["access_key_id"], config["access_key_secret"])
@@ -247,7 +274,8 @@ class OSSService:
         if total > 5 * 1024 * 1024 * 1024:
             raise ValueError("待上传视频超过 OSS 单次 PUT 的 5 GiB 上限")
         object_key = build_oss_object_key(material_id, scraped_at)
-        target_url = build_oss_public_url(object_key)
+        # Keep the target and signing credentials from the same config snapshot.
+        target_url = build_oss_public_url(object_key, self.access_key_id)
 
         digest = hashlib.sha256()
         with file_path.open("rb") as source:
@@ -302,6 +330,7 @@ class OSSService:
                 close_response()
         return {
             "object_key": object_key,
+            "bucket": self.access_key_id,
             "url": target_url,
             "size": total,
             "etag": etag,
@@ -671,6 +700,8 @@ class OSSUploadManager:
             if isinstance(video, dict) and str(video.get("id")) == task["video_id"]:
                 video["oss_video_url"] = result["url"]
                 video["oss_object_key"] = result["object_key"]
+                if result.get("bucket"):
+                    video["oss_bucket"] = result["bucket"]
                 video["oss_upload_status"] = "completed"
                 video["oss_uploaded_at"] = int(time.time())
                 break

@@ -84,7 +84,7 @@ const ChannelsLoginPage = {
                         </p>
                         <div style="font-size: 0.8rem; color: var(--text-muted); line-height: 1.5;">
                             1. 点击“启动助手”并允许添加/信任本地 CA 根证书。<br>
-                            2. Windows 用户可点击“检测并打开视频号”，系统会自动激活正在运行的微信并点击视频号入口。<br>
+                            2. 点击“检测并打开视频号”，先检测现有微信内置浏览器；最小化时只恢复原窗口，不重复点击入口。未打开浏览器时才尝试打开视频号。<br>
                             3. 视频号网页打开后即进入监听，可继续同步作者作品。
                         </div>
                         <div id="wechat-environment-status" style="display: none; margin-top: 10px; padding: 8px 10px; border-radius: 8px; font-size: 0.8rem; line-height: 1.45;"></div>
@@ -331,7 +331,7 @@ const ChannelsLoginPage = {
             statusBox.style.display = 'block';
             statusBox.style.color = '#805ad5';
             statusBox.style.background = 'rgba(128, 90, 213, 0.08)';
-            statusBox.textContent = '正在检查同步代理、微信进程和视频号入口…';
+            statusBox.textContent = '正在检测现有微信内置浏览器及视频号采集连接；已打开的浏览器不会重复打开，最小化时只恢复原窗口…';
         }
 
         try {

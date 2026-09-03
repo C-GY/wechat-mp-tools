@@ -5,7 +5,7 @@ import time
 import unittest
 from datetime import datetime
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from backend import pinchuang
 
@@ -110,7 +110,7 @@ class SnapshotMappingTests(unittest.TestCase):
 
 
 class MySQLAdapterTests(unittest.TestCase):
-    def test_retry_upsert_does_not_update_video_url(self):
+    def test_upsert_updates_latest_batch_and_time_without_replacing_video_url(self):
         class Cursor:
             def __init__(self):
                 self.sql = ""
@@ -150,9 +150,59 @@ class MySQLAdapterTests(unittest.TestCase):
             count = adapter.write_snapshots([row])
         update_clause = connection.cursor_instance.sql.split("ON DUPLICATE KEY UPDATE", 1)[1]
         self.assertNotIn("video_url=", update_clause)
+        self.assertNotIn("created_at=", update_clause)
+        self.assertNotIn("source_video_key=", update_clause)
+        self.assertNotIn("platform=", update_clause)
         self.assertIn("like_count=VALUES(like_count)", update_clause)
+        self.assertIn("sync_batch_id=IF(NOT (", update_clause)
+        self.assertIn("synced_at=IF(NOT (", update_clause)
+        self.assertIn("raw_payload=IF(NOT (", update_clause)
+        self.assertIn("(like_count <=> VALUES(like_count))", update_clause)
+        self.assertIn("CAST(video_title AS BINARY) <=> CAST(VALUES(video_title) AS BINARY)", update_clause)
+        self.assertNotIn("video_url <=>", update_clause)
+        self.assertNotIn("raw_payload <=>", update_clause)
+        for field in ("sync_batch_id", "synced_at", "raw_payload"):
+            self.assertLess(update_clause.index(f"{field}=IF("), update_clause.index("external_video_id=VALUES("))
         self.assertEqual(count, 1)
         self.assertTrue(connection.committed)
+
+    def _connection_with_index(self, columns, *, non_unique=0, sub_part=None):
+        connection = MagicMock()
+        cursor = connection.cursor.return_value.__enter__.return_value
+        cursor.fetchone.return_value = {"version": "8.0.24"}
+        cursor.fetchall.side_effect = [
+            [{"column_name": name} for name in pinchuang.TARGET_COLUMNS],
+            [
+                {"Key_name": "video_identity", "Column_name": name,
+                 "Non_unique": non_unique, "Sub_part": sub_part}
+                for name in columns
+            ],
+        ]
+        return connection
+
+    def test_connection_accepts_full_video_identity_unique_index_in_either_order(self):
+        adapter = pinchuang.MySQLSnapshotAdapter({"database": "test"})
+        for columns in (("platform", "source_video_key"), ("source_video_key", "platform")):
+            with self.subTest(columns=columns):
+                connection = self._connection_with_index(columns)
+                with patch.object(adapter, "connect", return_value=connection):
+                    self.assertEqual(adapter.test_connection()["table"], pinchuang.TARGET_TABLE)
+                connection.close.assert_called_once()
+
+    def test_connection_rejects_legacy_batch_nonunique_or_prefix_index(self):
+        adapter = pinchuang.MySQLSnapshotAdapter({"database": "test"})
+        for columns, options in (
+            (("platform", "source_video_key", "sync_batch_id"), {}),
+            (("platform", "source_video_key"), {"non_unique": 1}),
+            (("platform", "source_video_key"), {"sub_part": 10}),
+            ((), {}),
+        ):
+            with self.subTest(columns=columns, options=options):
+                connection = self._connection_with_index(columns, **options)
+                with patch.object(adapter, "connect", return_value=connection):
+                    with self.assertRaisesRegex(RuntimeError, "每个视频一行"):
+                        adapter.test_connection()
+                connection.close.assert_called_once()
 
 
 class FeishuNotifierTests(unittest.TestCase):
@@ -353,6 +403,8 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(result["new_videos"], 1)
             by_key = {row["source_video_key"]: row for row in adapter.written}
             self.assertEqual(by_key["old"]["video_url"], "https://database/old.mp4")
+            self.assertEqual(by_key["old"]["sync_batch_id"], "batch-1")
+            self.assertIsInstance(by_key["old"]["synced_at"], datetime)
             self.assertEqual(by_key["new"]["video_url"], "https://oss/new.mp4")
 
     def test_creator_failure_notifies_and_continues_to_next_creator(self):

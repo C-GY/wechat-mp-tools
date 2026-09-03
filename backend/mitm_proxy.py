@@ -40,6 +40,8 @@ _original_no_proxy = None
 
 _channels_activity_condition = threading.Condition()
 _last_channels_activity = {"timestamp": 0.0, "path": ""}
+_channels_pages_condition = threading.Condition()
+_channels_pages = {}
 
 
 def record_channels_activity(path=""):
@@ -60,6 +62,42 @@ def wait_for_channels_activity(since, timeout=8.0):
                 return None
             _channels_activity_condition.wait(timeout=remaining)
         return dict(_last_channels_activity)
+
+
+def record_channels_page(page_id="legacy", *, api_ready=True):
+    """Record a live injected page, not arbitrary traffic to the Channels host."""
+    now = time.time()
+    with _channels_pages_condition:
+        for key, page in list(_channels_pages.items()):
+            if now - page["timestamp"] > 120:
+                del _channels_pages[key]
+        key = str(page_id or "legacy")[:128]
+        _channels_pages[key] = {"timestamp": now, "api_ready": api_ready is True}
+        if len(_channels_pages) > 128:
+            oldest = min(_channels_pages, key=lambda item: _channels_pages[item]["timestamp"])
+            del _channels_pages[oldest]
+        _channels_pages_condition.notify_all()
+
+
+def wait_for_channels_page(since, timeout=8.0):
+    """Wait passively for an existing page whose collection API is ready."""
+    deadline = time.monotonic() + max(0.0, timeout)
+    with _channels_pages_condition:
+        while True:
+            ready = [page for page in _channels_pages.values()
+                     if page["api_ready"] and page["timestamp"] >= since]
+            if ready:
+                return dict(max(ready, key=lambda page: page["timestamp"]))
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            _channels_pages_condition.wait(timeout=remaining)
+
+
+def reset_channels_pages():
+    """A stopped/restarted proxy must not reuse an old page's online state."""
+    with _channels_pages_condition:
+        _channels_pages.clear()
 
 # ── 证书管理 (Certificate Management) ──────────────────────────
 
@@ -574,7 +612,15 @@ class ChannelsAddon:
             if path == "/__wx_channels_api/refresh-command":
                 from backend.channels_refresh import claim_refresh_command
 
-                command = claim_refresh_command()
+                # Older already-open pages have no query fields. Accept their
+                # command polls so upgrading the client does not reopen WeChat.
+                ready_value = flow.request.query.get("api_ready")
+                api_ready = ready_value is None or ready_value == "1"
+                record_channels_page(
+                    flow.request.query.get("page_id", "legacy"), api_ready=api_ready
+                )
+                busy = flow.request.query.get("busy") == "1"
+                command = claim_refresh_command() if api_ready and not busy else None
                 body = json.dumps(
                     {"code": 0, "data": command}, ensure_ascii=False
                 ).encode("utf-8")
@@ -586,6 +632,10 @@ class ChannelsAddon:
 
                     payload = json.loads(flow.request.get_text())
                     task = update_refresh_task(payload)
+                    # Legacy pages stop polling while collecting; their valid
+                    # progress heartbeat still proves the page is connected.
+                    if not payload.get("page_id") and payload.get("status") != "failed":
+                        record_channels_page()
                     body = json.dumps(
                         {"code": 0, "data": task}, ensure_ascii=False
                     ).encode("utf-8")
@@ -768,6 +818,7 @@ class ChannelsAddon:
                     parts.append(f"<script>{_read_injection('src/automation.js')}</script>")
                 elif path_only == "/web/pages/feed":
                     parts.append(f"<script>{_read_injection('src/feed.js')}</script>")
+                    parts.append(f"<script>{_read_injection('src/automation.js')}</script>")
                 elif path_only == "/web/pages/profile":
                     parts.append(f"<script>{_read_injection('src/profile.js')}</script>")
                     parts.append(f"<script>{_read_injection('src/automation.js')}</script>")
@@ -1525,6 +1576,7 @@ class ProxyManager:
         if self.running:
             return True
 
+        reset_channels_pages()
         cleanup_mitmproxy_logging_handlers()
         try:
             from mitmproxy.tools.dump import DumpMaster
@@ -1637,6 +1689,7 @@ class ProxyManager:
         self.loop = None
         self.thread = None
 
+        reset_channels_pages()
         cleanup_mitmproxy_logging_handlers()
 
         # 还原 NO_PROXY 环境变量

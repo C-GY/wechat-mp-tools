@@ -1,5 +1,9 @@
-/** OSS credentials for the fixed WeChat Channels storage target. */
+/** OSS credentials and the storage bucket derived from the configured ID. */
 const ChannelsOSSConfigPage = {
+    endpoint: 'https://oss.fandow.com',
+    savedAccessKeyId: '',
+    hasSavedSecret: false,
+
     render() {
         return `
             <div class="page-header animate-fade-in">
@@ -12,7 +16,7 @@ const ChannelsOSSConfigPage = {
                 </div>
                 <div class="form-group">
                     <label class="form-label" for="oss-access-key-id">OSS_ACCESS_KEY_ID</label>
-                    <input id="oss-access-key-id" class="form-input" type="text" maxlength="256" autocomplete="off" spellcheck="false" value="marketing-video-dashboard">
+                    <input id="oss-access-key-id" class="form-input" type="text" maxlength="256" autocomplete="off" spellcheck="false" value="marketing-video-dashboard" oninput="ChannelsOSSConfigPage.updateStoragePreview()">
                 </div>
                 <div class="form-group" style="margin-top: var(--spacing-md);">
                     <label class="form-label" for="oss-access-key-secret">OSS_ACCESS_KEY_SECRET</label>
@@ -23,7 +27,8 @@ const ChannelsOSSConfigPage = {
                     <div id="oss-secret-hint" class="form-hint" style="margin-top:7px;">保存后不会在页面中回显 Secret。</div>
                 </div>
                 <div style="margin-top: var(--spacing-lg); padding: 12px 14px; border-radius: 10px; background: rgba(7,193,96,0.06); color: var(--text-secondary); font-size: 0.85rem; line-height: 1.7;">
-                    固定存储地址：<code>https://oss.fandow.com/marketing-video-dashboard</code><br>
+                    存储地址预览（保存后生效）：<code id="oss-storage-base-url" style="overflow-wrap:anywhere;">https://oss.fandow.com/marketing-video-dashboard</code><br>
+                    使用 OSS_ACCESS_KEY_ID 作为存储桶路径；对应存储桶需已存在且密钥有访问权限，软件不会自动创建。新配置用于后续上传，已有视频链接保持不变。<br>
                     OSS_ACCESS_KEY_SECRET 仅发送给本机服务并保存在当前用户配置目录，接口不会返回明文。
                 </div>
                 <div id="oss-config-status" style="display:none; margin-top: var(--spacing-md); padding: 10px 12px; border-radius: 8px; font-size: 0.88rem;"></div>
@@ -38,6 +43,22 @@ const ChannelsOSSConfigPage = {
 
     async init() { await this.load(); },
     async onShow() { await this.load(); },
+
+    isValidAccessKeyId(value) {
+        return value.length <= 256 && /^[A-Za-z0-9._-]+$/.test(value) && value !== '.' && value !== '..';
+    },
+
+    updateStoragePreview() {
+        const accessKeyId = document.getElementById('oss-access-key-id')?.value.trim() || '';
+        const preview = document.getElementById('oss-storage-base-url');
+        if (preview) preview.textContent = this.isValidAccessKeyId(accessKeyId)
+            ? `${this.endpoint}/${accessKeyId}`
+            : '请填写有效的 OSS_ACCESS_KEY_ID（字母、数字、点、下划线、连字符；不能为 . 或 ..）';
+        const secretInput = document.getElementById('oss-access-key-secret');
+        if (secretInput) secretInput.placeholder = this.hasSavedSecret
+            ? (accessKeyId === this.savedAccessKeyId ? '已保存；如不修改请留空' : 'ID 已变更，请填写对应的 Secret')
+            : '请输入 OSS_ACCESS_KEY_SECRET';
+    },
 
     toggleSecret() {
         const input = document.getElementById('oss-access-key-secret');
@@ -59,20 +80,24 @@ const ChannelsOSSConfigPage = {
     async load() {
         try {
             const config = await API.oss.getConfig();
+            this.endpoint = config.endpoint || 'https://oss.fandow.com';
+            this.savedAccessKeyId = config.access_key_id || 'marketing-video-dashboard';
+            this.hasSavedSecret = !!config.has_secret;
             const idInput = document.getElementById('oss-access-key-id');
             const secretInput = document.getElementById('oss-access-key-secret');
             const hint = document.getElementById('oss-secret-hint');
-            if (idInput) idInput.value = config.access_key_id || 'marketing-video-dashboard';
+            if (idInput) idInput.value = this.savedAccessKeyId;
             if (secretInput) {
                 secretInput.value = '';
-                secretInput.placeholder = config.has_secret
-                    ? '已保存；如不修改请留空'
-                    : '请输入 OSS_ACCESS_KEY_SECRET';
             }
-            if (hint) hint.textContent = config.configured
-                ? '✅ 已保存 OSS 配置；Secret 不会在页面中回显。'
+            this.updateStoragePreview();
+            if (hint) hint.textContent = config.has_secret
+                ? '已保存 Secret，不会在页面中回显；更换 ID 时需填写对应 Secret。'
                 : '尚未配置 OSS_ACCESS_KEY_SECRET。';
-            this.showStatus(config.configured ? 'OSS 配置已就绪' : '请填写并保存 OSS 配置');
+            this.showStatus(
+                config.configuration_error || (config.configured ? 'OSS 配置已就绪' : '请填写并保存 OSS 配置'),
+                config.configuration_error ? 'error' : 'normal',
+            );
         } catch (error) {
             this.showStatus(`读取失败：${error.message || error}`, 'error');
         }
@@ -83,6 +108,10 @@ const ChannelsOSSConfigPage = {
         const accessKeyId = document.getElementById('oss-access-key-id')?.value.trim() || '';
         const accessKeySecret = document.getElementById('oss-access-key-secret')?.value.trim() || '';
         if (!accessKeyId) return Toast.warning('请填写 OSS_ACCESS_KEY_ID');
+        if (!this.isValidAccessKeyId(accessKeyId)) return Toast.warning('OSS_ACCESS_KEY_ID 只能包含字母、数字、点、下划线和连字符，且不能为 . 或 ..');
+        if (this.hasSavedSecret && accessKeyId !== this.savedAccessKeyId && !accessKeySecret) {
+            return Toast.warning('ID 已变更，请填写对应的 OSS_ACCESS_KEY_SECRET');
+        }
         try {
             if (button) { button.disabled = true; button.textContent = '保存中...'; }
             const result = await API.oss.saveConfig(accessKeyId, accessKeySecret);

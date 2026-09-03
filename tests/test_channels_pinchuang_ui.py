@@ -93,6 +93,10 @@ class ChannelsPinchuangUiTests(unittest.TestCase):
             self.assertIn("作者乙", result["row"])
             self.assertIn("第 2/2 位", result["row"])
             self.assertIn("已配置", result["oss"])
+            self.assertIn("数据库处理", page.locator("#pinchuang-stat-written").locator("..").text_content())
+            self.assertIn("每个视频只保留一行", page.locator(".page-description").text_content())
+            self.assertIn("仅业务数据变化时", page.locator(".page-description").text_content())
+            self.assertIn("无变化时保留原同步时间和批次", page.locator("#app").text_content())
         finally:
             page.evaluate("() => ChannelsPinchuangPage.destroy()")
             page.close()
@@ -104,12 +108,16 @@ class ChannelsPinchuangUiTests(unittest.TestCase):
             page.fill("#pinchuang-new-time", "22:15")
             page.locator("text=＋ 添加时间").click()
             page.fill("#pinchuang-creator-interval", "45")
-            page.locator("#btn-pinchuang-save").click()
+            page.locator("#btn-pinchuang-save-schedule").click()
             page.wait_for_function("window.__saved !== null")
             saved = page.evaluate("window.__saved")
             self.assertEqual(saved["schedule"]["times"], ["09:00", "18:30", "22:15"])
             self.assertEqual(saved["schedule"]["creator_interval_seconds"], 45)
             self.assertTrue(saved["schedule"]["enabled"])
+            self.assertEqual(
+                page.locator("#btn-pinchuang-save-schedule").text_content(),
+                "保存定时配置",
+            )
         finally:
             page.evaluate("() => ChannelsPinchuangPage.destroy()")
             page.close()

@@ -6,8 +6,12 @@ import ctypes
 import os
 import statistics
 import sys
+import threading
 import time
 from ctypes import wintypes
+
+
+_channels_environment_lock = threading.Lock()
 
 
 # Binary outline extracted from the Video Channels icon supplied by the user.
@@ -112,6 +116,12 @@ def find_video_channels_icon(grayscale, min_y=150, max_y=None):
 
 def _query_process_path(pid):
     kernel32 = ctypes.windll.kernel32
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)
+    ]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
     process = kernel32.OpenProcess(0x1000, False, pid)
     if not process:
         return ""
@@ -132,13 +142,30 @@ def _window_rect(hwnd):
     return rect
 
 
-def _find_wechat_window():
+def _enumerate_wechat_windows():
+    """Read native WeChat windows, including minimized ones, without activation."""
+    if sys.platform != "win32":
+        return []
     user32 = ctypes.windll.user32
+    user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    user32.IsIconic.argtypes = [wintypes.HWND]
+    user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+    user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
     windows = []
+    processes = {}
     callback_type = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
 
     def collect(hwnd, _):
         if not user32.IsWindowVisible(hwnd):
+            return True
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if pid.value not in processes:
+            processes[pid.value] = os.path.basename(_query_process_path(pid.value)).lower()
+        executable = processes[pid.value]
+        if executable not in {"weixin.exe", "wechat.exe", "wechatappex.exe"}:
             return True
         length = user32.GetWindowTextLengthW(hwnd)
         title_buffer = ctypes.create_unicode_buffer(length + 1)
@@ -146,30 +173,70 @@ def _find_wechat_window():
         class_buffer = ctypes.create_unicode_buffer(256)
         user32.GetClassNameW(hwnd, class_buffer, len(class_buffer))
 
-        pid = wintypes.DWORD()
-        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-        process_path = _query_process_path(pid.value)
-        executable = os.path.basename(process_path).lower()
-        title = title_buffer.value
-        class_name = class_buffer.value
-
-        is_wechat_executable = executable in {"weixin.exe", "wechat.exe"}
-        is_wechat_window = (
-            class_name in {"Qt51514QWindowIcon", "WeChatMainWndForPC"}
-            and title.lower() in {"微信", "wechat", "weixin"}
-        )
-        if is_wechat_executable and is_wechat_window:
-            windows.append({"hwnd": hwnd, "pid": pid.value, "title": title, "class_name": class_name})
+        windows.append({
+            "hwnd": hwnd, "pid": pid.value, "title": title_buffer.value,
+            "class_name": class_buffer.value, "executable": executable,
+            "minimized": bool(user32.IsIconic(hwnd)),
+        })
         return True
 
     callback = callback_type(collect)
     user32.EnumWindows(callback, 0)
+    return windows
+
+
+def _find_wechat_window():
+    windows = [window for window in _enumerate_wechat_windows()
+               if window["executable"] in {"weixin.exe", "wechat.exe"}
+               and window["class_name"] in {"Qt51514QWindowIcon", "WeChatMainWndForPC"}
+               and window["title"].lower() in {"微信", "wechat", "weixin"}]
     if not windows:
         return None
 
     # Prefer a titled main window that is already restored.
-    windows.sort(key=lambda item: bool(user32.IsIconic(item["hwnd"])))
+    windows.sort(key=lambda item: item["minimized"])
     return windows[0]
+
+
+def find_wechat_browser_windows():
+    """Find the embedded browser separately from the WeChat chat/main window.
+
+    Weixin 4.x labels its Channels browser simply '微信', even when minimized.
+    Native presence is therefore separate from the injected page's readiness.
+    """
+    windows = [window for window in _enumerate_wechat_windows()
+               if window["executable"] in {"weixin.exe", "wechat.exe", "wechatappex.exe"}
+               and window["class_name"].startswith("Chrome_WidgetWin_")
+               and (window["title"].lower() in {"微信", "wechat", "weixin"}
+                    or "视频号" in window["title"])]
+    windows.sort(key=lambda item: ("视频号" not in item["title"], item["minimized"]))
+    return windows
+
+
+def restore_wechat_browser_window(hwnd):
+    """Restore the existing minimized browser; never navigate or click WeChat."""
+    user32 = ctypes.windll.user32
+    user32.IsWindow.argtypes = [wintypes.HWND]
+    user32.IsIconic.argtypes = [wintypes.HWND]
+    user32.ShowWindowAsync.argtypes = [wintypes.HWND, ctypes.c_int]
+    if not user32.IsWindow(hwnd) or not user32.IsIconic(hwnd):
+        return False
+    return bool(user32.ShowWindowAsync(hwnd, 9))  # SW_RESTORE, same HWND/page
+
+
+def inspect_wechat_channels_environment():
+    """Read-only diagnostics: do not start the proxy, restore, click, or reload."""
+    from backend.mitm_proxy import ProxyManager, wait_for_channels_page
+
+    manager = ProxyManager.get_instance()
+    browsers = find_wechat_browser_windows()
+    page = wait_for_channels_page(time.time() - 20, timeout=0) if manager.running else None
+    return {
+        "proxy_running": manager.running,
+        "browser_open": bool(browsers),
+        "browser_windows": browsers,
+        "monitoring_active": page is not None,
+    }
 
 
 def _restore_and_focus(hwnd):
@@ -375,3 +442,83 @@ def open_wechat_video_channels():
         "click_method": click_method,
         "clicked": True,
     }
+
+
+def ensure_wechat_channels_available(
+    detection_timeout=20.0, open_timeout=8.0
+):
+    """Reuse a connected Channels page before attempting any desktop action.
+
+    The injected page's poll proves that the browser is on Channels and can
+    accept collection commands. A WeChat process, window title, or a request for
+    a static asset alone does not prove that the environment is usable.
+    """
+    if sys.platform != "win32":
+        raise RuntimeError("当前自动打开流程仅支持 Windows 微信客户端")
+    from backend.mitm_proxy import ProxyManager, wait_for_channels_page
+
+    with _channels_environment_lock:
+        checked_at = time.time()
+        browsers = find_wechat_browser_windows()
+        manager = ProxyManager.get_instance()
+        proxy_started = False
+        if not manager.running:
+            proxy_started = bool(manager.start())
+            if not proxy_started:
+                raise RuntimeError("微信极速同步助手启动失败，请检查本地代理端口")
+
+        # A minimized Chromium webview may suspend/throttle its injected poll.
+        # Restore that exact browser, not the WeChat main window or sidebar.
+        browser_restored = False
+        if browsers and browsers[0].get("minimized"):
+            browser_restored = restore_wechat_browser_window(browsers[0]["hwnd"])
+
+        # Allow an already-open page to reconnect after a client/proxy restart.
+        # Require a fresh response: old state can belong to a now-closed page.
+        # Legacy pages report every 15 seconds while collecting, so allow 20.
+        page = wait_for_channels_page(checked_at, timeout=detection_timeout)
+        if page is not None:
+            return {
+                "proxy_running": manager.running,
+                "proxy_started": proxy_started,
+                "monitoring_active": True,
+                "opened": False,
+                "browser_open": bool(browsers),
+                "browser_restored": browser_restored,
+                "message": (
+                    "已恢复现有视频号浏览器，采集接口已就绪，未重新打开页面"
+                    if browser_restored else "检测到现有微信视频号页面可用，已跳过打开步骤"
+                ),
+            }
+
+        # No heartbeat is not proof that the browser is absent. Recheck native
+        # windows in case the user opened one while we waited, and never click
+        # the sidebar again when an embedded browser already exists.
+        browsers = find_wechat_browser_windows()
+        if browsers:
+            return {
+                "proxy_running": manager.running,
+                "proxy_started": proxy_started,
+                "monitoring_active": False,
+                "opened": False,
+                "browser_open": True,
+                "browser_restored": browser_restored,
+                "message": "检测到微信内置浏览器已打开，未重复打开；视频号采集连接尚未就绪，请在现有窗口打开或刷新视频号页面后重试",
+            }
+
+        started_at = time.time()
+        result = open_wechat_video_channels()
+        page = wait_for_channels_page(started_at, timeout=open_timeout)
+        available = page is not None
+        return {
+            **(result or {}),
+            "proxy_running": manager.running,
+            "proxy_started": proxy_started,
+            "monitoring_active": available,
+            "opened": True,
+            "message": (
+                "视频号已自动打开，采集接口已就绪"
+                if available else
+                "已尝试打开视频号，但采集页面尚未就绪，请检查微信中的视频号页面"
+            ),
+        }

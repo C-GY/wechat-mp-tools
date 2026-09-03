@@ -340,7 +340,7 @@ def build_snapshot_row(
 
 
 class MySQLSnapshotAdapter:
-    """MySQL adapter for the fixed Pinchuang snapshot-table seam."""
+    """Store the latest state of each video in the legacy-named snapshot table."""
 
     def __init__(self, config: dict):
         self.config = dict(config or {})
@@ -391,6 +391,25 @@ class MySQLSnapshotAdapter:
                 raise RuntimeError(
                     f"目标表 {TARGET_TABLE} 缺少字段：{', '.join(missing)}"
                 )
+            with connection.cursor() as cursor:
+                cursor.execute(f"SHOW INDEX FROM {TARGET_TABLE}")
+                indexes: dict[str, list[dict]] = {}
+                for row in cursor.fetchall() or []:
+                    if not row["Non_unique"]:
+                        indexes.setdefault(row["Key_name"], []).append(row)
+            has_video_identity = any(
+                len(parts) == 2
+                and {part["Column_name"] for part in parts}
+                == {"platform", "source_video_key"}
+                and all(part.get("Sub_part") is None for part in parts)
+                for parts in indexes.values()
+            )
+            if not has_video_identity:
+                raise RuntimeError(
+                    f"目标表 {TARGET_TABLE} 尚未升级为每个视频一行："
+                    "请先备份并迁移数据库，建立 (platform, source_video_key) 唯一索引。"
+                    "为避免重复入库，本次同步已停止。"
+                )
             return {"version": version, "table": TARGET_TABLE}
         finally:
             connection.close()
@@ -407,13 +426,9 @@ class MySQLSnapshotAdapter:
                     chunk = keys[offset : offset + 500]
                     placeholders = ",".join(["%s"] * len(chunk))
                     cursor.execute(
-                        "SELECT source_video_key, video_url, synced_at FROM ("
-                        f"SELECT source_video_key, video_url, synced_at, "
-                        "ROW_NUMBER() OVER (PARTITION BY source_video_key "
-                        "ORDER BY synced_at DESC, snapshot_id DESC) AS row_num "
+                        "SELECT source_video_key, video_url, synced_at "
                         f"FROM {TARGET_TABLE} WHERE platform=%s "
-                        f"AND source_video_key IN ({placeholders})"
-                        ") AS ranked WHERE row_num=1",
+                        f"AND source_video_key IN ({placeholders})",
                         [PLATFORM, *chunk],
                     )
                     for row in cursor.fetchall() or []:
@@ -425,6 +440,7 @@ class MySQLSnapshotAdapter:
             connection.close()
 
     def write_snapshots(self, rows: list[dict]) -> int:
+        """Upsert changed videos; return successfully processed rows, including no-ops."""
         if not rows:
             return 0
         columns = (
@@ -446,9 +462,10 @@ class MySQLSnapshotAdapter:
             "raw_payload",
         )
         placeholders = ",".join(["%s"] * len(columns))
-        # A retry of the same batch refreshes mutable metadata but deliberately
-        # keeps the first durable OSS URL already stored for that snapshot.
-        update_columns = (
+        # Only persisted business fields define a change. Raw payloads include
+        # rotating source URLs and collection timestamps, which must not advance
+        # the last-change markers by themselves. The OSS URL remains immutable.
+        business_columns = (
             "external_video_id",
             "author_id",
             "author_name",
@@ -459,10 +476,23 @@ class MySQLSnapshotAdapter:
             "share_count",
             "favorite_count",
             "comment_count",
-            "synced_at",
-            "raw_payload",
         )
-        updates = ",".join(f"{name}=VALUES({name})" for name in update_columns)
+        text_columns = {"external_video_id", "author_id", "author_name", "video_title"}
+        comparisons = [
+            f"(CAST({name} AS BINARY) <=> CAST(VALUES({name}) AS BINARY))"
+            if name in text_columns else f"({name} <=> VALUES({name}))"
+            for name in business_columns
+        ]
+        changed = "NOT (" + " AND ".join(comparisons) + ")"
+        # MySQL evaluates assignments against the row as it is updated. All
+        # guarded assignments MUST precede business-column assignments, so each
+        # comparison still sees the old values. <=> handles NULL vs zero/empty;
+        # binary text comparisons detect case/accent changes under ai_ci schemas.
+        updates = ",".join([
+            *(f"{name}=IF({changed},VALUES({name}),{name})"
+              for name in ("sync_batch_id", "synced_at", "raw_payload")),
+            *(f"{name}=VALUES({name})" for name in business_columns),
+        ])
         sql = (
             f"INSERT INTO {TARGET_TABLE} ({','.join(columns)}) VALUES ({placeholders}) "
             f"ON DUPLICATE KEY UPDATE {updates}"
@@ -565,38 +595,14 @@ class FeishuNotifier:
         return {"sent": False, "attempts": attempts, "error": last_error}
 
 
-def ensure_wechat_channels_available(activity_max_age=20.0, open_timeout=8.0) -> dict:
-    """Check the injected WeChat page and open it only when it is unavailable."""
-    if sys.platform != "win32":
-        raise RuntimeError("品创中枢自动同步目前仅支持 Windows 微信客户端")
-    from backend.mitm_proxy import ProxyManager, wait_for_channels_activity
-    from backend.wechat_automation import open_wechat_video_channels
+def ensure_wechat_channels_available(detection_timeout=20.0, open_timeout=8.0) -> dict:
+    """Use the same detect-before-open policy as the manual environment button."""
+    from backend.wechat_automation import ensure_wechat_channels_available as ensure
 
-    manager = ProxyManager.get_instance()
-    if not manager.running and not manager.start():
-        raise RuntimeError("微信极速同步助手启动失败，请检查本地代理端口")
-
-    recent = wait_for_channels_activity(time.time() - activity_max_age, timeout=0)
-    if recent is not None:
-        return {
-            "proxy_running": True,
-            "monitoring_active": True,
-            "opened": False,
-            "message": "检测到视频号页面正在运行",
-        }
-
-    started_at = time.time() - 1
-    result = open_wechat_video_channels()
-    activity = wait_for_channels_activity(started_at, timeout=open_timeout)
-    if activity is None:
-        raise RuntimeError("已尝试打开视频号，但未检测到页面联网，请检查微信客户端")
-    return {
-        **(result or {}),
-        "proxy_running": manager.running,
-        "monitoring_active": True,
-        "opened": True,
-        "message": "视频号已自动打开，监听已就绪",
-    }
+    result = ensure(detection_timeout=detection_timeout, open_timeout=open_timeout)
+    if not result["monitoring_active"]:
+        raise RuntimeError(result["message"])
+    return result
 
 
 class PinchuangHub:
@@ -1140,7 +1146,7 @@ class PinchuangHub:
                     video_id, {"video_id": video_id, "error": str(exc)}
                 )
 
-        self._update_run(run_id, phase="writing_database", message="正在写入 MySQL 快照表")
+        self._update_run(run_id, phase="writing_database", message="正在核对并入库，仅更新有变化的作品")
         written = adapter.write_snapshots(rows)
         item_failures = list(failure_by_video.values())
         return {
@@ -1286,7 +1292,7 @@ class PinchuangHub:
             message = (
                 f"同步完成：成功 {totals['completed_creators']} 个，"
                 f"失败/部分失败 {totals['failed_creators']} 个，"
-                f"写入 {totals['database_written']} 条快照"
+                f"数据库处理 {totals['database_written']} 条作品（含无变化）"
             )
             self._finish_run(run_id, status, message)
         except Exception as exc:

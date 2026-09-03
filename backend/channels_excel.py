@@ -261,8 +261,12 @@ def write_channels_export_xlsx(payload: dict, output_path: Path) -> None:
             if oss_configured:
                 oss_video_url = video.get("oss_video_url") or ""
                 if not oss_video_url and video.get("oss_object_key"):
-                    from backend.oss import build_oss_public_url
-                    oss_video_url = build_oss_public_url(video.get("oss_object_key"))
+                    from backend.oss import LEGACY_OSS_BUCKET, build_oss_public_url
+                    # Never relocate old objects when the current credentials change.
+                    oss_video_url = build_oss_public_url(
+                        video.get("oss_object_key"),
+                        video.get("oss_bucket") or LEGACY_OSS_BUCKET,
+                    )
             video_rows.append([
                 {"type": "number", "value": video_index},
                 {"value": nickname},

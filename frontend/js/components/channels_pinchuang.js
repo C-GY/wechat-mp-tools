@@ -8,7 +8,7 @@ const ChannelsPinchuangPage = {
             <div class="page-header animate-fade-in" style="display:flex; justify-content:space-between; align-items:flex-start; gap:16px; flex-wrap:wrap;">
                 <div>
                     <h2 class="page-title">品创中枢系统</h2>
-                    <p class="page-description">按创作者逐个刷新视频号作品、同步 OSS，并写入 MySQL 8 快照表。</p>
+                    <p class="page-description">按创作者逐个刷新作品、增量同步 OSS；数据库每个视频只保留一行，仅业务数据变化时更新同步时间和批次。</p>
                 </div>
                 <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
                     <button class="btn btn-primary" id="btn-pinchuang-run" onclick="ChannelsPinchuangPage.startRun()">▶ 立即执行</button>
@@ -38,9 +38,10 @@ const ChannelsPinchuangPage = {
                     ${this.statCard('数据库已有', 'pinchuang-stat-existing')}
                     ${this.statCard('新增作品', 'pinchuang-stat-new')}
                     ${this.statCard('OSS 完成', 'pinchuang-stat-uploaded')}
-                    ${this.statCard('写入快照', 'pinchuang-stat-written')}
+                    ${this.statCard('数据库处理', 'pinchuang-stat-written')}
                     ${this.statCard('失败项', 'pinchuang-stat-failed')}
                 </div>
+                <div style="font-size:.78rem; color:var(--text-muted); margin-top:8px;">数据库处理包含新增、更新和无变化的作品；无变化时保留原同步时间和批次。</div>
             </div>
 
             <div class="card animate-fade-in" style="margin-top:var(--spacing-lg);">
@@ -83,6 +84,10 @@ const ChannelsPinchuangPage = {
                     </div>
                 </div>
                 <div id="pinchuang-time-list" style="display:flex; gap:8px; flex-wrap:wrap; margin-top:14px;"></div>
+                <div style="display:flex; gap:10px; align-items:center; margin-top:16px; flex-wrap:wrap;">
+                    <button class="btn btn-primary" id="btn-pinchuang-save-schedule" onclick="ChannelsPinchuangPage.saveConfig()">保存定时配置</button>
+                    <span style="font-size:.8rem; color:var(--text-muted);">添加、删除时间或修改间隔后，请点击保存。</span>
+                </div>
             </div>
 
             <div class="card animate-fade-in" style="margin-top:var(--spacing-lg);">
@@ -106,7 +111,7 @@ const ChannelsPinchuangPage = {
                 </div>
                 <div style="overflow:auto;">
                     <table class="data-table" style="min-width:1100px; width:100%;">
-                        <thead><tr><th>创作者</th><th>状态</th><th>刷新</th><th>已有</th><th>新增</th><th>OSS</th><th>写库</th><th>失败</th><th>结果</th></tr></thead>
+                        <thead><tr><th>创作者</th><th>状态</th><th>刷新</th><th>已有</th><th>新增</th><th>OSS</th><th title="包含新增、更新和无变化的作品">数据库处理</th><th>失败</th><th>结果</th></tr></thead>
                         <tbody id="pinchuang-creator-rows"><tr><td colspan="9" style="text-align:center; padding:32px; color:var(--text-muted);">暂无执行记录</td></tr></tbody>
                     </table>
                 </div>
@@ -195,9 +200,15 @@ const ChannelsPinchuangPage = {
     },
 
     async saveConfig(showToast = true) {
-        const button = document.getElementById('btn-pinchuang-save');
+        const buttons = [
+            [document.getElementById('btn-pinchuang-save'), '保存全部配置'],
+            [document.getElementById('btn-pinchuang-save-schedule'), '保存定时配置'],
+        ].filter(([button]) => !!button);
         try {
-            if (button) { button.disabled = true; button.textContent = '保存中...'; }
+            buttons.forEach(([button]) => {
+                button.disabled = true;
+                button.textContent = '保存中...';
+            });
             const result = await API.pinchuang.saveConfig(this.collectConfig());
             if (showToast) Toast.success(result.message || '配置已保存');
             await this.loadConfig();
@@ -206,7 +217,10 @@ const ChannelsPinchuangPage = {
             Toast.error(`保存失败：${error.message || error}`);
             return false;
         } finally {
-            if (button) { button.disabled = false; button.textContent = '保存全部配置'; }
+            buttons.forEach(([button, label]) => {
+                button.disabled = false;
+                button.textContent = label;
+            });
         }
     },
 
@@ -414,7 +428,7 @@ const ChannelsPinchuangPage = {
         return ({ queued:'等待中', running:'执行中', pausing:'正在暂停', paused:'已暂停', completed:'已完成', partial:'部分失败', failed:'失败', interrupted:'已中断' })[value] || '空闲';
     },
     phaseLabel(value) {
-        return ({ queued:'任务排队', preflight:'环境检查', checking_wechat:'检查视频号', refreshing:'刷新创作者', checking_database:'比对数据库', uploading_oss:'同步 OSS', writing_database:'写入数据库', creator_interval:'创作者间隔', paused:'已暂停', finished:'已结束', interrupted:'已中断' })[value] || '准备中';
+        return ({ queued:'任务排队', preflight:'环境检查', checking_wechat:'检查视频号', refreshing:'刷新创作者', checking_database:'比对数据库', uploading_oss:'同步 OSS', writing_database:'数据库处理', creator_interval:'创作者间隔', paused:'已暂停', finished:'已结束', interrupted:'已中断' })[value] || '准备中';
     },
     value(id) { return document.getElementById(id)?.value.trim() || ''; },
     setValue(id, value) { const el = document.getElementById(id); if (el) el.value = value == null ? '' : value; },

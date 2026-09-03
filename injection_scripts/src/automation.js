@@ -18,6 +18,7 @@
   if (typeof WXU === "undefined") return;
   if (window.__wx_harvest_inited__) return;
   window.__wx_harvest_inited__ = true;
+  var pageId = Date.now().toString(36) + "-" + Math.random().toString(36).slice(2);
 
   // ---- 可调参数（测风控时单变量扫描这几个）----
   var RATE_LIMIT_PER_MIN = 20; // 令牌桶：60s 窗口内最多 finder 调用次数
@@ -207,6 +208,7 @@
   async function reportRemoteProgress(taskId, progress) {
     var body = progress || {};
     body.task_id = taskId;
+    body.page_id = pageId;
     try {
       await WXU.request({
         method: "POST",
@@ -542,12 +544,16 @@
 
   var remotePollBusy = false;
   async function pollRemoteRefreshCommand() {
-    if (running || remotePollBusy) return;
+    if (remotePollBusy) return;
     remotePollBusy = true;
     try {
+      // Keep reporting readiness even while collecting. No desktop focus or
+      // visible rendering is needed for the backend to detect this page.
+      var apiReady = !!(WXU.API && typeof WXU.API.finderUserPage === "function");
       var ret = await WXU.request({
         method: "GET",
-        url: "/__wx_channels_api/refresh-command",
+        url: "/__wx_channels_api/refresh-command?page_id=" + encodeURIComponent(pageId) +
+          "&api_ready=" + (apiReady ? "1" : "0") + "&busy=" + (running ? "1" : "0"),
       });
       var command = ret && ret[1];
       // 兼容 request 包装器返回 data 或完整响应对象两种形式。
