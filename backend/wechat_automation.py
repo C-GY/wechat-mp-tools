@@ -5,6 +5,7 @@ from __future__ import annotations
 import ctypes
 import os
 import statistics
+import subprocess
 import sys
 import threading
 import time
@@ -278,6 +279,28 @@ def _window_rect(hwnd):
     return rect
 
 
+class _WindowPlacement(ctypes.Structure):
+    _fields_ = [
+        ("length", wintypes.UINT),
+        ("flags", wintypes.UINT),
+        ("show_cmd", wintypes.UINT),
+        ("min_position", wintypes.POINT),
+        ("max_position", wintypes.POINT),
+        ("normal_position", wintypes.RECT),
+    ]
+
+
+def _window_normal_size(hwnd):
+    """Return the restored size even when a window is minimized or tray-hidden."""
+    placement = _WindowPlacement()
+    placement.length = ctypes.sizeof(placement)
+    if ctypes.windll.user32.GetWindowPlacement(hwnd, ctypes.byref(placement)):
+        rect = placement.normal_position
+    else:
+        rect = _window_rect(hwnd)
+    return rect.right - rect.left, rect.bottom - rect.top
+
+
 def _enumerate_wechat_windows(*, include_hidden=False):
     """Read native WeChat windows without activating or changing them."""
     if sys.platform != "win32":
@@ -326,15 +349,37 @@ def _find_wechat_window():
     # Closing Weixin 4.x normally hides the existing main window to the tray;
     # it does not terminate the process. Include that hidden HWND so the same
     # restore path works whether the window is open, minimized, or tray-hidden.
-    windows = [window for window in _enumerate_wechat_windows(include_hidden=True)
-               if window["executable"] in {"weixin.exe", "wechat.exe"}
-               and window["class_name"] in {"Qt51514QWindowIcon", "WeChatMainWndForPC"}
-               and window["title"].lower() in {"微信", "wechat", "weixin"}]
+    candidates = [
+        window
+        for window in _enumerate_wechat_windows(include_hidden=True)
+        if window["executable"] in {"weixin.exe", "wechat.exe"}
+        and window["class_name"] in {"Qt51514QWindowIcon", "WeChatMainWndForPC"}
+        and window["title"].lower() in {"微信", "wechat", "weixin"}
+    ]
+    windows = []
+    for window in candidates:
+        try:
+            normal_width, normal_height = _window_normal_size(window["hwnd"])
+        except RuntimeError:
+            continue
+        # Weixin creates small Qt windows with the same class/title after the
+        # main window is restored. Selecting one of those on a later call makes
+        # Weixin appear frozen while the real main window remains minimized.
+        if normal_width < 500 or normal_height < 500:
+            continue
+        item = dict(window)
+        item["normal_size"] = (normal_width, normal_height)
+        windows.append(item)
     if not windows:
         return None
 
-    # Prefer a titled main window that is already restored.
-    windows.sort(key=lambda item: item["minimized"])
+    # Prefer a visible, already-restored main window. Area is the final
+    # tiebreaker when a client update temporarily leaves two plausible HWNDs.
+    windows.sort(key=lambda item: (
+        not item.get("visible", True),
+        item["minimized"],
+        -(item["normal_size"][0] * item["normal_size"][1]),
+    ))
     return windows[0]
 
 
@@ -381,36 +426,16 @@ def inspect_wechat_channels_environment():
 
 def _restore_and_focus(hwnd):
     user32 = ctypes.windll.user32
-    kernel32 = ctypes.windll.kernel32
 
-    foreground = user32.GetForegroundWindow()
-    foreground_thread = user32.GetWindowThreadProcessId(foreground, None) if foreground else 0
-    target_thread = user32.GetWindowThreadProcessId(hwnd, None)
-    current_thread = kernel32.GetCurrentThreadId()
-    attached_threads = []
-
-    # Attach to the current foreground queue so Windows permits a background
-    # Flask worker to activate WeChat when the user presses our button.
-    for thread_id in {foreground_thread, target_thread}:
-        if thread_id and thread_id != current_thread:
-            if user32.AttachThreadInput(current_thread, thread_id, True):
-                attached_threads.append(thread_id)
-    try:
-        user32.ShowWindowAsync(hwnd, 9)  # SW_RESTORE
-        user32.AllowSetForegroundWindow(-1)  # ASFW_ANY
-        # The synthetic Alt press is a second activation path for newer Windows.
-        user32.keybd_event(0x12, 0, 0, 0)
-        user32.keybd_event(0x12, 0, 0x0002, 0)
-        user32.BringWindowToTop(hwnd)
-        user32.SetForegroundWindow(hwnd)
-        user32.SetFocus(hwnd)
-        try:
-            user32.SwitchToThisWindow(hwnd, True)
-        except Exception:
-            pass
-    finally:
-        for thread_id in attached_threads:
-            user32.AttachThreadInput(current_thread, thread_id, False)
+    # Do not attach input queues, synthesize Alt, or call cross-process
+    # SetFocus here. Those techniques can break real mouse input when the user
+    # is connected through remote-control software (for example GameViewer),
+    # making an otherwise responsive Weixin window appear frozen after a later
+    # launcher call. Try the ordinary non-invasive APIs first; the caller can
+    # use one safe title-bar activation click if Windows still denies focus.
+    user32.ShowWindowAsync(hwnd, 9)  # SW_RESTORE for a genuinely minimized window
+    user32.BringWindowToTop(hwnd)
+    user32.SetForegroundWindow(hwnd)
 
     deadline = time.time() + 3
     while time.time() < deadline:
@@ -418,8 +443,167 @@ def _restore_and_focus(hwnd):
             return True
         time.sleep(0.1)
         user32.ShowWindowAsync(hwnd, 9)
+        user32.BringWindowToTop(hwnd)
         user32.SetForegroundWindow(hwnd)
     return not user32.IsIconic(hwnd) and user32.GetForegroundWindow() == hwnd
+
+
+def _set_window_topmost(hwnd, enabled):
+    """Temporarily keep WeChat above full-screen remote-control windows."""
+    user32 = ctypes.windll.user32
+    user32.SetWindowPos.argtypes = [
+        wintypes.HWND,
+        wintypes.HWND,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        wintypes.UINT,
+    ]
+    user32.SetWindowPos.restype = wintypes.BOOL
+    insert_after = wintypes.HWND(-1 if enabled else -2)  # TOPMOST / NOTOPMOST
+    # The window must already be visible through Qt. SWP_SHOWWINDOW can create
+    # a painted but unclickable ghost when Weixin is internally hidden to tray.
+    flags = 0x0001 | 0x0002  # SWP_NOSIZE | SWP_NOMOVE
+    if not user32.SetWindowPos(hwnd, insert_after, 0, 0, 0, 0, flags):
+        raise RuntimeError("无法将微信主窗口显示到前台")
+
+
+def _begin_wechat_interaction(hwnd):
+    """Expose WeChat for real input and remember the original z-order state."""
+    user32 = ctypes.windll.user32
+    if not user32.IsWindowVisible(hwnd):
+        raise RuntimeError("微信主窗口仍处于托盘隐藏状态")
+    was_topmost = bool(user32.GetWindowLongW(hwnd, -20) & 0x00000008)
+    if not was_topmost:
+        _set_window_topmost(hwnd, True)
+    try:
+        focused = _restore_and_focus(hwnd)
+    except Exception:
+        if not was_topmost:
+            _set_window_topmost(hwnd, False)
+        raise
+    return {"focused": focused, "was_topmost": was_topmost}
+
+
+def _toggle_wechat_main_window_hotkey():
+    """Ask Weixin itself to toggle the main window via its global shortcut."""
+    user32 = ctypes.windll.user32
+    pressed = []
+    try:
+        for virtual_key in (0x11, 0x12, 0x57):  # Ctrl + Alt + W
+            user32.keybd_event(virtual_key, 0, 0, 0)
+            pressed.append(virtual_key)
+            time.sleep(0.04)
+    finally:
+        for virtual_key in reversed(pressed):
+            user32.keybd_event(virtual_key, 0, 0x0002, 0)
+            time.sleep(0.04)
+
+
+def _invoke_wechat_notification_icon():
+    """Invoke Weixin's notification-area icon through Windows UI Automation."""
+    script = r"""
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+$root = [System.Windows.Automation.AutomationElement]::RootElement
+function Find-WechatTrayIcon {
+    param($searchRoot)
+    $all = $searchRoot.FindAll(
+        [System.Windows.Automation.TreeScope]::Descendants,
+        [System.Windows.Automation.Condition]::TrueCondition
+    )
+    for ($i = 0; $i -lt $all.Count; $i++) {
+        $item = $all.Item($i)
+        if (
+            $item.Current.ControlType -eq [System.Windows.Automation.ControlType]::Button -and
+            $item.Current.ClassName -eq 'SystemTray.NormalButton' -and
+            $item.Current.Name.Trim() -in @('微信', 'WeChat', 'Weixin')
+        ) {
+            return $item
+        }
+    }
+    return $null
+}
+$icon = Find-WechatTrayIcon $root
+if ($null -eq $icon) {
+    $condition = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::AutomationIdProperty,
+        'SystemTrayIcon'
+    )
+    $arrow = $root.FindFirst(
+        [System.Windows.Automation.TreeScope]::Descendants,
+        $condition
+    )
+    if ($null -eq $arrow) { exit 2 }
+    $arrow.GetCurrentPattern(
+        [System.Windows.Automation.InvokePattern]::Pattern
+    ).Invoke()
+    Start-Sleep -Milliseconds 500
+    $root = [System.Windows.Automation.AutomationElement]::RootElement
+    $icon = Find-WechatTrayIcon $root
+}
+if ($null -eq $icon) { exit 3 }
+$icon.GetCurrentPattern(
+    [System.Windows.Automation.InvokePattern]::Pattern
+).Invoke()
+exit 0
+"""
+    try:
+        result = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                script,
+            ],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=7,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
+def _restore_tray_hidden_wechat(window, timeout=4.0):
+    """Restore a Qt-hidden main window without forcing its native HWND visible."""
+    hwnd = window["hwnd"]
+    if window.get("visible", True):
+        return window
+
+    # ShowWindow/SWP_SHOWWINDOW only changes the native flag; Weixin's Qt state
+    # stays hidden and the resulting window paints but ignores mouse input.
+    # Invoke the real notification icon so Qt performs its own restore. The
+    # shortcut is only a fallback for older Windows notification areas.
+    if not _invoke_wechat_notification_icon():
+        _toggle_wechat_main_window_hotkey()
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        candidate = _find_wechat_window()
+        if candidate and candidate.get("visible", False):
+            return candidate
+        time.sleep(0.1)
+    raise RuntimeError(
+        "微信主窗口已关闭到托盘且自动唤醒失败，请按 Ctrl+Alt+W 打开微信后重试"
+    )
+
+
+def _end_wechat_interaction(hwnd, interaction):
+    """Always release the button and restore WeChat's original topmost state."""
+    user32 = ctypes.windll.user32
+    # A real button-up is safe even after an exception and prevents a failed
+    # automation attempt from leaving either Windows or Qt in a dragging state.
+    user32.mouse_event(0x0004, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTUP
+    if not interaction["was_topmost"]:
+        _set_window_topmost(hwnd, False)
+        # The final real click normally grants foreground rights. Reassert the
+        # ordinary z-order after removing TOPMOST so the user can keep using it.
+        user32.BringWindowToTop(hwnd)
+        user32.SetForegroundWindow(hwnd)
 
 
 class _BitmapInfoHeader(ctypes.Structure):
@@ -512,13 +696,31 @@ def _capture_grayscale(left, top, width, height):
 
 
 def _click_wechat_client_point(hwnd, x, y):
-    """Send a click directly to WeChat so another foreground app is never clicked."""
+    """Perform a real click at a point measured from the captured window rect.
+
+    Weixin 4.x uses a transparent rendering child and does not safely support
+    fabricated WM_LBUTTON* messages on the top-level Qt window. Posting those
+    messages can minimize the window or leave later real input unresponsive.
+    During an interaction session WeChat is topmost, so system input reaches the
+    correct native hit target while still following Qt's normal input path.
+    """
     user32 = ctypes.windll.user32
-    packed_point = (int(y) << 16) | (int(x) & 0xFFFF)
-    user32.PostMessageW(hwnd, 0x0200, 0, packed_point)  # WM_MOUSEMOVE
-    user32.PostMessageW(hwnd, 0x0201, 0x0001, packed_point)  # WM_LBUTTONDOWN
+    rect = _window_rect(hwnd)
+    screen_x = rect.left + int(x)
+    screen_y = rect.top + int(y)
+    cursor = wintypes.POINT()
+    cursor_saved = bool(user32.GetCursorPos(ctypes.byref(cursor)))
+
+    if not user32.SetCursorPos(screen_x, screen_y):
+        raise RuntimeError("无法移动鼠标到微信入口")
+    try:
+        user32.mouse_event(0x0002, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTDOWN
+        time.sleep(0.08)
+    finally:
+        user32.mouse_event(0x0004, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTUP
     time.sleep(0.08)
-    user32.PostMessageW(hwnd, 0x0202, 0, packed_point)  # WM_LBUTTONUP
+    if cursor_saved:
+        user32.SetCursorPos(cursor.x, cursor.y)
 
 
 def _window_scale(hwnd):
@@ -526,18 +728,8 @@ def _window_scale(hwnd):
     return dpi / 96.0
 
 
-def open_wechat_video_channels():
-    """Restore WeChat and open Video Channels through either supported entry."""
-    if sys.platform != "win32":
-        raise RuntimeError("当前自动打开流程仅支持 Windows 微信客户端")
-
-    window = _find_wechat_window()
-    if not window:
-        raise RuntimeError("未找到已登录的微信主窗口，请先启动并登录电脑版微信")
-
+def _open_wechat_video_channels_in_window(window, focused):
     hwnd = window["hwnd"]
-    focused = _restore_and_focus(hwnd)
-
     time.sleep(0.6)
     rect = _window_rect(hwnd)
     window_width = rect.right - rect.left
@@ -546,6 +738,27 @@ def open_wechat_video_channels():
         raise RuntimeError("微信主窗口尺寸异常，请先恢复窗口后重试")
 
     scale = _window_scale(hwnd)
+    if not focused:
+        # Full-screen remote-control clients can legally reject a background
+        # SetForegroundWindow call. Clicking a blank part of WeChat's custom
+        # title bar grants focus without changing any page state. Never send a
+        # navigation click until foreground ownership has been confirmed: an
+        # inactive Qt window can consume or misinterpret that first click.
+        _click_wechat_client_point(
+            hwnd,
+            window_width // 2,
+            max(12, round(16 * scale)),
+        )
+        deadline = time.time() + 1.5
+        user32 = ctypes.windll.user32
+        while time.time() < deadline:
+            if user32.GetForegroundWindow() == hwnd:
+                focused = True
+                break
+            time.sleep(0.1)
+        if not focused:
+            raise RuntimeError("微信主窗口未能获得输入焦点，请先点击微信窗口后重试")
+
     nav_width = min(window_width, max(64, round(76 * scale)))
     nav_height = min(window_height, max(420, round(560 * scale)))
     channels_match = None
@@ -680,6 +893,27 @@ def open_wechat_video_channels():
         "menu_already_selected": menu_already_selected,
         "clicked": True,
     }
+
+
+def open_wechat_video_channels():
+    """Restore WeChat and open Video Channels through either supported entry."""
+    if sys.platform != "win32":
+        raise RuntimeError("当前自动打开流程仅支持 Windows 微信客户端")
+
+    window = _find_wechat_window()
+    if not window:
+        raise RuntimeError("未找到已登录的微信主窗口，请先启动并登录电脑版微信")
+
+    window = _restore_tray_hidden_wechat(window)
+
+    hwnd = window["hwnd"]
+    interaction = _begin_wechat_interaction(hwnd)
+    try:
+        return _open_wechat_video_channels_in_window(
+            window, interaction["focused"]
+        )
+    finally:
+        _end_wechat_interaction(hwnd, interaction)
 
 
 def ensure_wechat_channels_available(

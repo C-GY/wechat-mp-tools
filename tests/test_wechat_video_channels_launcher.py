@@ -1,7 +1,7 @@
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import call, patch
+from unittest.mock import Mock, call, patch
 
 from playwright.sync_api import sync_playwright
 
@@ -61,6 +61,138 @@ class VideoChannelsIconMatcherTests(unittest.TestCase):
 
 
 class WechatLauncherFlowTests(unittest.TestCase):
+    def test_tray_hidden_main_is_restored_through_notification_icon(self):
+        from backend import wechat_automation
+
+        hidden = {"hwnd": 123, "visible": False}
+        restored = {"hwnd": 123, "visible": True}
+        with (
+            patch.object(
+                wechat_automation,
+                "_invoke_wechat_notification_icon",
+                return_value=True,
+            ) as tray_icon,
+            patch.object(wechat_automation, "_toggle_wechat_main_window_hotkey") as hotkey,
+            patch.object(
+                wechat_automation, "_find_wechat_window", return_value=restored
+            ),
+            patch.object(wechat_automation.time, "sleep"),
+        ):
+            result = wechat_automation._restore_tray_hidden_wechat(hidden)
+
+        tray_icon.assert_called_once_with()
+        hotkey.assert_not_called()
+        self.assertEqual(result, restored)
+
+    def test_tray_restore_falls_back_to_weixin_hotkey(self):
+        from backend import wechat_automation
+
+        hidden = {"hwnd": 123, "visible": False}
+        restored = {"hwnd": 123, "visible": True}
+        with (
+            patch.object(
+                wechat_automation,
+                "_invoke_wechat_notification_icon",
+                return_value=False,
+            ),
+            patch.object(wechat_automation, "_toggle_wechat_main_window_hotkey") as hotkey,
+            patch.object(
+                wechat_automation, "_find_wechat_window", return_value=restored
+            ),
+            patch.object(wechat_automation.time, "sleep"),
+        ):
+            result = wechat_automation._restore_tray_hidden_wechat(hidden)
+
+        hotkey.assert_called_once_with()
+        self.assertEqual(result, restored)
+
+    def test_weixin_hotkey_always_releases_every_modifier(self):
+        from backend import wechat_automation
+
+        user32 = SimpleNamespace(keybd_event=Mock())
+        with (
+            patch.object(
+                wechat_automation.ctypes,
+                "windll",
+                SimpleNamespace(user32=user32),
+            ),
+            patch.object(wechat_automation.time, "sleep"),
+        ):
+            wechat_automation._toggle_wechat_main_window_hotkey()
+
+        self.assertEqual(
+            user32.keybd_event.call_args_list,
+            [
+                call(0x11, 0, 0, 0),
+                call(0x12, 0, 0, 0),
+                call(0x57, 0, 0, 0),
+                call(0x57, 0, 0x0002, 0),
+                call(0x12, 0, 0x0002, 0),
+                call(0x11, 0, 0x0002, 0),
+            ],
+        )
+
+    def test_click_uses_real_mouse_input_instead_of_posting_qt_messages(self):
+        from backend import wechat_automation
+
+        user32 = SimpleNamespace(
+            GetCursorPos=Mock(return_value=False),
+            SetCursorPos=Mock(return_value=True),
+            mouse_event=Mock(),
+            PostMessageW=Mock(),
+        )
+        with (
+            patch.object(
+                wechat_automation.ctypes,
+                "windll",
+                SimpleNamespace(user32=user32),
+            ),
+            patch.object(
+                wechat_automation,
+                "_window_rect",
+                return_value=SimpleNamespace(left=100, top=200),
+            ),
+            patch.object(wechat_automation.time, "sleep"),
+        ):
+            wechat_automation._click_wechat_client_point(123, 36, 258)
+
+        user32.SetCursorPos.assert_called_once_with(136, 458)
+        self.assertEqual(
+            user32.mouse_event.call_args_list,
+            [call(0x0002, 0, 0, 0, 0), call(0x0004, 0, 0, 0, 0)],
+        )
+        user32.PostMessageW.assert_not_called()
+
+    def test_restore_does_not_attach_or_synthesize_input(self):
+        from backend import wechat_automation
+
+        user32 = SimpleNamespace(
+            ShowWindowAsync=Mock(return_value=True),
+            BringWindowToTop=Mock(return_value=True),
+            SetForegroundWindow=Mock(return_value=True),
+            IsIconic=Mock(return_value=False),
+            GetForegroundWindow=Mock(return_value=123),
+            AttachThreadInput=Mock(),
+            keybd_event=Mock(),
+            SetFocus=Mock(),
+            SwitchToThisWindow=Mock(),
+        )
+        with patch.object(
+            wechat_automation.ctypes,
+            "windll",
+            SimpleNamespace(user32=user32),
+        ):
+            result = wechat_automation._restore_and_focus(123)
+
+        self.assertTrue(result)
+        user32.ShowWindowAsync.assert_called_once_with(123, 9)
+        user32.BringWindowToTop.assert_called_once_with(123)
+        user32.SetForegroundWindow.assert_called_once_with(123)
+        user32.AttachThreadInput.assert_not_called()
+        user32.keybd_event.assert_not_called()
+        user32.SetFocus.assert_not_called()
+        user32.SwitchToThisWindow.assert_not_called()
+
     def test_main_window_lookup_includes_tray_hidden_wechat_window(self):
         from backend import wechat_automation
 
@@ -76,11 +208,97 @@ class WechatLauncherFlowTests(unittest.TestCase):
             wechat_automation,
             "_enumerate_wechat_windows",
             return_value=[hidden_main],
-        ) as enumerate_windows:
+        ) as enumerate_windows, patch.object(
+            wechat_automation, "_window_normal_size", return_value=(800, 600)
+        ):
             result = wechat_automation._find_wechat_window()
 
         enumerate_windows.assert_called_once_with(include_hidden=True)
-        self.assertEqual(result, hidden_main)
+        self.assertEqual(result["hwnd"], hidden_main["hwnd"])
+
+    def test_main_window_lookup_ignores_small_weixin_auxiliary_window(self):
+        from backend import wechat_automation
+
+        auxiliary = {
+            "hwnd": 111,
+            "title": "Weixin",
+            "class_name": "Qt51514QWindowIcon",
+            "executable": "weixin.exe",
+            "minimized": False,
+            "visible": True,
+        }
+        main = {
+            "hwnd": 222,
+            "title": "微信",
+            "class_name": "Qt51514QWindowIcon",
+            "executable": "weixin.exe",
+            "minimized": True,
+            "visible": True,
+        }
+
+        with patch.object(
+            wechat_automation,
+            "_enumerate_wechat_windows",
+            return_value=[auxiliary, main],
+        ), patch.object(
+            wechat_automation,
+            "_window_normal_size",
+            side_effect=lambda hwnd: (176, 199) if hwnd == 111 else (1285, 782),
+        ):
+            result = wechat_automation._find_wechat_window()
+
+        self.assertEqual(result["hwnd"], main["hwnd"])
+        self.assertEqual(result["normal_size"], (1285, 782))
+
+    def test_inactive_window_is_activated_before_navigation_clicks(self):
+        from backend import wechat_automation
+
+        window = {
+            "hwnd": 123,
+            "title": "微信",
+            "class_name": "Qt51514QWindowIcon",
+            "executable": "weixin.exe",
+        }
+        favorites = {"x": 36, "y": 208, "score": 0.91}
+        channels = {"x": 86, "y": 152, "score": 0.88}
+        user32 = SimpleNamespace(GetForegroundWindow=Mock(return_value=123))
+
+        with (
+            patch.object(wechat_automation.sys, "platform", "win32"),
+            patch.object(wechat_automation, "_find_wechat_window", return_value=window),
+            patch.object(
+                wechat_automation,
+                "_begin_wechat_interaction",
+                return_value={"focused": False, "was_topmost": False},
+            ),
+            patch.object(wechat_automation, "_end_wechat_interaction"),
+            patch.object(
+                wechat_automation,
+                "_window_rect",
+                return_value=SimpleNamespace(left=10, top=20, right=810, bottom=670),
+            ),
+            patch.object(wechat_automation, "_window_scale", return_value=1.0),
+            patch.object(wechat_automation, "_capture_grayscale", return_value=[[238]]),
+            patch.object(wechat_automation, "find_favorites_icon", return_value=favorites),
+            patch.object(
+                wechat_automation,
+                "find_video_channels_icon",
+                return_value=channels,
+            ),
+            patch.object(wechat_automation, "_click_wechat_client_point") as click_point,
+            patch.object(wechat_automation.time, "sleep"),
+            patch.object(
+                wechat_automation.ctypes,
+                "windll",
+                SimpleNamespace(user32=user32),
+            ),
+        ):
+            wechat_automation.open_wechat_video_channels()
+
+        self.assertEqual(
+            click_point.call_args_list,
+            [call(123, 400, 16), call(123, 36, 258), call(123, 86, 152)],
+        )
 
     def test_new_layout_opens_discover_below_favorites_then_video_channels(self):
         from backend import wechat_automation
@@ -97,7 +315,12 @@ class WechatLauncherFlowTests(unittest.TestCase):
         with (
             patch.object(wechat_automation.sys, "platform", "win32"),
             patch.object(wechat_automation, "_find_wechat_window", return_value=window),
-            patch.object(wechat_automation, "_restore_and_focus", return_value=True),
+            patch.object(
+                wechat_automation,
+                "_begin_wechat_interaction",
+                return_value={"focused": True, "was_topmost": False},
+            ),
+            patch.object(wechat_automation, "_end_wechat_interaction"),
             patch.object(
                 wechat_automation,
                 "_window_rect",
@@ -139,7 +362,12 @@ class WechatLauncherFlowTests(unittest.TestCase):
         with (
             patch.object(wechat_automation.sys, "platform", "win32"),
             patch.object(wechat_automation, "_find_wechat_window", return_value=window),
-            patch.object(wechat_automation, "_restore_and_focus", return_value=True),
+            patch.object(
+                wechat_automation,
+                "_begin_wechat_interaction",
+                return_value={"focused": True, "was_topmost": False},
+            ),
+            patch.object(wechat_automation, "_end_wechat_interaction"),
             patch.object(
                 wechat_automation,
                 "_window_rect",
@@ -181,7 +409,12 @@ class WechatLauncherFlowTests(unittest.TestCase):
         with (
             patch.object(wechat_automation.sys, "platform", "win32"),
             patch.object(wechat_automation, "_find_wechat_window", return_value=window),
-            patch.object(wechat_automation, "_restore_and_focus", return_value=True),
+            patch.object(
+                wechat_automation,
+                "_begin_wechat_interaction",
+                return_value={"focused": True, "was_topmost": False},
+            ),
+            patch.object(wechat_automation, "_end_wechat_interaction"),
             patch.object(
                 wechat_automation,
                 "_window_rect",
@@ -256,8 +489,11 @@ class WechatLauncherFlowTests(unittest.TestCase):
                         wechat_automation, "_find_wechat_window", return_value=window
                     ),
                     patch.object(
-                        wechat_automation, "_restore_and_focus", return_value=True
+                        wechat_automation,
+                        "_begin_wechat_interaction",
+                        return_value={"focused": True, "was_topmost": False},
                     ),
+                    patch.object(wechat_automation, "_end_wechat_interaction"),
                     patch.object(
                         wechat_automation,
                         "_window_rect",
