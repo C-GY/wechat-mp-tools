@@ -37,9 +37,38 @@ VIDEO_CHANNELS_ICON_TEMPLATE = (
 )
 
 
-def _scaled_template(scale: float):
-    source_height = len(VIDEO_CHANNELS_ICON_TEMPLATE)
-    source_width = len(VIDEO_CHANNELS_ICON_TEMPLATE[0])
+# Binary outline extracted from the Favorites icon supplied by the user.  In
+# Weixin 4.x, Discover is the navigation item immediately below this stable
+# cube icon even though avatars, badges, themes, and Discover artwork vary.
+FAVORITES_ICON_TEMPLATE = (
+    ".......####.......",
+    ".....###..###.....",
+    "...###.....###....",
+    "..###........###..",
+    ".##............##.",
+    "###............###",
+    "#####........#####",
+    "#...###....###..##",
+    "#....###.###....##",
+    "#......####.....##",
+    "#.......##......##",
+    "#.......##......##",
+    "#.......##......##",
+    "##......##......##",
+    "###.....##.....##.",
+    ".###....##....###.",
+    "...###..##..###...",
+    ".....########.....",
+    "......######......",
+)
+
+
+_ICON_SCALES = (0.75, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0)
+
+
+def _scaled_template(source, scale: float):
+    source_height = len(source)
+    source_width = len(source[0])
     width = max(1, round(source_width * scale))
     height = max(1, round(source_height * scale))
     rows = []
@@ -48,13 +77,21 @@ def _scaled_template(scale: float):
         row = []
         for x in range(width):
             source_x = min(source_width - 1, int(x / scale))
-            row.append(VIDEO_CHANNELS_ICON_TEMPLATE[source_y][source_x] == "#")
+            row.append(source[source_y][source_x] == "#")
         rows.append(row)
     return rows
 
 
-def find_video_channels_icon(grayscale, min_y=150, max_y=None):
-    """Return the best Video Channels icon center in a grayscale sidebar image."""
+def _find_icon(
+    grayscale,
+    source,
+    *,
+    min_y=0,
+    max_y=None,
+    min_x=8,
+    max_x=None,
+    minimum_score=0.52,
+):
     if not grayscale or not grayscale[0]:
         return None
 
@@ -62,41 +99,74 @@ def find_video_channels_icon(grayscale, min_y=150, max_y=None):
     image_width = len(grayscale[0])
     search_top = max(0, min(int(min_y), image_height - 1))
     search_bottom = image_height if max_y is None else min(image_height, int(max_y))
+    search_left = max(0, int(min_x))
+    search_right = image_width if max_x is None else min(image_width, int(max_x))
+    if search_top >= search_bottom or search_left >= search_right:
+        return None
     best = None
 
-    for scale in (0.9, 1.0, 1.1, 1.2, 1.3):
-        template = _scaled_template(scale)
+    # The navigation/menu surfaces are effectively flat-colour regions. Build
+    # one foreground mask and summed-area table so each candidate rectangle can
+    # be rejected in O(1); only plausible rectangles need point-by-point shape
+    # comparison. This keeps the launcher responsive without shipping OpenCV.
+    sample_step = max(1, min(image_width, image_height) // 40)
+    samples = [
+        grayscale[y][x]
+        for y in range(search_top, search_bottom, sample_step)
+        for x in range(search_left, search_right, sample_step)
+    ]
+    background = statistics.median(samples)
+    if background >= 128:
+        foreground = [
+            [value < background - 28 for value in row]
+            for row in grayscale
+        ]
+    else:
+        foreground = [
+            [value > background + 28 for value in row]
+            for row in grayscale
+        ]
+
+    integral = [[0] * (image_width + 1) for _ in range(image_height + 1)]
+    for y, row in enumerate(foreground):
+        running = 0
+        previous = integral[y]
+        current = integral[y + 1]
+        for x, value in enumerate(row):
+            running += value
+            current[x + 1] = previous[x + 1] + running
+
+    for scale in _ICON_SCALES:
+        template = _scaled_template(source, scale)
         height = len(template)
         width = len(template[0])
         target_count = sum(sum(row) for row in template)
-        if width >= image_width or height >= search_bottom - search_top:
+        target_points = [
+            (x, y)
+            for y, row in enumerate(template)
+            for x, value in enumerate(row)
+            if value
+        ]
+        if width > search_right - search_left or height > search_bottom - search_top:
             continue
 
         for top in range(search_top, search_bottom - height + 1):
-            for left in range(8, image_width - width - 8 + 1):
-                values = [
-                    grayscale[top + y][left + x]
-                    for y in range(height)
-                    for x in range(width)
-                ]
-                background = statistics.median(values)
-                # WeChat uses a light sidebar by default and a dark one in dark mode.
-                if background >= 128:
-                    observed = [value < background - 28 for value in values]
-                else:
-                    observed = [value > background + 28 for value in values]
-
-                observed_count = sum(observed)
+            for left in range(search_left, search_right - width + 1):
+                right = left + width
+                bottom = top + height
+                observed_count = (
+                    integral[bottom][right]
+                    - integral[top][right]
+                    - integral[bottom][left]
+                    + integral[top][left]
+                )
                 if observed_count < target_count * 0.35 or observed_count > target_count * 2.2:
                     continue
 
-                intersection = 0
-                index = 0
-                for y in range(height):
-                    for x in range(width):
-                        if template[y][x] and observed[index]:
-                            intersection += 1
-                        index += 1
+                intersection = sum(
+                    foreground[top + y][left + x]
+                    for x, y in target_points
+                )
                 score = (2.0 * intersection) / (target_count + observed_count)
                 if best is None or score > best["score"]:
                     best = {
@@ -109,9 +179,50 @@ def find_video_channels_icon(grayscale, min_y=150, max_y=None):
                         "height": height,
                     }
 
-    if best is None or best["score"] < 0.52:
+    if best is None or best["score"] < minimum_score:
         return None
     return best
+
+
+def find_video_channels_icon(
+    grayscale, min_y=150, max_y=None, min_x=8, max_x=None
+):
+    """Return the best Video Channels icon center in a grayscale image."""
+    return _find_icon(
+        grayscale,
+        VIDEO_CHANNELS_ICON_TEMPLATE,
+        min_y=min_y,
+        max_y=max_y,
+        min_x=min_x,
+        max_x=max_x,
+    )
+
+
+def find_favorites_icon(grayscale, min_y=120, max_y=None):
+    """Return the Favorites cube center used to anchor the Discover entry."""
+    return _find_icon(
+        grayscale,
+        FAVORITES_ICON_TEMPLATE,
+        min_y=min_y,
+        max_y=max_y,
+        min_x=8,
+        max_x=None,
+        minimum_score=0.56,
+    )
+
+
+def _is_direct_channels_entry(channels_match, favorites_match, scale):
+    """Distinguish the old direct entry from the similarly shaped Discover icon."""
+    if channels_match is None:
+        return False
+    if favorites_match is None:
+        return True
+    expected_y = favorites_match["y"] + round(50 * scale)
+    return (
+        channels_match["score"] >= 0.68
+        and abs(channels_match["x"] - favorites_match["x"]) <= round(8 * scale)
+        and abs(channels_match["y"] - expected_y) <= round(15 * scale)
+    )
 
 
 def _query_process_path(pid):
@@ -381,8 +492,13 @@ def _click_wechat_client_point(hwnd, x, y):
     user32.PostMessageW(hwnd, 0x0202, 0, packed_point)  # WM_LBUTTONUP
 
 
+def _window_scale(hwnd):
+    dpi = ctypes.windll.user32.GetDpiForWindow(hwnd) or 96
+    return dpi / 96.0
+
+
 def open_wechat_video_channels():
-    """Restore running WeChat, find its Video Channels icon, and click it."""
+    """Restore WeChat and open Video Channels through either supported entry."""
     if sys.platform != "win32":
         raise RuntimeError("当前自动打开流程仅支持 Windows 微信客户端")
 
@@ -400,30 +516,100 @@ def open_wechat_video_channels():
     if window_width < 500 or window_height < 500:
         raise RuntimeError("微信主窗口尺寸异常，请先恢复窗口后重试")
 
-    dpi = ctypes.windll.user32.GetDpiForWindow(hwnd) or 96
-    scale = dpi / 96.0
+    scale = _window_scale(hwnd)
     nav_width = min(window_width, max(64, round(76 * scale)))
     nav_height = min(window_height, max(420, round(560 * scale)))
-    match = None
+    channels_match = None
+    favorites_match = None
     if focused:
         try:
             grayscale = _capture_grayscale(rect.left, rect.top, nav_width, nav_height)
-            match = find_video_channels_icon(
+            favorites_match = find_favorites_icon(
+                grayscale,
+                min_y=round(110 * scale),
+                max_y=min(nav_height, round(430 * scale)),
+            )
+            channels_match = find_video_channels_icon(
                 grayscale,
                 min_y=round(170 * scale),
                 max_y=min(nav_height, round(430 * scale)),
             )
+            if favorites_match is not None:
+                # The cube resembles the butterfly at low resolution, so scan
+                # its next slot explicitly instead of accepting an overlapping
+                # false match on Favorites itself.
+                channels_match = find_video_channels_icon(
+                    grayscale,
+                    min_y=favorites_match["y"] + round(20 * scale),
+                    max_y=min(
+                        nav_height,
+                        favorites_match["y"] + round(80 * scale),
+                    ),
+                    min_x=max(8, favorites_match["x"] - round(25 * scale)),
+                    max_x=min(
+                        nav_width,
+                        favorites_match["x"] + round(25 * scale),
+                    ),
+                )
+                if not _is_direct_channels_entry(
+                    channels_match, favorites_match, scale
+                ):
+                    channels_match = None
         except RuntimeError:
-            match = None
+            channels_match = None
+            favorites_match = None
 
-    if match:
-        click_x = match["x"]
-        click_y = match["y"]
+    anchor_match_score = None
+    if channels_match:
+        click_x = channels_match["x"]
+        click_y = channels_match["y"]
         click_method = "icon_match"
-        match_score = round(match["score"], 3)
+        match_score = round(channels_match["score"], 3)
+    elif favorites_match:
+        # The Discover icon itself is not stable across accounts/themes. Its
+        # slot is stable relative to Favorites: 50 logical pixels below it.
+        discover_x = favorites_match["x"]
+        discover_y = favorites_match["y"] + round(50 * scale)
+        if discover_y >= nav_height:
+            raise RuntimeError("已识别收藏图标，但发现入口超出微信导航栏范围")
+        _click_wechat_client_point(hwnd, discover_x, discover_y)
+
+        # Discover opens inside the main window. Match the unchanged orange
+        # Video Channels outline in its first few menu rows instead of relying
+        # on account-specific artwork or fixed absolute coordinates.
+        menu_width = min(window_width, max(round(320 * scale), nav_width + 140))
+        menu_height = min(window_height, max(round(330 * scale), 280))
+        menu_match = None
+        for _ in range(3):
+            time.sleep(0.3)
+            try:
+                menu_grayscale = _capture_grayscale(
+                    rect.left, rect.top, menu_width, menu_height
+                )
+            except RuntimeError:
+                continue
+            menu_match = find_video_channels_icon(
+                menu_grayscale,
+                min_y=round(70 * scale),
+                max_y=min(menu_height, round(235 * scale)),
+                min_x=round(58 * scale),
+                max_x=min(menu_width, round(165 * scale)),
+            )
+            if menu_match:
+                break
+        if menu_match is None:
+            raise RuntimeError("已通过收藏图标打开发现，但未识别到视频号按钮")
+
+        click_x = menu_match["x"]
+        click_y = menu_match["y"]
+        click_method = "favorites_anchor_discover_menu"
+        match_score = round(menu_match["score"], 3)
+        anchor_match_score = round(favorites_match["score"], 3)
     elif window["class_name"] == "Qt51514QWindowIcon":
         # Weixin 4.x exposes no accessibility tree. Its left navigation slots are
-        # stable; this verified slot is used only inside the WeChat window itself.
+        # stable in older layouts. This remains the final compatibility fallback
+        # only when neither the old Channels icon nor the new Favorites anchor
+        # can be identified.
         click_x = round(38 * scale)
         click_y = round(307 * scale)
         click_method = "verified_weixin_sidebar_slot"
@@ -439,6 +625,7 @@ def open_wechat_video_channels():
         "window_title": window["title"],
         "icon_found": True,
         "icon_match_score": match_score,
+        "anchor_match_score": anchor_match_score,
         "click_method": click_method,
         "clicked": True,
     }

@@ -1,5 +1,7 @@
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import call, patch
 
 from playwright.sync_api import sync_playwright
 
@@ -35,6 +37,107 @@ class VideoChannelsIconMatcherTests(unittest.TestCase):
         self.assertAlmostEqual(match["x"], left + 10, delta=2)
         self.assertAlmostEqual(match["y"], top + 8, delta=2)
         self.assertGreater(match["score"], 0.8)
+
+    def test_finds_favorites_cube_used_as_discover_anchor(self):
+        from backend.wechat_automation import (
+            FAVORITES_ICON_TEMPLATE,
+            find_favorites_icon,
+        )
+
+        width, height = 76, 520
+        image = [[238 for _ in range(width)] for _ in range(height)]
+        left, top = 27, 198
+        for y, row in enumerate(FAVORITES_ICON_TEMPLATE):
+            for x, pixel in enumerate(row):
+                if pixel == "#":
+                    image[top + y][left + x] = 88
+
+        match = find_favorites_icon(image)
+
+        self.assertIsNotNone(match)
+        self.assertAlmostEqual(match["x"], left + 9, delta=2)
+        self.assertAlmostEqual(match["y"], top + 9, delta=2)
+        self.assertGreater(match["score"], 0.8)
+
+
+class WechatLauncherFlowTests(unittest.TestCase):
+    def test_new_layout_opens_discover_below_favorites_then_video_channels(self):
+        from backend import wechat_automation
+
+        window = {
+            "hwnd": 123,
+            "title": "微信",
+            "class_name": "Qt51514QWindowIcon",
+        }
+        favorites = {"x": 36, "y": 208, "score": 0.91}
+        discover_false_match = {"x": 36, "y": 258, "score": 0.64}
+        channels = {"x": 86, "y": 152, "score": 0.88}
+
+        with (
+            patch.object(wechat_automation.sys, "platform", "win32"),
+            patch.object(wechat_automation, "_find_wechat_window", return_value=window),
+            patch.object(wechat_automation, "_restore_and_focus", return_value=True),
+            patch.object(
+                wechat_automation,
+                "_window_rect",
+                return_value=SimpleNamespace(left=10, top=20, right=810, bottom=670),
+            ),
+            patch.object(wechat_automation, "_window_scale", return_value=1.0),
+            patch.object(wechat_automation, "_capture_grayscale", return_value=[[238]]),
+            patch.object(
+                wechat_automation,
+                "find_video_channels_icon",
+                side_effect=[None, discover_false_match, channels],
+            ),
+            patch.object(wechat_automation, "find_favorites_icon", return_value=favorites),
+            patch.object(wechat_automation, "_click_wechat_client_point") as click_point,
+            patch.object(wechat_automation.time, "sleep"),
+        ):
+            result = wechat_automation.open_wechat_video_channels()
+
+        self.assertEqual(
+            click_point.call_args_list,
+            [call(123, 36, 258), call(123, 86, 152)],
+        )
+        self.assertEqual(result["click_method"], "favorites_anchor_discover_menu")
+        self.assertEqual(result["anchor_match_score"], 0.91)
+        self.assertEqual(result["icon_match_score"], 0.88)
+
+    def test_old_layout_still_clicks_direct_video_channels_entry(self):
+        from backend import wechat_automation
+
+        window = {
+            "hwnd": 123,
+            "title": "微信",
+            "class_name": "Qt51514QWindowIcon",
+        }
+        favorites = {"x": 36, "y": 208, "score": 0.91}
+        direct_channels = {"x": 36, "y": 258, "score": 0.78}
+
+        with (
+            patch.object(wechat_automation.sys, "platform", "win32"),
+            patch.object(wechat_automation, "_find_wechat_window", return_value=window),
+            patch.object(wechat_automation, "_restore_and_focus", return_value=True),
+            patch.object(
+                wechat_automation,
+                "_window_rect",
+                return_value=SimpleNamespace(left=10, top=20, right=810, bottom=670),
+            ),
+            patch.object(wechat_automation, "_window_scale", return_value=1.0),
+            patch.object(wechat_automation, "_capture_grayscale", return_value=[[238]]),
+            patch.object(
+                wechat_automation,
+                "find_video_channels_icon",
+                side_effect=[direct_channels, direct_channels],
+            ),
+            patch.object(wechat_automation, "find_favorites_icon", return_value=favorites),
+            patch.object(wechat_automation, "_click_wechat_client_point") as click_point,
+            patch.object(wechat_automation.time, "sleep"),
+        ):
+            result = wechat_automation.open_wechat_video_channels()
+
+        click_point.assert_called_once_with(123, 36, 258)
+        self.assertEqual(result["click_method"], "icon_match")
 
 
 class WechatLauncherUiTests(unittest.TestCase):
