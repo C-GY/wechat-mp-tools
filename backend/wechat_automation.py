@@ -225,6 +225,31 @@ def _is_direct_channels_entry(channels_match, favorites_match, scale):
     )
 
 
+def _is_discover_menu_row_selected(grayscale, row_y, scale):
+    """Detect the green selected-row background without depending on colour."""
+    if not grayscale or not grayscale[0]:
+        return False
+    height = len(grayscale)
+    width = len(grayscale[0])
+    left = max(0, round(175 * scale))
+    right = min(width, round(260 * scale))
+    half_height = max(3, round(10 * scale))
+    reference_y = row_y + round(49 * scale)
+    if left >= right or reference_y + half_height >= height:
+        return False
+
+    def region_median(center_y):
+        top = max(0, center_y - half_height)
+        bottom = min(height, center_y + half_height + 1)
+        return statistics.median(
+            grayscale[y][x]
+            for y in range(top, bottom)
+            for x in range(left, right)
+        )
+
+    return abs(region_median(row_y) - region_median(reference_y)) >= 38
+
+
 def _query_process_path(pid):
     kernel32 = ctypes.windll.kernel32
     kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
@@ -253,8 +278,8 @@ def _window_rect(hwnd):
     return rect
 
 
-def _enumerate_wechat_windows():
-    """Read native WeChat windows, including minimized ones, without activation."""
+def _enumerate_wechat_windows(*, include_hidden=False):
+    """Read native WeChat windows without activating or changing them."""
     if sys.platform != "win32":
         return []
     user32 = ctypes.windll.user32
@@ -269,7 +294,8 @@ def _enumerate_wechat_windows():
     callback_type = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
 
     def collect(hwnd, _):
-        if not user32.IsWindowVisible(hwnd):
+        visible = bool(user32.IsWindowVisible(hwnd))
+        if not include_hidden and not visible:
             return True
         pid = wintypes.DWORD()
         user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
@@ -287,7 +313,7 @@ def _enumerate_wechat_windows():
         windows.append({
             "hwnd": hwnd, "pid": pid.value, "title": title_buffer.value,
             "class_name": class_buffer.value, "executable": executable,
-            "minimized": bool(user32.IsIconic(hwnd)),
+            "minimized": bool(user32.IsIconic(hwnd)), "visible": visible,
         })
         return True
 
@@ -297,7 +323,10 @@ def _enumerate_wechat_windows():
 
 
 def _find_wechat_window():
-    windows = [window for window in _enumerate_wechat_windows()
+    # Closing Weixin 4.x normally hides the existing main window to the tray;
+    # it does not terminate the process. Include that hidden HWND so the same
+    # restore path works whether the window is open, minimized, or tray-hidden.
+    windows = [window for window in _enumerate_wechat_windows(include_hidden=True)
                if window["executable"] in {"weixin.exe", "wechat.exe"}
                and window["class_name"] in {"Qt51514QWindowIcon", "WeChatMainWndForPC"}
                and window["title"].lower() in {"微信", "wechat", "weixin"}]
@@ -521,6 +550,10 @@ def open_wechat_video_channels():
     nav_height = min(window_height, max(420, round(560 * scale)))
     channels_match = None
     favorites_match = None
+    is_weixin_4 = (
+        window.get("executable", "weixin.exe").lower() == "weixin.exe"
+        and window["class_name"] == "Qt51514QWindowIcon"
+    )
     if focused:
         try:
             grayscale = _capture_grayscale(rect.left, rect.top, nav_width, nav_height)
@@ -529,12 +562,13 @@ def open_wechat_video_channels():
                 min_y=round(110 * scale),
                 max_y=min(nav_height, round(430 * scale)),
             )
-            channels_match = find_video_channels_icon(
-                grayscale,
-                min_y=round(170 * scale),
-                max_y=min(nav_height, round(430 * scale)),
-            )
-            if favorites_match is not None:
+            if not is_weixin_4:
+                channels_match = find_video_channels_icon(
+                    grayscale,
+                    min_y=round(170 * scale),
+                    max_y=min(nav_height, round(430 * scale)),
+                )
+            if favorites_match is not None and not is_weixin_4:
                 # The cube resembles the butterfly at low resolution, so scan
                 # its next slot explicitly instead of accepting an overlapping
                 # false match on Favorites itself.
@@ -560,28 +594,46 @@ def open_wechat_video_channels():
             favorites_match = None
 
     anchor_match_score = None
+    menu_already_selected = False
     if channels_match:
         click_x = channels_match["x"]
         click_y = channels_match["y"]
         click_method = "icon_match"
         match_score = round(channels_match["score"], 3)
-    elif favorites_match:
+    elif favorites_match or is_weixin_4:
         # The Discover icon itself is not stable across accounts/themes. Its
-        # slot is stable relative to Favorites: 50 logical pixels below it.
-        discover_x = favorites_match["x"]
-        discover_y = favorites_match["y"] + round(50 * scale)
+        # slot is stable relative to Favorites: 50 logical pixels below it. A
+        # selected Discover icon can resemble the old Channels butterfly, so
+        # Weixin 4.x must always complete the two-click flow instead of treating
+        # that false match as the legacy direct entry.
+        if favorites_match:
+            discover_x = favorites_match["x"]
+            discover_y = favorites_match["y"] + round(50 * scale)
+            click_method = "favorites_anchor_discover_menu"
+            anchor_match_score = round(favorites_match["score"], 3)
+        else:
+            # Final Weixin 4.x compatibility fallback. Navigation slots remain
+            # top-anchored as the window is resized; the old fallback pointed
+            # at y=307, which is no longer the Discover slot.
+            discover_x = round(38 * scale)
+            discover_y = round(257 * scale)
+            click_method = "weixin4_discover_slot_menu"
         if discover_y >= nav_height:
-            raise RuntimeError("已识别收藏图标，但发现入口超出微信导航栏范围")
+            raise RuntimeError("发现入口超出微信导航栏范围")
         _click_wechat_client_point(hwnd, discover_x, discover_y)
 
         # Discover opens inside the main window. Match the unchanged orange
-        # Video Channels outline in its first few menu rows instead of relying
-        # on account-specific artwork or fixed absolute coordinates.
+        # Video Channels outline specifically in the second menu row. Searching
+        # all first rows can accept Moments/Search artwork while the panel is
+        # still animating, causing the launcher to click the wrong entry.
         menu_width = min(window_width, max(round(320 * scale), nav_width + 140))
         menu_height = min(window_height, max(round(330 * scale), 280))
         menu_match = None
-        for _ in range(3):
-            time.sleep(0.3)
+        for attempt in range(3):
+            # Narrow windows take longer to finish the Discover-panel layout.
+            # The icon may already be paintable while the row still ignores
+            # clicks, so give the first attempt a full animation interval.
+            time.sleep(0.8 if attempt == 0 else 0.3)
             try:
                 menu_grayscale = _capture_grayscale(
                     rect.left, rect.top, menu_width, menu_height
@@ -590,35 +642,33 @@ def open_wechat_video_channels():
                 continue
             menu_match = find_video_channels_icon(
                 menu_grayscale,
-                min_y=round(70 * scale),
-                max_y=min(menu_height, round(235 * scale)),
+                min_y=round(125 * scale),
+                max_y=min(menu_height, round(180 * scale)),
                 min_x=round(58 * scale),
                 max_x=min(menu_width, round(165 * scale)),
             )
             if menu_match:
+                menu_already_selected = _is_discover_menu_row_selected(
+                    menu_grayscale, menu_match["y"], scale
+                )
                 break
         if menu_match is None:
             raise RuntimeError("已通过收藏图标打开发现，但未识别到视频号按钮")
 
         click_x = menu_match["x"]
         click_y = menu_match["y"]
-        click_method = "favorites_anchor_discover_menu"
         match_score = round(menu_match["score"], 3)
-        anchor_match_score = round(favorites_match["score"], 3)
-    elif window["class_name"] == "Qt51514QWindowIcon":
-        # Weixin 4.x exposes no accessibility tree. Its left navigation slots are
-        # stable in older layouts. This remains the final compatibility fallback
-        # only when neither the old Channels icon nor the new Favorites anchor
-        # can be identified.
-        click_x = round(38 * scale)
-        click_y = round(307 * scale)
-        click_method = "verified_weixin_sidebar_slot"
-        match_score = None
+        if menu_already_selected:
+            click_method += "_already_selected"
     else:
         raise RuntimeError("已打开微信，但未识别到视频号图标；请确认微信左侧导航栏可见")
 
-    _click_wechat_client_point(hwnd, click_x, click_y)
-    _restore_and_focus(hwnd)
+    if not menu_already_selected:
+        _click_wechat_client_point(hwnd, click_x, click_y)
+        # WM_* messages are queued in Weixin's UI thread. Returning focus
+        # immediately can overtake the queued button-up event on a busy or
+        # resized window and leave Discover open without selecting Channels.
+        time.sleep(0.3)
 
     return {
         "window_found": True,
@@ -627,6 +677,7 @@ def open_wechat_video_channels():
         "icon_match_score": match_score,
         "anchor_match_score": anchor_match_score,
         "click_method": click_method,
+        "menu_already_selected": menu_already_selected,
         "clicked": True,
     }
 
