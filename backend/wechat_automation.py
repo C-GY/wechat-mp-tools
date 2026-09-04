@@ -212,18 +212,48 @@ def find_favorites_icon(grayscale, min_y=120, max_y=None):
     )
 
 
-def _is_direct_channels_entry(channels_match, favorites_match, scale):
-    """Distinguish the old direct entry from the similarly shaped Discover icon."""
+def _is_direct_channels_entry(
+    channels_match, favorites_match, scale, *, slot_offset
+):
+    """Distinguish a direct Channels entry from the similarly shaped Discover icon."""
     if channels_match is None:
         return False
     if favorites_match is None:
         return True
-    expected_y = favorites_match["y"] + round(50 * scale)
+    expected_y = favorites_match["y"] + round(slot_offset * scale)
     return (
         channels_match["score"] >= 0.68
         and abs(channels_match["x"] - favorites_match["x"]) <= round(8 * scale)
         and abs(channels_match["y"] - expected_y) <= round(15 * scale)
     )
+
+
+def _find_direct_channels_entry(
+    grayscale, favorites_match, scale, nav_width, nav_height, *, slot_offset
+):
+    """Find Channels only in the direct-entry slot selected by the caller.
+
+    Weixin Qt's tested new layout uses the first slot below Favorites as
+    Discover and must retain its existing two-click flow. Its old layout keeps
+    Moments there and exposes Channels in the second slot, which is the only
+    compatibility slot this helper scans for Qt windows.
+    """
+    expected_y = favorites_match["y"] + round(slot_offset * scale)
+    match = find_video_channels_icon(
+        grayscale,
+        min_y=expected_y - round(30 * scale),
+        max_y=min(nav_height, expected_y + round(30 * scale)),
+        min_x=max(8, favorites_match["x"] - round(25 * scale)),
+        max_x=min(nav_width, favorites_match["x"] + round(25 * scale)),
+    )
+    if _is_direct_channels_entry(
+        match,
+        favorites_match,
+        scale,
+        slot_offset=slot_offset,
+    ):
+        return match
+    return None
 
 
 def _is_discover_menu_row_selected(grayscale, row_y, scale):
@@ -775,33 +805,26 @@ def _open_wechat_video_channels_in_window(window, focused):
                 min_y=round(110 * scale),
                 max_y=min(nav_height, round(430 * scale)),
             )
-            if not is_weixin_4:
+            if favorites_match is not None:
+                # Preserve the tested Weixin Qt flow at Favorites + 50: that
+                # slot is Discover, and Channels is selected from its menu.
+                # Only the old Qt layout gets a direct compatibility probe at
+                # Favorites + 100, where its butterfly actually appears.
+                direct_slot_offset = 100 if is_weixin_4 else 50
+                channels_match = _find_direct_channels_entry(
+                    grayscale,
+                    favorites_match,
+                    scale,
+                    nav_width,
+                    nav_height,
+                    slot_offset=direct_slot_offset,
+                )
+            elif not is_weixin_4:
                 channels_match = find_video_channels_icon(
                     grayscale,
                     min_y=round(170 * scale),
                     max_y=min(nav_height, round(430 * scale)),
                 )
-            if favorites_match is not None and not is_weixin_4:
-                # The cube resembles the butterfly at low resolution, so scan
-                # its next slot explicitly instead of accepting an overlapping
-                # false match on Favorites itself.
-                channels_match = find_video_channels_icon(
-                    grayscale,
-                    min_y=favorites_match["y"] + round(20 * scale),
-                    max_y=min(
-                        nav_height,
-                        favorites_match["y"] + round(80 * scale),
-                    ),
-                    min_x=max(8, favorites_match["x"] - round(25 * scale)),
-                    max_x=min(
-                        nav_width,
-                        favorites_match["x"] + round(25 * scale),
-                    ),
-                )
-                if not _is_direct_channels_entry(
-                    channels_match, favorites_match, scale
-                ):
-                    channels_match = None
         except RuntimeError:
             channels_match = None
             favorites_match = None
@@ -814,11 +837,9 @@ def _open_wechat_video_channels_in_window(window, focused):
         click_method = "icon_match"
         match_score = round(channels_match["score"], 3)
     elif favorites_match or is_weixin_4:
-        # The Discover icon itself is not stable across accounts/themes. Its
-        # slot is stable relative to Favorites: 50 logical pixels below it. A
-        # selected Discover icon can resemble the old Channels butterfly, so
-        # Weixin 4.x must always complete the two-click flow instead of treating
-        # that false match as the legacy direct entry.
+        # No old-layout direct Channels butterfly was found. Preserve the
+        # existing Weixin Qt behavior: the first slot is Discover, and Channels
+        # is selected from its menu in the second click.
         if favorites_match:
             discover_x = favorites_match["x"]
             discover_y = favorites_match["y"] + round(50 * scale)

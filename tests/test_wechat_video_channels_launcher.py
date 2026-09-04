@@ -300,7 +300,7 @@ class WechatLauncherFlowTests(unittest.TestCase):
             [call(123, 400, 16), call(123, 36, 258), call(123, 86, 152)],
         )
 
-    def test_new_layout_opens_discover_below_favorites_then_video_channels(self):
+    def test_discover_menu_layout_opens_discover_then_video_channels(self):
         from backend import wechat_automation
 
         window = {
@@ -347,7 +347,7 @@ class WechatLauncherFlowTests(unittest.TestCase):
         self.assertEqual(result["anchor_match_score"], 0.91)
         self.assertEqual(result["icon_match_score"], 0.88)
 
-    def test_old_layout_still_clicks_direct_video_channels_entry(self):
+    def test_classic_wechat_clicks_direct_channels_in_first_slot(self):
         from backend import wechat_automation
 
         window = {
@@ -387,6 +387,123 @@ class WechatLauncherFlowTests(unittest.TestCase):
             result = wechat_automation.open_wechat_video_channels()
 
         click_point.assert_called_once_with(123, 36, 258)
+        self.assertEqual(result["click_method"], "icon_match")
+
+    def test_new_weixin_qt_layout_keeps_existing_discover_menu_flow(self):
+        from backend import wechat_automation
+
+        window = {
+            "hwnd": 123,
+            "title": "微信",
+            "class_name": "Qt51514QWindowIcon",
+            "executable": "weixin.exe",
+        }
+        favorites = {"x": 36, "y": 208, "score": 0.91}
+        # A selected Discover icon may resemble the Channels butterfly. The
+        # tested new-version behavior must still click Discover first, then the
+        # real Channels row in the opened menu.
+        discover_false_match = {"x": 36, "y": 258, "score": 0.79}
+        menu_channels = {"x": 86, "y": 152, "score": 0.88}
+
+        with (
+            patch.object(wechat_automation.sys, "platform", "win32"),
+            patch.object(wechat_automation, "_find_wechat_window", return_value=window),
+            patch.object(
+                wechat_automation,
+                "_begin_wechat_interaction",
+                return_value={"focused": True, "was_topmost": False},
+            ),
+            patch.object(wechat_automation, "_end_wechat_interaction"),
+            patch.object(
+                wechat_automation,
+                "_window_rect",
+                return_value=SimpleNamespace(left=10, top=20, right=810, bottom=670),
+            ),
+            patch.object(wechat_automation, "_window_scale", return_value=1.0),
+            patch.object(wechat_automation, "_capture_grayscale", return_value=[[238]]),
+            patch.object(wechat_automation, "find_favorites_icon", return_value=favorites),
+            patch.object(
+                wechat_automation,
+                "find_video_channels_icon",
+                side_effect=[discover_false_match, menu_channels],
+            ),
+            patch.object(wechat_automation, "_click_wechat_client_point") as click_point,
+            patch.object(wechat_automation.time, "sleep"),
+        ):
+            result = wechat_automation.open_wechat_video_channels()
+
+        self.assertEqual(
+            click_point.call_args_list,
+            [call(123, 36, 258), call(123, 86, 152)],
+        )
+        self.assertEqual(
+            result["click_method"], "favorites_anchor_discover_menu"
+        )
+
+    def test_old_weixin_qt_layout_clicks_direct_channels_below_moments(self):
+        from backend import wechat_automation
+
+        def paint_template(image, template, left, top):
+            for y, row in enumerate(template):
+                for x, pixel in enumerate(row):
+                    if pixel == "#":
+                        image[top + y][left + x] = 88
+
+        # Old layout reproduced from the live Weixin Qt sidebar:
+        # Favorites is at y=208, Moments occupies the next slot at y=257, and
+        # the direct Video Channels butterfly is one more slot down at y=305.
+        nav_image = [[238 for _ in range(76)] for _ in range(560)]
+        paint_template(
+            nav_image,
+            wechat_automation.FAVORITES_ICON_TEMPLATE,
+            29,
+            199,
+        )
+        # Non-Channels artwork in the first slot represents Moments. It must
+        # not prevent the real butterfly in the second slot from being chosen.
+        for y in range(249, 268):
+            for x in range(29, 48):
+                if (x - 38) ** 2 + (y - 258) ** 2 <= 8 ** 2:
+                    nav_image[y][x] = 88
+        paint_template(
+            nav_image,
+            wechat_automation.VIDEO_CHANNELS_ICON_TEMPLATE,
+            28,
+            297,
+        )
+        window = {
+            "hwnd": 123,
+            "title": "微信",
+            "class_name": "Qt51514QWindowIcon",
+            "executable": "weixin.exe",
+        }
+
+        with (
+            patch.object(wechat_automation.sys, "platform", "win32"),
+            patch.object(wechat_automation, "_find_wechat_window", return_value=window),
+            patch.object(
+                wechat_automation,
+                "_begin_wechat_interaction",
+                return_value={"focused": True, "was_topmost": False},
+            ),
+            patch.object(wechat_automation, "_end_wechat_interaction"),
+            patch.object(
+                wechat_automation,
+                "_window_rect",
+                return_value=SimpleNamespace(left=10, top=20, right=810, bottom=670),
+            ),
+            patch.object(wechat_automation, "_window_scale", return_value=1.0),
+            patch.object(
+                wechat_automation,
+                "_capture_grayscale",
+                return_value=nav_image,
+            ),
+            patch.object(wechat_automation, "_click_wechat_client_point") as click_point,
+            patch.object(wechat_automation.time, "sleep"),
+        ):
+            result = wechat_automation.open_wechat_video_channels()
+
+        click_point.assert_called_once_with(123, 38, 305)
         self.assertEqual(result["click_method"], "icon_match")
 
     def test_new_layout_does_not_toggle_off_an_already_selected_channels_row(self):
