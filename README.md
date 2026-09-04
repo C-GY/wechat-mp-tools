@@ -132,9 +132,10 @@ python app.py    # 浏览器模式（访问 http://localhost:5200）
 `competitor_video_snapshots` 按同步批次记录视频状态，保留历史快照：
 
 - 唯一键为 `(platform, source_video_key, sync_batch_id)`：同一视频在同一批次最多一行，不同批次分别保存，业务字段无变化也会新增本批次快照。
-- 同批次重试更新该快照的作者、标题、发布时间、时长、互动指标、`synced_at` 和 `raw_payload`；保留其主键、`sync_batch_id`、`created_at` 和 OSS `video_url`，不会更新其他批次。
+- 同批次重试更新该快照的作者、标题、封面 `cover_url`、发布时间、时长、互动指标、`synced_at` 和 `raw_payload`；保留其主键、`sync_batch_id`、`created_at` 和 OSS `video_url`，不会更新其他批次。
 - 每轮任务生成新的 `sync_batch_id`；暂停后继续沿用当前批次。`synced_at` 表示该快照最近一次入库/重试的时间。
 - 新视频上传 OSS 后入库；已有视频按 `synced_at DESC, snapshot_id DESC` 选择最新快照并复用 OSS 链接，不重复上传。
+- 每轮同步都会为已有视频写入本批次的新快照，因此下次同步会把当前采集到的 `cover_url` 写入新快照；历史批次的旧快照不会被回填或改写。
 - 看板的“数据库处理”统计成功处理的快照数，包含本批次新增及同批次重试，不等于新增视频数；接口字段仍为 `database_written`。
 - 连接测试和同步前检查要求完整的三字段唯一索引（不接受普通索引或前缀索引）。若同时存在 `(platform, source_video_key)` 两字段唯一索引，会停止同步，避免跨批次写入覆盖历史。已有三字段唯一索引且无冲突约束的数据库无需迁移。
 
