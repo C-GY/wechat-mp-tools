@@ -86,6 +86,7 @@ hiddenimports = [
     'backend.channels_excel',
     'backend.oss',
     'backend.pinchuang',
+    'backend.guangce',
     'backend.creative_radar',
     'backend.rss_scheduler',
     'backend.transcode',

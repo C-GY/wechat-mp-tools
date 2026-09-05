@@ -257,6 +257,20 @@ const API = {
         getStatus() { return API.get('/api/creative-radar/status', { showError: false }); },
     },
 
+    // ── Guangce Hub API ──────────────────────────────
+    guangce: {
+        getConfig() { return API.get('/api/guangce/config', { showError: false }); },
+        exportConfig() { return API.post('/api/guangce/config/export', {}, { showError: false }); },
+        importConfig(config) { return API.post('/api/guangce/config/import', config, { showError: false }); },
+        saveConfig(config) { return API.post('/api/guangce/config', config); },
+        testDatabase() { return API.post('/api/guangce/test-database'); },
+        testFeishu() { return API.post('/api/guangce/test-feishu'); },
+        startRun() { return API.post('/api/guangce/runs'); },
+        pauseRun() { return API.post('/api/guangce/runs/pause'); },
+        resumeRun() { return API.post('/api/guangce/runs/resume'); },
+        getStatus() { return API.get('/api/guangce/status', { showError: false }); },
+    },
+
     // ── Pinchuang Hub API ────────────────────────────
     pinchuang: {
         getConfig() { return API.get('/api/pinchuang/config', { showError: false }); },

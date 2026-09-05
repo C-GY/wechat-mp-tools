@@ -44,7 +44,7 @@
 | `backend/runtime.py` | 源码与 PyInstaller 运行时差异适配 | `resource_dir()`、`app_dir()`、`log_file()`、`configure_runtime()`、`launch_chromium()`、`launch_persistent_context()`、`write_startup_error()`；修正 CA、Playwright 浏览器路径、ffmpeg 搜索路径 |
 | `backend/config.py` | 设置、存储路径和代理调度 | `DEFAULT_SETTINGS`、`ensure_dirs()`、`get_settings()/save_settings()`、`get_proxy_url()`、`report_proxy_status()`；所有主要 JSON 状态文件路径在此集中声明 |
 
-`app.py` 依次注册认证、公众号、文章、代理、账号池、抖音、快手、视频号、转码、小红书、B 站、OSS、品创中枢和创意雷达蓝图。每个 `backend/*.py` 蓝图自带 `url_prefix`，因此路由归属可以直接从模块开头的 `Blueprint(...)` 判断。
+`app.py` 依次注册认证、公众号、文章、代理、账号池、抖音、快手、视频号、转码、小红书、B 站、OSS、品创中枢、广策中枢和创意雷达蓝图。每个 `backend/*.py` 蓝图自带 `url_prefix`，因此路由归属可以直接从模块开头的 `Blueprint(...)` 判断。
 
 ### 共享领域服务
 
@@ -53,6 +53,7 @@
 | `backend/account_pool.py` | 微信读书凭证池 | `acquire()` 按 `(failures, last_used)` 选择 active 账号；`report()` 处理 401/429/200013 与普通失败；`start_keepalive()` 每 15 分钟心跳，超过 45 分钟做浏览器刷新；全局 `account_pool` 在模块导入时启动 |
 | `backend/rss_scheduler.py` | 公众号订阅抓取与上传 | 全局 `rss_scheduler` daemon 循环每 30 秒 `_tick()`；`ThreadPoolExecutor(max_workers=50)` 执行 `_fetch_for_account()`；下载历史中未上传条目可批量 POST 到设置的上传网关 |
 | `backend/pinchuang.py` | 品创中枢定时同步 | `PinchuangHub` 按北京时间匹配多个每日触发点；每位创作者依次执行视频号健康检查、全量刷新、MySQL 差异比对、仅新增作品 OSS 上传和快照写入；飞书异常通知最多重试 3 次 |
+| `backend/guangce.py` | 广策中枢定时同步 | `GuangceHub` 继承完整的 `PinchuangHub` MySQL 快照流程，独立配置、备份类型、调度线程和运行状态；数据库名称默认留空，接口为 `/api/guangce` |
 | `backend/creative_radar.py` | 创意雷达 API 定时同步 | `CreativeRadarHub` 复用品创中枢调度、刷新、OSS、通知和状态流程，每轮将全部已准备作品按 200 条分批提交，由服务端处理幂等；接口为 `/api/creative-radar` |
 | `backend/downloader.py` | 微信公众号文章离线化 | `download_single_article()` 用 requests 拉文章、解析正文/封面/视频、把资源写到 `media/`，生成 `*.html`、`*_raw.html`、`data.json`、`content.txt`、`metadata.json` |
 | `backend/mitm_proxy.py` | 视频号 HTTPS 拦截与页面注入 | `ChannelsAddon` 只拦截 `channels.weixin.qq.com`、`mp.weixin.qq.com`、`res.wx.qq.com`；`ProxyManager.start()/stop()` 管理 CA、系统代理、NO_PROXY、mitmproxy 线程 |
@@ -132,6 +133,7 @@
 | 微信读书保活 | `backend/account_pool.py` 导入全局单例 | daemon thread，15 秒后每 15 分钟 | 进程内守护，不独立持久化 |
 | RSS 调度 | `app.py` 导入时 `rss_scheduler.start()` | daemon loop 每 30 秒 + 最多 50 worker 线程 | `stop()` 设置 Event 并 shutdown executor |
 | 品创中枢调度 | `app.py` 导入时 `pinchuang_hub.start()` | daemon loop 每 15 秒检查多时点计划；每轮单 worker、按创作者串行处理 | 进度与最近 100 次运行持久化；异常退出在下次启动标记 interrupted |
+| 广策中枢调度 | `app.py` 导入时 `guangce_hub.start()` | 继承相同的多时点计划与同步流程，使用独立 worker 和暂停/继续控制 | 配置与最近 100 次运行独立持久化，共用创作者、视频号环境和 OSS |
 | 创意雷达调度 | `app.py` 导入时 `creative_radar_hub.start()` | 复用品创中枢调度器，使用独立配置、worker 与状态；每轮全量分批提交，API 每批最多 200 条；`api.timeout_seconds` 控制每批响应超时，默认 600 秒（10 分钟）、可配置 1–600 秒 | 持久化批次受理、明确失败及待确认结果；逐条回执可缺省；问题批次不阻止后续批次和创作者；运行历史独立持久化 |
 | 文章下载 | `backend/articles.py` | 每个任务一个 daemon thread，状态字典加锁 | completed/failed/cancelled |
 | 平台批量下载 | `backend/douyin.py`、`backend/kuaishou.py`、`backend/xiaohongshu.py`、`backend/bilibili.py`、`backend/channels.py` | 平台级单任务或 task id 字典 + daemon thread/Event | 可取消，写平台历史 |
@@ -154,6 +156,7 @@
 | `data/rss_articles.json`、`data/rss_subscriptions.json`、`data/rss_upload_log.json` | RSS 缓存、订阅、上传审计 | `backend/rss_scheduler.py` |
 | `data/channels_*` | 视频号历史、收藏、feed、调用日志 | `backend/channels.py`、`backend/mitm_proxy.py` |
 | 系统用户配置目录下 `pinchuang_hub_config.json`、`pinchuang_hub_state.json` | 品创中枢数据库/计划/飞书配置与运行历史，覆盖安装后保留 | `backend/pinchuang.py` |
+| 系统用户配置目录下 `guangce_hub_config.json`、`guangce_hub_state.json` | 广策中枢数据库/计划/飞书配置与运行历史，覆盖安装后保留 | `backend/guangce.py` |
 | 系统用户配置目录下 `creative_radar_config.json`、`creative_radar_state.json` | 创意雷达 API/计划/飞书配置、运行历史及批次结果；旧 `creative_radar_state_sync_cache.json` 不再读写 | `backend/creative_radar.py` |
 | `data/douyin_downloads/`、`data/douyin_history.json` | 抖音文件与历史 | `backend/douyin.py` |
 | `data/kuaishou_downloads/`、`data/kuaishou_history.json` | 快手文件与历史 | `backend/kuaishou.py` |
@@ -162,7 +165,7 @@
 | `data/temp_uploads/`、`data/transcoded/` | 外部上传缓存和转码输出 | `backend/transcode.py` |
 | `data/ca.*`、`data/certs/`、`data/mitm/`、`data/frontend_errors.log`、`data/parse_debug.log` | mitmproxy 证书、配置、前端错误和解析诊断 | `backend/mitm_proxy.py`、`backend/channels.py` |
 
-除品创中枢通过 PyMySQL 写入外部 MySQL 8 快照表外，本地持久化主要是普通 JSON 和文件目录；并发保护是模块内 `threading.Lock`，不是文件锁。多个应用实例同时写同一个 `DATA_DIR` 或系统用户配置目录时应先避免这种操作。
+除品创中枢和广策中枢通过 PyMySQL 写入外部 MySQL 8 快照表外，本地持久化主要是普通 JSON 和文件目录；并发保护是模块内 `threading.Lock`，不是文件锁。多个应用实例同时写同一个 `DATA_DIR` 或系统用户配置目录时应先避免这种操作。
 
 ## 构建与自动化
 

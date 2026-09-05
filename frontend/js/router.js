@@ -23,6 +23,7 @@ const Router = {
             'channels_oss_config': typeof ChannelsOSSConfigPage !== 'undefined' ? ChannelsOSSConfigPage : null,
             'channels_oss_progress': typeof ChannelsOSSProgressPage !== 'undefined' ? ChannelsOSSProgressPage : null,
             'channels_pinchuang': typeof ChannelsPinchuangPage !== 'undefined' ? ChannelsPinchuangPage : null,
+            'channels_guangce': typeof ChannelsGuangcePage !== 'undefined' ? ChannelsGuangcePage : null,
             'channels_creative_radar': typeof ChannelsCreativeRadarPage !== 'undefined' ? ChannelsCreativeRadarPage : null,
             'proxy': ProxyPage,
             'settings': SettingsPage,

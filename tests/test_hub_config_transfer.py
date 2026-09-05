@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from flask import Flask
 
-from backend import creative_radar, pinchuang
+from backend import creative_radar, guangce, pinchuang
 
 
 class HubConfigFixture(unittest.TestCase):
@@ -21,6 +21,7 @@ class HubConfigFixture(unittest.TestCase):
         self.hubs = {
             "pinchuang": pinchuang.PinchuangHub(self.root / "pinchuang.json", self.root / "pinchuang-state.json"),
             "creative-radar": creative_radar.CreativeRadarHub(self.root / "radar.json", self.root / "radar-state.json"),
+            "guangce": guangce.GuangceHub(self.root / "guangce.json", self.root / "guangce-state.json"),
         }
         common = {
             "schedule": {"enabled": True, "times": ["09:00", "18:30"], "creator_interval_seconds": 25},
@@ -35,11 +36,18 @@ class HubConfigFixture(unittest.TestCase):
             **common,
             "api": {"endpoint": "https://example.invalid/upload", "api_key": "test-api-secret", "timeout_seconds": 90},
         })
+        self.hubs["guangce"].save_config({
+            **common,
+            "database": {"host": "guangce.example.invalid", "port": 3306, "username": "guangce-writer",
+                         "password": "test-db-secret", "database": "guangce_platform"},
+        })
         self.stack.enter_context(patch.object(pinchuang, "pinchuang_hub", self.hubs["pinchuang"]))
         self.stack.enter_context(patch.object(creative_radar, "creative_radar_hub", self.hubs["creative-radar"]))
+        self.stack.enter_context(patch.object(guangce, "guangce_hub", self.hubs["guangce"]))
         self.app = Flask(__name__)
         self.app.register_blueprint(pinchuang.pinchuang_bp)
         self.app.register_blueprint(creative_radar.creative_radar_bp)
+        self.app.register_blueprint(guangce.guangce_bp)
         self.client = self.app.test_client()
 
 
@@ -66,8 +74,8 @@ class HubConfigTransferTests(HubConfigFixture):
             with self.subTest(module=key):
                 backup = self.client.post(f"/api/{key}/config/export").get_json()
                 expected = copy.deepcopy(hub.config)
-                other = next(other for other_key, other in self.hubs.items() if other_key != key)
-                other_before = other.config_path.read_bytes()
+                others_before = {other.config_path: other.config_path.read_bytes()
+                                 for other_key, other in self.hubs.items() if other_key != key}
                 state_before = hub.state_path.read_bytes()
                 hub.save_config({"schedule": {"enabled": False, "times": ["12:00"]}})
                 response = self.client.post(f"/api/{key}/config/import", json=backup)
@@ -76,7 +84,8 @@ class HubConfigTransferTests(HubConfigFixture):
                 self.assertEqual(json.loads(hub.config_path.read_text(encoding="utf-8")), expected)
                 restarted = type(hub)(hub.config_path, self.root / f"{key}-restarted.json")
                 self.assertEqual(restarted.config, expected)
-                self.assertEqual(other.config_path.read_bytes(), other_before)
+                for path, before in others_before.items():
+                    self.assertEqual(path.read_bytes(), before)
                 self.assertEqual(hub.state_path.read_bytes(), state_before)
                 self.assertIsNone(hub.worker)
                 for secret in ("test-db-secret", "test-api-secret", "test-bot-secret"):
@@ -101,16 +110,17 @@ class HubConfigTransferTests(HubConfigFixture):
                 bad_times = copy.deepcopy(backup)
                 bad_times["config"]["schedule"]["times"] = ["25:00"]
                 bad_field = copy.deepcopy(backup)
-                connection = "database" if key == "pinchuang" else "api"
-                number = "port" if key == "pinchuang" else "timeout_seconds"
+                connection = "database" if "database" in hub.config else "api"
+                number = "port" if connection == "database" else "timeout_seconds"
                 bad_field["config"][connection][number] = -1
                 incomplete = copy.deepcopy(backup)
-                del incomplete["config"][connection]["password" if key == "pinchuang" else "api_key"]
-                other = next(other for other_key, other in self.hubs.items() if other_key != key)
+                del incomplete["config"][connection]["password" if connection == "database" else "api_key"]
+                other = next(other for other in self.hubs.values() if set(other.config) != set(hub.config))
                 payloads = [
                     None, [], {}, {"format": hub.config_backup_format},
                     {**backup, "format_version": 2}, {**backup, "format_version": True},
-                    other.export_config_backup(), other.config, incomplete,
+                    *(other.export_config_backup() for other_key, other in self.hubs.items() if other_key != key),
+                    other.config, incomplete,
                     bad_enabled, bad_times, bad_field, hub.get_config(),
                 ]
                 before = hub.config_path.read_bytes()

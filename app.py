@@ -64,6 +64,7 @@ from backend.bilibili import bilibili_bp
 from backend.bilibili_login import bilibili_login_bp
 from backend.oss import oss_bp
 from backend.pinchuang import pinchuang_bp
+from backend.guangce import guangce_bp
 from backend.creative_radar import creative_radar_bp
 
 # ── Flask 应用 ────────────────────────────────────────────
@@ -95,6 +96,7 @@ app.register_blueprint(bilibili_bp)
 app.register_blueprint(bilibili_login_bp)
 app.register_blueprint(oss_bp)
 app.register_blueprint(pinchuang_bp)
+app.register_blueprint(guangce_bp)
 app.register_blueprint(creative_radar_bp)
 
 
@@ -106,9 +108,11 @@ migrate_legacy_config()
 from backend.rss_scheduler import rss_scheduler
 rss_scheduler.start()
 
-# 启动品创中枢多时点调度器（配置保存在系统用户目录）
+# 启动各同步模块的多时点调度器（配置保存在系统用户目录）
 from backend.pinchuang import pinchuang_hub
 pinchuang_hub.start()
+from backend.guangce import guangce_hub
+guangce_hub.start()
 from backend.creative_radar import creative_radar_hub
 creative_radar_hub.start()
 

@@ -1188,7 +1188,8 @@ body {
     font-size: 1.6rem;
 }
 
-/* 品创中枢共 7 项：桌面端固定两行，并让 4 项 / 3 项各自铺满整行。 */
+/* 品创/广策中枢共 7 项：桌面端固定两行，并让 4 项 / 3 项各自铺满整行。 */
+.guangce-stats-row,
 .pinchuang-stats-row {
     display: grid;
     grid-template-columns: repeat(12, minmax(0, 1fr));
@@ -1196,25 +1197,31 @@ body {
     margin-top: var(--spacing-lg);
 }
 
+.guangce-stats-row .stat-card,
 .pinchuang-stats-row .stat-card {
     grid-column: span 3;
     min-width: 0;
     padding: var(--spacing-md);
 }
 
+.guangce-stats-row .stat-card:nth-child(n + 5),
 .pinchuang-stats-row .stat-card:nth-child(n + 5) {
     grid-column: span 4;
 }
 
+.guangce-stats-row .stat-label,
 .pinchuang-stats-row .stat-label {
     white-space: nowrap;
 }
 
 @media (max-width: 900px) {
+    .guangce-stats-row,
     .pinchuang-stats-row {
         grid-template-columns: repeat(2, minmax(0, 1fr));
     }
 
+    .guangce-stats-row .stat-card,
+    .guangce-stats-row .stat-card:nth-child(n + 5),
     .pinchuang-stats-row .stat-card,
     .pinchuang-stats-row .stat-card:nth-child(n + 5) {
         grid-column: span 1;
@@ -1222,6 +1229,7 @@ body {
 }
 
 @media (max-width: 520px) {
+    .guangce-stats-row,
     .pinchuang-stats-row {
         grid-template-columns: 1fr;
     }

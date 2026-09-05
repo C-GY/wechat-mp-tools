@@ -310,10 +310,12 @@ class SchedulerTests(unittest.TestCase):
 
 
 class PauseControlTests(unittest.TestCase):
+    hub_class = pinchuang.PinchuangHub
+
     def test_pause_checkpoint_blocks_until_resume_and_restores_phase(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            hub = pinchuang.PinchuangHub(root / "config.json", root / "state.json")
+            hub = self.hub_class(root / "config.json", root / "state.json")
             hub.state["current_run"] = {
                 "run_id": "run-1",
                 "status": "running",
@@ -352,15 +354,17 @@ class PauseControlTests(unittest.TestCase):
 
 
 class PipelineTests(unittest.TestCase):
+    hub_class = pinchuang.PinchuangHub
+
     def _hub_with_run(self, root):
-        hub = pinchuang.PinchuangHub(root / "config.json", root / "state.json")
-        hub.config = pinchuang._merged_config({
+        hub = self.hub_class(root / "config.json", root / "state.json")
+        hub.config = hub._merge_config({
             "database": {
                 "host": "db.local",
                 "port": 3306,
                 "username": "writer",
                 "password": "secret",
-                "database": "pinchuang_platform",
+                "database": "snapshot_test",
             },
             "schedule": {"creator_interval_seconds": 0},
         })

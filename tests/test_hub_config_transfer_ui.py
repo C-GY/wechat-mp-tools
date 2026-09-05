@@ -1,6 +1,8 @@
 import json
+import mimetypes
 from pathlib import Path
 from urllib.parse import urlsplit
+from unittest.mock import MagicMock
 
 from playwright.sync_api import sync_playwright
 
@@ -8,7 +10,7 @@ from test_hub_config_transfer import HubConfigFixture
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PAGES = {"pinchuang": "ChannelsPinchuangPage", "creative-radar": "ChannelsCreativeRadarPage"}
+PAGES = {"pinchuang": "ChannelsPinchuangPage", "creative-radar": "ChannelsCreativeRadarPage", "guangce": "ChannelsGuangcePage"}
 
 
 class HubConfigTransferUiTests(HubConfigFixture):
@@ -65,7 +67,7 @@ class HubConfigTransferUiTests(HubConfigFixture):
         for key, hub in self.hubs.items():
             with self.subTest(module=key):
                 page = self.page_for(key)
-                field = "pinchuang-db-host" if key == "pinchuang" else "creative-radar-api-endpoint"
+                field = f"{key}-db-host" if "database" in hub.config else f"{key}-api-endpoint"
                 page.locator(f"#{field}").fill("https://unsaved.example.invalid")
                 page.locator(f"#btn-{key}-export-config").click()
                 page.wait_for_function("window.__copied !== null")
@@ -82,12 +84,12 @@ class HubConfigTransferUiTests(HubConfigFixture):
                 page.locator("#hub-config-import-json").fill("\ufeff" + text)
                 page.locator("#hub-config-import-submit").click()
                 page.wait_for_function("!Modal.overlay.classList.contains('active')")
-                expected_value = backup["config"]["database"]["host"] if key == "pinchuang" else backup["config"]["api"]["endpoint"]
+                expected_value = backup["config"]["database"]["host"] if "database" in hub.config else backup["config"]["api"]["endpoint"]
                 page.wait_for_function("([id, value]) => document.getElementById(id).value === value", arg=[field, expected_value])
                 self.assertEqual(hub.config, backup["config"])
                 self.assertTrue(page.locator(f"#{key}-schedule-enabled").is_checked())
                 self.assertIn("18:30", page.locator(f"#{key}-time-list").inner_text())
-                secret_input = "pinchuang-db-password" if key == "pinchuang" else "creative-radar-api-key"
+                secret_input = f"{key}-db-password" if "database" in hub.config else f"{key}-api-key"
                 self.assertEqual(page.locator(f"#{secret_input}").input_value(), "")
                 self.assertIn("已保存", page.locator(f"#{secret_input}").get_attribute("placeholder"))
                 self.assertEqual(page.locator("#hub-config-import-json").input_value(), "")
@@ -155,3 +157,72 @@ class HubConfigTransferUiTests(HubConfigFixture):
         page.wait_for_function("window.__messages.some(item => item.type === 'error')")
         self.assertIsNone(page.evaluate("window.__copied"))
         self.assertTrue(page.locator("#btn-creative-radar-export-config").is_enabled())
+
+    def test_guangce_navigation_save_progress_and_pause_are_independent(self):
+        page = self.browser.new_page(viewport={"width": 1440, "height": 1000})
+        self.addCleanup(page.close)
+        errors = []
+        page.on("pageerror", lambda error: errors.append(str(error)))
+
+        def handle(route):
+            request = route.request
+            path = urlsplit(request.url).path
+            if path.startswith(("/api/guangce/", "/api/pinchuang/")):
+                response = self.client.open(path, method=request.method, data=request.post_data, content_type="application/json")
+                route.fulfill(status=response.status_code, content_type="application/json", body=response.data)
+            elif path.startswith("/api/"):
+                route.fulfill(content_type="application/json", body='{"available":true}')
+            else:
+                target = ROOT / "frontend" / (path.lstrip("/") or "index.html")
+                if target.is_file():
+                    route.fulfill(content_type=mimetypes.guess_type(target)[0] or "application/octet-stream", body=target.read_bytes())
+                else:
+                    route.fulfill(status=404)
+
+        page.route("https://hub-app.test/**", handle)
+        page.goto("https://hub-app.test/#channels_guangce")
+        page.wait_for_function("document.getElementById('guangce-db-host')?.value === 'guangce.example.invalid'")
+        self.assertEqual(page.locator(".page-title:visible").inner_text(), "广策中枢系统")
+        self.assertIn("active", page.locator("#nav-channels_guangce").get_attribute("class"))
+        self.assertEqual(page.locator(".guangce-stats-row .stat-card").count(), 7)
+        self.assertEqual(page.locator(".guangce-stats-row").evaluate("el => getComputedStyle(el).display"), "grid")
+        original_config = self.hubs["pinchuang"].config_path.read_bytes()
+        page.locator("#guangce-db-host").fill("new-guangce.example.invalid")
+        page.locator("#guangce-new-time").fill("22:15")
+        page.get_by_role("button", name="＋ 添加时间").click()
+        page.locator("#guangce-creator-interval").fill("45")
+        with page.expect_response("**/api/guangce/config") as saved:
+            page.locator("#btn-guangce-save-schedule").click()
+        self.assertEqual(saved.value.status, 200)
+        hub = self.hubs["guangce"]
+        self.assertEqual(hub.config["schedule"]["times"], ["09:00", "18:30", "22:15"])
+        self.assertEqual(hub.config["schedule"]["creator_interval_seconds"], 45)
+        self.assertEqual(hub.config["database"]["host"], "new-guangce.example.invalid")
+
+        hub.worker = MagicMock()
+        hub.worker.is_alive.return_value = True
+        hub.state["current_run"] = {
+            "run_id": "guangce-ui-run", "status": "running", "phase": "uploading_oss",
+            "message": "正在同步 OSS：2/3", "total_creators": 2, "completed_creators": 1,
+            "current_creator_index": 2, "current_creator_name": "广策测试作者", "uploaded_videos": 2,
+        }
+        page.evaluate("() => ChannelsGuangcePage.loadStatus()")
+        self.assertEqual(page.locator("#guangce-stat-creators").inner_text(), "2/2")
+        self.assertEqual(page.locator("#guangce-stat-creator-name").inner_text(), "广策测试作者")
+        self.assertEqual(page.locator("#guangce-stat-uploaded").inner_text(), "2")
+        with page.expect_response("**/api/guangce/runs/pause"):
+            page.locator("#btn-guangce-pause").click()
+        page.wait_for_function("document.getElementById('btn-guangce-pause').dataset.action === 'resume'")
+        self.assertEqual(hub.state["current_run"]["status"], "pausing")
+        with page.expect_response("**/api/guangce/runs/resume"):
+            page.locator("#btn-guangce-pause").click()
+        self.assertEqual(hub.state["current_run"]["status"], "running")
+
+        page.locator("#nav-channels_pinchuang").click()
+        page.wait_for_function("document.getElementById('pinchuang-db-host')?.value === 'db.example.invalid'")
+        page.locator("#nav-channels_guangce").click()
+        page.wait_for_function("Router.currentKey === 'channels_guangce'")
+        self.assertEqual(page.locator("#guangce-db-host").input_value(), "new-guangce.example.invalid")
+        self.assertEqual(self.hubs["pinchuang"].config_path.read_bytes(), original_config)
+        self.assertEqual(page.evaluate("() => { const ids = [...document.querySelectorAll('[id]')].map(el => el.id); return ids.length - new Set(ids).size; }"), 0)
+        self.assertEqual(errors, [])
