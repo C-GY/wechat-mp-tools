@@ -872,6 +872,7 @@ class ChannelsAddon:
 
 def save_synced_feeds(username, feeds):
     import urllib.parse
+    from backend.channels_capture import capture_metadata
     from backend.config import load_json, save_json
     from backend.channels_favorites import FAVORITES_LOCK, save_favorites_atomic
     from backend.channels import (
@@ -1032,6 +1033,7 @@ def save_synced_feeds(username, feeds):
             "createtime": createtime,
             "decode_key": decode_key
         }
+        item.update(capture_metadata(feed))
         item.update(extract_interaction_metrics(feed))
         duration_seconds = extract_video_duration(feed)
         if duration_seconds is not None:

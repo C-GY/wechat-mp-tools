@@ -257,6 +257,22 @@ const API = {
         getStatus() { return API.get('/api/creative-radar/status', { showError: false }); },
     },
 
+    // ── Competitor Monitoring API ────────────────────
+    competitor_monitor: {
+        getAuthors() { return API.get('/api/competitor_monitor/authors', { showError: false }); },
+        changeAuthorTags(payload) { return API.post('/api/competitor_monitor/author-tags/batch', payload, { showError: false }); },
+        getConfig() { return API.get('/api/competitor_monitor/config', { showError: false }); },
+        exportConfig() { return API.post('/api/competitor_monitor/config/export', {}, { showError: false }); },
+        importConfig(config) { return API.post('/api/competitor_monitor/config/import', config, { showError: false }); },
+        saveConfig(config) { return API.post('/api/competitor_monitor/config', config); },
+        testDatabase() { return API.post('/api/competitor_monitor/test-database'); },
+        testFeishu() { return API.post('/api/competitor_monitor/test-feishu'); },
+        startRun() { return API.post('/api/competitor_monitor/runs'); },
+        pauseRun() { return API.post('/api/competitor_monitor/runs/pause'); },
+        resumeRun() { return API.post('/api/competitor_monitor/runs/resume'); },
+        getStatus() { return API.get('/api/competitor_monitor/status', { showError: false }); },
+    },
+
     // ── Guangce Hub API ──────────────────────────────
     guangce: {
         getConfig() { return API.get('/api/guangce/config', { showError: false }); },

@@ -623,6 +623,7 @@ def ensure_wechat_channels_available(detection_timeout=20.0, open_timeout=8.0, *
 
 class PinchuangHub:
     module_name = "品创中枢"
+    require_feishu = True
     config_backup_format = "pinchuang_config"
     storage_label = "数据库"
     thread_prefix = "pinchuang"
@@ -942,7 +943,7 @@ class PinchuangHub:
             self._validate_database_config(self.config)
             if not get_oss_config().get("configured"):
                 raise ValueError("请先完成 OSS 配置")
-            if not self._notifier().configured():
+            if self.require_feishu and not self._notifier().configured():
                 raise ValueError("请先配置飞书机器人 Webhook")
             if self.worker and self.worker.is_alive():
                 raise RuntimeError(f"已有{self.module_name}同步任务正在运行")

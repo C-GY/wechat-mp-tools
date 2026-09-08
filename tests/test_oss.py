@@ -3,7 +3,7 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from flask import Flask
 
@@ -182,6 +182,49 @@ class OSSConfigTests(unittest.TestCase):
 
 
 class OSSUploadTests(unittest.TestCase):
+    def test_upload_progress_is_bounded_and_completion_is_always_saved(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            file = root / "video.mp4"
+            file.write_bytes(b"example video bytes")
+            with patch.object(oss, "OSS_UPLOAD_TASKS_FILE", root / "tasks.json"):
+                manager = oss.OSSUploadManager()
+                task = {"id": "task-1", "video_id": "v1"}
+                service = MagicMock()
+
+                def upload(path, video_id, created_at, callback):
+                    for value in range(101):
+                        callback(value, 100)
+                    return {"size": 100, "url": "https://oss.example/v1.mp4", "object_key": "v1.mp4"}
+
+                service.upload_video.side_effect = upload
+                with patch.object(oss.OSSService, "from_saved_config", return_value=service), patch.object(manager, "_download_video", return_value=file), patch.object(manager, "_save_video_result"), patch.object(manager, "_update") as update, patch.object(oss.time, "monotonic", return_value=10.0):
+                    manager._run_batch("batch-1", [(task, {})])
+                progress = [call.kwargs["progress"] for call in update.call_args_list if call.kwargs.get("status") == "uploading"]
+                self.assertEqual(progress, [0, 100])
+                self.assertEqual(update.call_args_list[-1].kwargs["status"], "completed")
+
+    def test_remote_reuse_requires_a_public_readable_mp4_and_never_uploads(self):
+        for status, size, prefix, found in ((200, 1024, b"\x00\x00\x00\x20ftypisom", True),
+                                           (404, 1024, b"\x00\x00\x00\x20ftypisom", False),
+                                           (200, 0, b"", False),
+                                           (200, 1024, b"<html>error", False)):
+            with self.subTest(status=status, size=size, prefix=prefix):
+                session = MagicMock()
+                head = session.head.return_value.__enter__.return_value
+                head.status_code = status
+                head.headers = {"Content-Length": str(size)}
+                get = session.get.return_value.__enter__.return_value
+                get.status_code = 206
+                get.iter_content.return_value = iter([prefix])
+                service = oss.OSSService("access-id", "access-secret", session=session, bucket="video-library")
+                result = service.find_uploaded_video("video-1", 1721174400)
+                self.assertEqual(bool(result), found)
+                if found:
+                    self.assertEqual(result["url"], "https://oss.fandow.com/video-library/wechat_channel/2024-07-17/video-1.mp4")
+                    self.assertEqual(result["size"], size)
+                session.put.assert_not_called()
+
     def test_upload_signs_streams_and_verifies_the_file(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             video = Path(temp_dir) / "video.mp4"

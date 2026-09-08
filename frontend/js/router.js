@@ -24,6 +24,8 @@ const Router = {
             'channels_oss_progress': typeof ChannelsOSSProgressPage !== 'undefined' ? ChannelsOSSProgressPage : null,
             'channels_pinchuang': typeof ChannelsPinchuangPage !== 'undefined' ? ChannelsPinchuangPage : null,
             'channels_guangce': typeof ChannelsGuangcePage !== 'undefined' ? ChannelsGuangcePage : null,
+            'channels_competitor_monitor': typeof ChannelsCompetitorMonitorPage !== 'undefined' ? ChannelsCompetitorMonitorPage : null,
+            'channels_competitor_author_tags': typeof ChannelsCompetitorAuthorTagsPage !== 'undefined' ? ChannelsCompetitorAuthorTagsPage : null,
             'channels_creative_radar': typeof ChannelsCreativeRadarPage !== 'undefined' ? ChannelsCreativeRadarPage : null,
             'proxy': ProxyPage,
             'settings': SettingsPage,

@@ -609,6 +609,8 @@ def save_parsed_video_to_db(result):
                 "createtime": createtime,
                 "decode_key": decode_key
             }
+            from backend.channels_capture import capture_metadata
+            item.update(capture_metadata(fi))
             item.update(extract_interaction_metrics(fi))
             duration_seconds = extract_video_duration(fi)
             if duration_seconds is not None:

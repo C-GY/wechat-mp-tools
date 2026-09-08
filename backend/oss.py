@@ -284,6 +284,31 @@ class OSSService:
             + (f": {body}" if body else "")
         )
 
+    def find_uploaded_video(self, material_id: str, scraped_at=None):
+        """Reuse an existing public MP4 when this machine has no upload record.
+
+        This is read-only. Missing, inaccessible, or non-video responses fall
+        back to the ordinary upload path; they never become stored video URLs.
+        """
+        object_key = build_oss_object_key(material_id, scraped_at)
+        target_url = build_oss_public_url(object_key, self.bucket)
+        try:
+            with self.session.head(target_url, timeout=(5, 10)) as response:
+                if response.status_code != 200:
+                    return None
+                size = int(response.headers.get("Content-Length", 0))
+                if size < 12:
+                    return None
+            with self.session.get(target_url, headers={"Range": "bytes=0-31"}, stream=True, timeout=(5, 10)) as response:
+                if response.status_code not in (200, 206):
+                    return None
+                prefix = next(response.iter_content(chunk_size=32), b"")
+                if prefix[4:8] != b"ftyp":
+                    return None
+            return {"object_key": object_key, "bucket": self.bucket, "url": target_url, "size": size}
+        except (requests.RequestException, ValueError, OSError):
+            return None
+
     def upload_video(self, file_path: Path, material_id: str, scraped_at=None, callback=None):
         file_path = Path(file_path)
         if not file_path.is_file() or file_path.stat().st_size <= 0:
@@ -589,13 +614,20 @@ class OSSUploadManager:
             try:
                 temp_path = self._download_video(task_id, video)
                 last_saved_percent = -1
+                last_saved_at = 0.0
 
                 def on_progress(uploaded, total):
-                    nonlocal last_saved_percent
+                    nonlocal last_saved_percent, last_saved_at
                     percent = int(uploaded / total * 100) if total else 0
-                    if percent == last_saved_percent and uploaded != total:
+                    now = time.monotonic()
+                    # History can contain thousands of tasks. Rewriting it for
+                    # every percentage point blocks the HTTP upload reader.
+                    if uploaded != total and last_saved_percent >= 0 and (
+                        percent == last_saved_percent or now - last_saved_at < 1.0
+                    ):
                         return
                     last_saved_percent = percent
+                    last_saved_at = now
                     self._update(
                         task_id,
                         status="uploading",

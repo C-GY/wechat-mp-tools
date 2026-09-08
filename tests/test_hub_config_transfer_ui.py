@@ -10,7 +10,7 @@ from test_hub_config_transfer import HubConfigFixture
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PAGES = {"pinchuang": "ChannelsPinchuangPage", "creative-radar": "ChannelsCreativeRadarPage", "guangce": "ChannelsGuangcePage"}
+PAGES = {"pinchuang": "ChannelsPinchuangPage", "creative-radar": "ChannelsCreativeRadarPage", "guangce": "ChannelsGuangcePage", "competitor_monitor": "ChannelsCompetitorMonitorPage"}
 
 
 class HubConfigTransferUiTests(HubConfigFixture):

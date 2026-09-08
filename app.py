@@ -65,6 +65,7 @@ from backend.bilibili_login import bilibili_login_bp
 from backend.oss import oss_bp
 from backend.pinchuang import pinchuang_bp
 from backend.guangce import guangce_bp
+from backend.competitor_monitor import competitor_monitor_bp
 from backend.creative_radar import creative_radar_bp
 
 # ── Flask 应用 ────────────────────────────────────────────
@@ -97,6 +98,7 @@ app.register_blueprint(bilibili_login_bp)
 app.register_blueprint(oss_bp)
 app.register_blueprint(pinchuang_bp)
 app.register_blueprint(guangce_bp)
+app.register_blueprint(competitor_monitor_bp)
 app.register_blueprint(creative_radar_bp)
 
 
@@ -113,6 +115,8 @@ from backend.pinchuang import pinchuang_hub
 pinchuang_hub.start()
 from backend.guangce import guangce_hub
 guangce_hub.start()
+from backend.competitor_monitor import competitor_monitor_hub
+competitor_monitor_hub.start()
 from backend.creative_radar import creative_radar_hub
 creative_radar_hub.start()
 

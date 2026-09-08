@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from flask import Flask
 
-from backend import creative_radar, guangce, pinchuang
+from backend import competitor_monitor, creative_radar, guangce, pinchuang
 
 
 class HubConfigFixture(unittest.TestCase):
@@ -22,6 +22,7 @@ class HubConfigFixture(unittest.TestCase):
             "pinchuang": pinchuang.PinchuangHub(self.root / "pinchuang.json", self.root / "pinchuang-state.json"),
             "creative-radar": creative_radar.CreativeRadarHub(self.root / "radar.json", self.root / "radar-state.json"),
             "guangce": guangce.GuangceHub(self.root / "guangce.json", self.root / "guangce-state.json"),
+            "competitor_monitor": competitor_monitor.CompetitorMonitorHub(self.root / "competitor.json", self.root / "competitor-state.json"),
         }
         common = {
             "schedule": {"enabled": True, "times": ["09:00", "18:30"], "creator_interval_seconds": 25},
@@ -41,13 +42,20 @@ class HubConfigFixture(unittest.TestCase):
             "database": {"host": "guangce.example.invalid", "port": 3306, "username": "guangce-writer",
                          "password": "test-db-secret", "database": "guangce_platform"},
         })
+        self.hubs["competitor_monitor"].save_config({
+            **common,
+            "database": {"host": "competitor.example.invalid", "port": 3306, "username": "competitor-writer",
+                         "password": "test-db-secret", "database": "competitor_monitor"},
+        })
         self.stack.enter_context(patch.object(pinchuang, "pinchuang_hub", self.hubs["pinchuang"]))
         self.stack.enter_context(patch.object(creative_radar, "creative_radar_hub", self.hubs["creative-radar"]))
         self.stack.enter_context(patch.object(guangce, "guangce_hub", self.hubs["guangce"]))
+        self.stack.enter_context(patch.object(competitor_monitor, "competitor_monitor_hub", self.hubs["competitor_monitor"]))
         self.app = Flask(__name__)
         self.app.register_blueprint(pinchuang.pinchuang_bp)
         self.app.register_blueprint(creative_radar.creative_radar_bp)
         self.app.register_blueprint(guangce.guangce_bp)
+        self.app.register_blueprint(competitor_monitor.competitor_monitor_bp)
         self.client = self.app.test_client()
 
 

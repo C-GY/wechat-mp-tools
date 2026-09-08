@@ -79,6 +79,55 @@
     --transition-slow: 0.4s cubic-bezier(0.4, 0, 0.2, 1);
 }
 
+/* 竞对账号标签管理 */
+.author-tags-heading, .author-tags-selection, .author-tags-pagination {
+    display: flex; justify-content: space-between; align-items: center; gap: 16px; flex-wrap: wrap;
+}
+.author-tags-heading { align-items: flex-start; }
+.author-tags-actions, .author-tags-row-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.author-tags-stats { display: flex; gap: 28px; flex-wrap: wrap; padding: 24px 0; color: var(--text-secondary); }
+.author-tags-stats strong { color: var(--primary); font-size: 1.35rem; margin-left: 8px; }
+.author-tags-card { padding: 24px; }
+.author-tags-filters { display: flex; align-items: end; gap: 16px; flex-wrap: wrap; margin-bottom: 20px; }
+.author-tags-filters label { display: grid; gap: 8px; min-width: 160px; color: var(--text-secondary); font-size: .85rem; }
+.author-tags-filters .author-tags-search { flex: 1; min-width: 240px; }
+.author-tags-selection { background: var(--bg-glass); border-radius: 10px; padding: 12px; }
+.author-tags-selection > div { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.author-tags-selection strong { margin-right: 8px; }
+.author-tags-hint { color: var(--text-muted); font-size: .8rem; line-height: 1.6; margin: 10px 0; }
+.author-tags-table-wrap { overflow-x: auto; }
+.author-tags-table { width: 100%; border-collapse: collapse; font-size: .86rem; }
+.author-tags-table th { text-align: left; color: var(--text-secondary); font-weight: 500; white-space: nowrap; }
+.author-tags-table td, .author-tags-table th { padding: 16px 12px; border-bottom: 1px solid var(--border-color); vertical-align: middle; }
+.author-tags-table .author-tags-check { width: 36px; }
+.author-tags-table td:nth-child(2) { min-width: 220px; width: 35%; }
+.author-tags-table td:nth-child(3) { white-space: nowrap; }
+.author-tags-table td:nth-child(4) { min-width: 180px; }
+.author-tags-table input[type="checkbox"] { accent-color: var(--primary); width: 16px; height: 16px; cursor: pointer; }
+.author-tags-table .is-selected { background: var(--bg-glass); }
+.author-tags-name { color: var(--text-primary); overflow-wrap: anywhere; }
+.author-tags-platform { display: inline-block; font-size: .72rem; color: var(--text-muted); margin-left: 8px; }
+.author-tags-id { display: block; margin-top: 7px; color: var(--text-muted); font-size: .72rem; overflow-wrap: anywhere; max-width: 320px; }
+.author-tags-chips, .author-tags-choices { display: flex; flex-wrap: wrap; gap: 6px; }
+.author-tags-chip { display: inline-block; padding: 4px 10px; border: 1px solid var(--border-color); border-radius: 6px; color: var(--primary); background: var(--bg-glass); font-size: .8rem; overflow-wrap: anywhere; max-width: 100%; }
+.author-tags-choice { cursor: pointer; font: inherit; }
+.author-tags-choice[aria-pressed="true"] { background: var(--primary); color: white; border-color: var(--primary); }
+.author-tags-choices { max-height: 190px; overflow-y: auto; margin-top: 10px; }
+.author-tags-empty { text-align: center; color: var(--text-muted); height: 160px; }
+.author-tags-error { color: var(--error); background: var(--bg-glass); padding: 12px; border-radius: 8px; margin: 12px 0; overflow-wrap: anywhere; }
+.author-tags-error[hidden] { display: none; }
+.author-tags-pagination { margin-top: 18px; font-size: .82rem; color: var(--text-secondary); }
+.author-tags-editor { display: grid; gap: 12px; }
+.author-tags-editor textarea { width: 100%; resize: vertical; }
+.author-tags-editor .author-tags-hint { margin: 0; }
+.author-tags-targets { padding: 12px; background: var(--bg-glass); border-radius: 8px; color: var(--text-secondary); overflow-wrap: anywhere; }
+@media (max-width: 760px) {
+    .author-tags-card { padding: 14px; }
+    .author-tags-filters label { min-width: 130px; flex: 1; }
+    .author-tags-heading .author-tags-actions { width: 100%; }
+    .author-tags-stats { gap: 16px; }
+}
+
 /* ── 全局重置 ──────────────────────────────────────────── */
 *, *::before, *::after {
     margin: 0;
@@ -1188,7 +1237,8 @@ body {
     font-size: 1.6rem;
 }
 
-/* 品创/广策中枢共 7 项：桌面端固定两行，并让 4 项 / 3 项各自铺满整行。 */
+/* 品创/广策/竞对监测共 7 项：桌面端固定两行，并让 4 项 / 3 项各自铺满整行。 */
+.competitor_monitor-stats-row,
 .guangce-stats-row,
 .pinchuang-stats-row {
     display: grid;
@@ -1197,6 +1247,7 @@ body {
     margin-top: var(--spacing-lg);
 }
 
+.competitor_monitor-stats-row .stat-card,
 .guangce-stats-row .stat-card,
 .pinchuang-stats-row .stat-card {
     grid-column: span 3;
@@ -1204,23 +1255,28 @@ body {
     padding: var(--spacing-md);
 }
 
+.competitor_monitor-stats-row .stat-card:nth-child(n + 5),
 .guangce-stats-row .stat-card:nth-child(n + 5),
 .pinchuang-stats-row .stat-card:nth-child(n + 5) {
     grid-column: span 4;
 }
 
+.competitor_monitor-stats-row .stat-label,
 .guangce-stats-row .stat-label,
 .pinchuang-stats-row .stat-label {
     white-space: nowrap;
 }
 
 @media (max-width: 900px) {
+    .competitor_monitor-stats-row,
     .guangce-stats-row,
     .pinchuang-stats-row {
         grid-template-columns: repeat(2, minmax(0, 1fr));
     }
 
+    .competitor_monitor-stats-row .stat-card,
     .guangce-stats-row .stat-card,
+    .competitor_monitor-stats-row .stat-card:nth-child(n + 5),
     .guangce-stats-row .stat-card:nth-child(n + 5),
     .pinchuang-stats-row .stat-card,
     .pinchuang-stats-row .stat-card:nth-child(n + 5) {
@@ -1229,6 +1285,7 @@ body {
 }
 
 @media (max-width: 520px) {
+    .competitor_monitor-stats-row,
     .guangce-stats-row,
     .pinchuang-stats-row {
         grid-template-columns: 1fr;
