@@ -8,6 +8,41 @@ SCRIPT = Path(__file__).resolve().parents[1] / "injection_scripts/src/automation
 
 
 class ChannelsEnvironmentHeartbeatUiTests(unittest.TestCase):
+    def test_stalled_heartbeat_times_out_and_polling_recovers_automatically(self):
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(channel="msedge", headless=True)
+            page = browser.new_page()
+            try:
+                page.clock.install()
+                page.set_content("<body></body>")
+                page.evaluate("""() => {
+                    window.__requests = [];
+                    window.WXE = {onAPILoaded() {}, onUtilsLoaded() {}, onInit() {}};
+                    window.XMLHttpRequest = class {
+                        open(method, url) { this.url = url; }
+                        setRequestHeader() {}
+                        send() {
+                            window.__requests.push(this);
+                            if (window.__requests.length === 1) {
+                                // Model a browser-level timeout for a stalled request.
+                                if (this.timeout) setTimeout(() => this.ontimeout(), this.timeout);
+                            } else {
+                                this.responseText = JSON.stringify({code:0, data:null});
+                                this.onload();
+                            }
+                        }
+                    };
+                }""")
+                page.add_script_tag(path=str(SCRIPT.parent / "utils.js"))
+                page.evaluate("() => { WXU.API.finderUserPage = () => {}; }")
+                page.add_script_tag(path=str(SCRIPT))
+                page.clock.run_for(8100)
+                self.assertGreaterEqual(page.evaluate("window.__requests.length"), 2)
+                self.assertEqual(page.evaluate("window.__requests[0].timeout"), 5000)
+                self.assertIn("api_ready=1", page.evaluate("window.__requests[1].url"))
+            finally:
+                browser.close()
+
     def test_readiness_and_busy_heartbeats_continue_during_collection(self):
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(channel="msedge", headless=True)

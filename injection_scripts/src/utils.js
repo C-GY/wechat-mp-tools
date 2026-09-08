@@ -1075,12 +1075,13 @@ var WXU = (() => {
       });
     },
     /**
-     * @param {{ url: string; method: 'GET' | 'POST'; body?: any }} opt
+     * @param {{ url: string; method: 'GET' | 'POST'; body?: any; timeout?: number }} opt
      */
     async request(opt) {
       return new Promise((resolve, reject) => {
         var xhr = new XMLHttpRequest();
         xhr.open(opt.method, opt.url);
+        if (Number.isFinite(opt.timeout) && opt.timeout > 0) xhr.timeout = opt.timeout;
         xhr.setRequestHeader("Content-Type", "application/json");
         xhr.onload = async function () {
           // console.log("[request]xhr.responseText", xhr.responseText);
@@ -1099,6 +1100,12 @@ var WXU = (() => {
         xhr.onerror = function (err) {
           // console.log("[request]xhr.onerror", err);
           resolve([new Error(err.type), null]);
+        };
+        xhr.ontimeout = function () {
+          resolve([new Error("request timeout"), null]);
+        };
+        xhr.onabort = function () {
+          resolve([new Error("request aborted"), null]);
         };
         xhr.send(JSON.stringify(opt.body));
       });

@@ -552,6 +552,7 @@
       var apiReady = !!(WXU.API && typeof WXU.API.finderUserPage === "function");
       var ret = await WXU.request({
         method: "GET",
+        timeout: 5000,
         url: "/__wx_channels_api/refresh-command?page_id=" + encodeURIComponent(pageId) +
           "&api_ready=" + (apiReady ? "1" : "0") + "&busy=" + (running ? "1" : "0"),
       });
@@ -566,6 +567,12 @@
       remotePollBusy = false;
     }
   }
+
+  window.addEventListener("online", pollRemoteRefreshCommand);
+  window.addEventListener("pageshow", pollRemoteRefreshCommand);
+  document.addEventListener("visibilitychange", function () {
+    if (!document.hidden) pollRemoteRefreshCommand();
+  });
 
   var iv = setInterval(function () {
     if (document.body) {

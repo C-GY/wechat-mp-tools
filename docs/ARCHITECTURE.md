@@ -132,7 +132,7 @@
 | 浏览器自动打开 | `app.py::open_browser()` | daemon thread 延迟 1 秒 | 一次性 |
 | 微信读书保活 | `backend/account_pool.py` 导入全局单例 | daemon thread，15 秒后每 15 分钟 | 进程内守护，不独立持久化 |
 | RSS 调度 | `app.py` 导入时 `rss_scheduler.start()` | daemon loop 每 30 秒 + 最多 50 worker 线程 | `stop()` 设置 Event 并 shutdown executor |
-| 品创中枢调度 | `app.py` 导入时 `pinchuang_hub.start()` | daemon loop 每 15 秒检查多时点计划；每轮单 worker、按创作者串行处理 | 进度与最近 100 次运行持久化；异常退出在下次启动标记 interrupted |
+| 品创中枢调度 | `app.py` 导入时 `pinchuang_hub.start()` | daemon loop 每 15 秒检查多时点计划；每轮单 worker、按创作者串行处理；视频号环境失败按 15/30/60 秒退避并持续重试 | 环境等待保留原批次与创作者计划，重启自动续跑、跳过已有结果；等待时的定时触发合并补跑；其他异常退出下次启动标记 interrupted |
 | 广策中枢调度 | `app.py` 导入时 `guangce_hub.start()` | 继承相同的多时点计划与同步流程，使用独立 worker 和暂停/继续控制 | 配置与最近 100 次运行独立持久化，共用创作者、视频号环境和 OSS |
 | 创意雷达调度 | `app.py` 导入时 `creative_radar_hub.start()` | 复用品创中枢调度器，使用独立配置、worker 与状态；每轮全量分批提交，API 每批最多 200 条；`api.timeout_seconds` 控制每批响应超时，默认 600 秒（10 分钟）、可配置 1–600 秒 | 持久化批次受理、明确失败及待确认结果；逐条回执可缺省；问题批次不阻止后续批次和创作者；运行历史独立持久化 |
 | 文章下载 | `backend/articles.py` | 每个任务一个 daemon thread，状态字典加锁 | completed/failed/cancelled |

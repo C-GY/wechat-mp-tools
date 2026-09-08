@@ -81,6 +81,26 @@ python3 scripts/verify_macos_bundle.py "dist/WeChat MP Tools.app" x86_64
 
 如果您有 Windows 电脑，也可以非常方便地进行本地打包：
 
+<a id="windows-installer-policy"></a>
+
+### Windows 安装包固定规则
+
+用户已指定：所有后续 Windows 安装包默认目录固定为 `%LOCALAPPDATA%\Programs\SelfMediaContentCollector`（通常展开为 `C:\Users\<用户名>\AppData\Local\Programs\SelfMediaContentCollector`）。软件显示名称继续使用中文。
+
+- 安装脚本统一使用 `installer/windows_full_setup.iss`，通过 `scripts/build_windows_installer.py` 编译。`build/` 下的历史脚本仅为旧构建产物。
+- 保持当前脚本的 AppId 不变，版本升级只更新版本号和构建输入。
+- `UsePreviousAppDir=no` 保证旧中文目录或用户曾选过的目录不会覆盖本次默认值。安装向导仍允许手动选择其他目录；已安装程序的位置、旧目录中的 `data/` 不会自动移动。
+- 打包入口先检查默认目录、AppId 和历史目录复用设置；配置不符时终止。编译成功后输出安装包及 SHA256 文件。同日修订使用第四段版本号，保留旧包以便区分。
+- GitHub Actions 当前生成的是免安装 ZIP；若新增安装包构建，也必须调用此入口。
+
+完成下方 PyInstaller Full 构建，并安装 Inno Setup 6 后，在项目根目录运行（版本号按本次发布填写）：
+
+```powershell
+python scripts/build_windows_installer.py --version 2026.09.08.1 --source-dir "dist/WeChat MP Tools"
+```
+
+可先添加 `--check-only` 校验配置和输入；编译器未被自动找到时用 `--compiler "C:/path/to/ISCC.exe"` 指定。安装包输出到 `dist/installer/`。仅修改安装器时可以复用已验证的 Full 程序目录；修改业务代码后需先重新运行 PyInstaller。
+
 ### 1. 准备工作（在一台 Windows 电脑上）
 1. 将本项目整个目录（`wechat-mp-tools` 文件夹）复制到 Windows 电脑上。
 2. 在 Windows 上安装 Python（推荐使用 [Python 3.10 / 3.11 / 3.12](https://www.python.org/downloads/)，安装时务必勾选 **"Add Python to PATH"** 选项）。

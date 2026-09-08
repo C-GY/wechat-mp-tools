@@ -443,7 +443,7 @@ const ChannelsPinchuangPage = {
         return ({ queued:'等待中', running:'执行中', pausing:'正在暂停', paused:'已暂停', completed:'已完成', partial:'部分失败', failed:'失败', interrupted:'已中断' })[value] || '空闲';
     },
     phaseLabel(value) {
-        return ({ queued:'任务排队', preflight:'环境检查', checking_wechat:'检查视频号', refreshing:'刷新创作者', checking_database:'比对数据库', uploading_oss:'同步 OSS', writing_database:'数据库处理', creator_interval:'创作者间隔', paused:'已暂停', finished:'已结束', interrupted:'已中断' })[value] || '准备中';
+        return ({ queued:'任务排队', preflight:'环境检查', checking_wechat:'检查视频号', waiting_wechat:'等待自动恢复', refreshing:'刷新创作者', checking_database:'比对数据库', uploading_oss:'同步 OSS', writing_database:'数据库处理', creator_interval:'创作者间隔', paused:'已暂停', finished:'已结束', interrupted:'已中断' })[value] || '准备中';
     },
     value(id) { return document.getElementById(id)?.value.trim() || ''; },
     setValue(id, value) { const el = document.getElementById(id); if (el) el.value = value == null ? '' : value; },

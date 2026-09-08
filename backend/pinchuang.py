@@ -61,6 +61,11 @@ _TIME_RE = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
 _ACTIVE_RUN_STATUSES = {"queued", "running", "pausing", "paused"}
 _TERMINAL_RUN_STATUSES = {"completed", "partial", "failed", "interrupted"}
 
+
+class _RunStopping(Exception):
+    """Leave a recoverable checkpoint intact when the application shuts down."""
+
+
 DEFAULT_CONFIG = {
     "database": {
         "host": "",
@@ -606,11 +611,11 @@ class FeishuNotifier:
         return {"sent": False, "attempts": attempts, "error": last_error}
 
 
-def ensure_wechat_channels_available(detection_timeout=20.0, open_timeout=8.0) -> dict:
+def ensure_wechat_channels_available(detection_timeout=20.0, open_timeout=8.0, *, recover_browser=False) -> dict:
     """Use the same detect-before-open policy as the manual environment button."""
     from backend.wechat_automation import ensure_wechat_channels_available as ensure
 
-    result = ensure(detection_timeout=detection_timeout, open_timeout=open_timeout)
+    result = ensure(detection_timeout=detection_timeout, open_timeout=open_timeout, recover_browser=recover_browser)
     if not result["monitoring_active"]:
         raise RuntimeError(result["message"])
     return result
@@ -653,7 +658,12 @@ class PinchuangHub:
         self.state.setdefault("schedule_marks", {})
         current = self.state.get("current_run")
         self.interrupted_run = None
-        if isinstance(current, dict) and current.get("status") in _ACTIVE_RUN_STATUSES:
+        self.recoverable_run_id = None
+        if (isinstance(current, dict) and current.get("wechat_recovery")
+                and current.get("status") in {"queued", "running"}):
+            self.recoverable_run_id = current["run_id"]
+            current.update(phase="waiting_wechat", message="软件已重启，将自动恢复等待中的视频号同步")
+        elif isinstance(current, dict) and current.get("status") in _ACTIVE_RUN_STATUSES:
             current.update(
                 {
                     "status": "interrupted",
@@ -785,6 +795,14 @@ class PinchuangHub:
             if self.scheduler_thread and self.scheduler_thread.is_alive():
                 return
             self.stop_event.clear()
+            if self.recoverable_run_id:
+                self.resume_event.set()
+                self.worker = threading.Thread(
+                    target=self._run_pipeline, args=(self.recoverable_run_id,), daemon=True,
+                    name=f"{self.thread_prefix}-recover-{self.recoverable_run_id[:8]}",
+                )
+                self.recoverable_run_id = None
+                self.worker.start()
             self.scheduler_thread = threading.Thread(
                 target=self._scheduler_loop,
                 daemon=True,
@@ -837,6 +855,14 @@ class PinchuangHub:
                 for key, value in self.state["schedule_marks"].items()
                 if key.split("|", 1)[0] >= cutoff
             }
+            current = self.state.get("current_run") or {}
+            if current.get("wechat_recovery") and current.get("status") in _ACTIVE_RUN_STATUSES:
+                # A waiting batch will collect the latest data on reconnect.
+                # Coalesce missed triggers instead of replacing that checkpoint.
+                current["merged_schedule_count"] = int(current.get("merged_schedule_count") or 0) + 1
+                current["last_merged_schedule"] = f"{date_key} {minute}"
+                self._persist_state_locked()
+                return
             self._persist_state_locked()
         try:
             self.start_run(trigger="scheduled", scheduled_time=minute)
@@ -865,8 +891,12 @@ class PinchuangHub:
             "creators": [],
         }
         with self.lock:
-            self.state["current_run"] = run
-            self._archive_current_locked()
+            current = self.state.get("current_run") or {}
+            if current.get("status") in _ACTIVE_RUN_STATUSES:
+                self.state["history"] = [run, *self.state.get("history", [])][:100]
+            else:
+                self.state["current_run"] = run
+                self._archive_current_locked()
             self._persist_state_locked()
 
     def next_scheduled_at(self) -> str:
@@ -1041,6 +1071,43 @@ class PinchuangHub:
             remaining = deadline - time.monotonic()
             if remaining <= 0 or self.stop_event.wait(min(0.5, remaining)):
                 return
+
+    def _wait_for_wechat(self, run_id: str):
+        """Retry only the environment gate; never replay a completed upload."""
+        with self.lock:
+            run = self.state.get("current_run") or {}
+            phase = str(run.get("phase") or "preflight")
+            message = str(run.get("message") or "")
+            recovery = dict(run.get("wechat_recovery") or {})
+        attempts = int(recovery.get("attempts") or 0)
+        while True:
+            self._pause_checkpoint(run_id)
+            if self.stop_event.is_set():
+                raise _RunStopping()
+            try:
+                if attempts >= 2:
+                    available = ensure_wechat_channels_available(recover_browser=True)
+                else:
+                    available = ensure_wechat_channels_available()
+            except RuntimeError as exc:
+                if sys.platform != "win32":
+                    raise
+                attempts += 1
+                delay = (15, 30, 60)[min(attempts - 1, 2)]
+                self._update_run(
+                    run_id, phase="waiting_wechat",
+                    message=f"视频号连接暂不可用，{delay} 秒后自动重试（第 {attempts} 次），恢复后自动继续",
+                    wechat_recovery={
+                        "attempts": attempts, "last_error": str(exc),
+                        "next_retry_at": format_beijing(self.now() + timedelta(seconds=delay)),
+                    },
+                )
+                self._wait_creator_interval(run_id, delay)
+                continue
+            if self.stop_event.is_set():
+                raise _RunStopping()
+            self._update_run(run_id, phase=phase, message=message, wechat_recovery=None)
+            return available
 
     def _update_run(self, run_id: str, **changes) -> dict | None:
         with self.lock:
@@ -1249,11 +1316,11 @@ class PinchuangHub:
                 raise ValueError("OSS 尚未配置")
             adapter = self._database_adapter(config)
             adapter.test_connection()
-            ensure_wechat_channels_available()
+            self._wait_for_wechat(run_id)
 
             from backend import channels
 
-            favorites = load_json(channels.CHANNELS_FAVORITES_FILE, [])
+            favorites = run.get("creator_plan") or load_json(channels.CHANNELS_FAVORITES_FILE, [])
             authors = []
             seen_authors = set()
             for author in favorites or []:
@@ -1269,6 +1336,7 @@ class PinchuangHub:
             self._update_run(
                 run_id,
                 total_creators=len(authors),
+                creator_plan=authors,
                 message=f"环境检查完成，共 {len(authors)} 个创作者",
             )
             self._pause_checkpoint(run_id)
@@ -1283,8 +1351,20 @@ class PinchuangHub:
                 "database_written": 0,
                 "failed_items": 0,
             }
+            processed_authors = set()
+            for previous in run.get("creators") or []:
+                if previous.get("status") not in {"completed", "partial", "failed"}:
+                    continue
+                processed_authors.add(previous["author_id"])
+                totals["completed_creators" if previous["status"] == "completed" else "failed_creators"] += 1
+                for field in totals:
+                    if field not in {"completed_creators", "failed_creators"}:
+                        totals[field] += int(previous.get(field) or 0)
+            self._update_run(run_id, **totals)
             interval = int(config.get("schedule", {}).get("creator_interval_seconds") or 0)
             for index, author in enumerate(authors, 1):
+                if author["username"] in processed_authors:
+                    continue
                 self._pause_checkpoint(run_id)
                 author_id = str(author.get("username") or "")
                 author_name = str(author.get("nickname") or author_id)
@@ -1297,7 +1377,7 @@ class PinchuangHub:
                     message=f"正在检查视频号环境：{index}/{len(authors)} {author_name}",
                 )
                 try:
-                    ensure_wechat_channels_available()
+                    self._wait_for_wechat(run_id)
                     result = self._run_creator(
                         run_id, run["sync_batch_id"], author, adapter
                     )
@@ -1310,6 +1390,8 @@ class PinchuangHub:
                             f"创作者：{author_name}\n批次：{run['sync_batch_id']}\n"
                             f"{self.failure_items_label}：{result['failed_items']} 条",
                         )
+                except _RunStopping:
+                    raise
                 except Exception as exc:
                     totals["failed_creators"] += 1
                     result = {
@@ -1362,6 +1444,8 @@ class PinchuangHub:
                 f"{self.storage_label}处理 {totals['database_written']} 条作品{self.processed_suffix}"
             )
             self._finish_run(run_id, status, message)
+        except _RunStopping:
+            return
         except Exception as exc:
             self._finish_run(run_id, "failed", f"任务执行失败：{exc}")
             notifier.send(

@@ -99,6 +99,27 @@ def reset_channels_pages():
     with _channels_pages_condition:
         _channels_pages.clear()
 
+
+def channels_page_diagnostics(since):
+    """Summarize heartbeat timing without recording page IDs or request data."""
+    now = time.time()
+    with _channels_pages_condition:
+        pages = list(_channels_pages.values())
+        ready = [page for page in pages if page["api_ready"]]
+        return {
+            "page_count": len(pages),
+            "ready_page_count": len(ready),
+            "fresh_ready_page_count": sum(page["timestamp"] >= since for page in ready),
+            "last_heartbeat_age_seconds": (
+                round(max(0, now - max(page["timestamp"] for page in pages)), 3)
+                if pages else None
+            ),
+            "last_ready_heartbeat_age_seconds": (
+                round(max(0, now - max(page["timestamp"] for page in ready)), 3)
+                if ready else None
+            ),
+        }
+
 # ── 证书管理 (Certificate Management) ──────────────────────────
 
 def ensure_ca_certificates():

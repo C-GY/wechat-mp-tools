@@ -101,6 +101,22 @@ class ChannelsPinchuangUiTests(unittest.TestCase):
             page.evaluate("() => ChannelsPinchuangPage.destroy()")
             page.close()
 
+    def test_waiting_for_recovery_keeps_batch_active_and_pausable(self):
+        page = self._page()
+        try:
+            page.evaluate("""() => ChannelsPinchuangPage.renderStatus({
+                running:true, history:[], current_run:{
+                    run_id:'run-1', status:'running', phase:'waiting_wechat',
+                    message:'视频号连接暂不可用，60 秒后自动重试，恢复后自动继续',
+                },
+            })""")
+            self.assertIn("等待自动恢复", page.locator("#pinchuang-run-title").text_content())
+            self.assertIn("自动重试", page.locator("#pinchuang-run-message").text_content())
+            self.assertTrue(page.locator("#btn-pinchuang-run").is_disabled())
+            self.assertTrue(page.locator("#btn-pinchuang-pause").is_visible())
+        finally:
+            page.close()
+
     def test_saves_multiple_daily_times_and_interval(self):
         page = self._page()
         try:

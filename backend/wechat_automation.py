@@ -3,16 +3,47 @@
 from __future__ import annotations
 
 import ctypes
+import json
+import logging
 import os
 import statistics
 import subprocess
 import sys
 import threading
 import time
+import uuid
 from ctypes import wintypes
+from datetime import datetime
+from logging.handlers import RotatingFileHandler
+
+from backend.runtime import app_dir
 
 
 _channels_environment_lock = threading.Lock()
+_environment_log_lock = threading.Lock()
+_browser_reload_attempts = {}
+
+
+def _write_environment_diagnostic(check_id, event, **fields):
+    """Persist bounded diagnostics even in a console-free packaged client."""
+    try:
+        with _environment_log_lock:
+            path = app_dir() / "data" / "logs" / "channels_environment.jsonl"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            handler = RotatingFileHandler(
+                path, maxBytes=2 * 1024 * 1024, backupCount=3, encoding="utf-8"
+            )
+            try:
+                message = json.dumps({
+                    "timestamp": datetime.now().astimezone().isoformat(timespec="milliseconds"),
+                    "check_id": check_id, "event": event, **fields,
+                }, ensure_ascii=False)
+                handler.emit(logging.LogRecord(__name__, logging.INFO, "", 0, message, (), None))
+            finally:
+                handler.close()
+    except Exception:
+        # A read-only installation or full disk must not break synchronization.
+        pass
 
 
 # Binary outline extracted from the Video Channels icon supplied by the user.
@@ -437,6 +468,36 @@ def restore_wechat_browser_window(hwnd):
     if not user32.IsWindow(hwnd) or not user32.IsIconic(hwnd):
         return False
     return bool(user32.ShowWindowAsync(hwnd, 9))  # SW_RESTORE, same HWND/page
+
+
+def _reload_wechat_browser_window(window):
+    """Reload a recognized, unresponsive browser at most once per five minutes."""
+    hwnd = window["hwnd"]
+    now = time.monotonic()
+    for old_hwnd, attempted_at in list(_browser_reload_attempts.items()):
+        if now - attempted_at >= 300:
+            del _browser_reload_attempts[old_hwnd]
+    if hwnd in _browser_reload_attempts:
+        return False
+    _browser_reload_attempts[hwnd] = now
+    interaction = _begin_wechat_interaction(hwnd)
+    try:
+        user32 = ctypes.windll.user32
+        if not interaction["focused"]:
+            rect = _window_rect(hwnd)
+            _click_wechat_client_point(hwnd, (rect.right - rect.left) // 2, max(12, round(16 * _window_scale(hwnd))))
+            if not _restore_and_focus(hwnd):
+                return False
+        # Never send refresh to another app or an inaccessible/locked desktop.
+        if user32.GetForegroundWindow() != hwnd:
+            return False
+        try:
+            user32.keybd_event(0x74, 0, 0, 0)  # F5
+        finally:
+            user32.keybd_event(0x74, 0, 0x0002, 0)
+        return True
+    finally:
+        _end_wechat_interaction(hwnd, interaction)
 
 
 def inspect_wechat_channels_environment():
@@ -938,7 +999,7 @@ def open_wechat_video_channels():
 
 
 def ensure_wechat_channels_available(
-    detection_timeout=20.0, open_timeout=8.0
+    detection_timeout=20.0, open_timeout=8.0, *, recover_browser=False
 ):
     """Reuse a connected Channels page before attempting any desktop action.
 
@@ -948,70 +1009,130 @@ def ensure_wechat_channels_available(
     """
     if sys.platform != "win32":
         raise RuntimeError("当前自动打开流程仅支持 Windows 微信客户端")
-    from backend.mitm_proxy import ProxyManager, wait_for_channels_page
+    from backend.mitm_proxy import (
+        ProxyManager, channels_page_diagnostics, wait_for_channels_page,
+    )
 
     with _channels_environment_lock:
         checked_at = time.time()
+        check_id = uuid.uuid4().hex[:12]
         browsers = find_wechat_browser_windows()
         manager = ProxyManager.get_instance()
         proxy_started = False
+        browser_restored = False
+        restore_attempted = set()
+
+        def diagnostic(event, **fields):
+            # Never log window titles, page URLs, author names or credentials.
+            _write_environment_diagnostic(
+                check_id, event, proxy_running=bool(manager.running),
+                browsers=[{
+                    key: window[key] for key in (
+                        "hwnd", "pid", "class_name", "executable", "minimized", "visible"
+                    ) if key in window
+                } for window in browsers],
+                **channels_page_diagnostics(checked_at), **fields,
+            )
+
+        def result(available, message, *, opened=False, details=None):
+            diagnostic("ready" if available else "unavailable", opened=opened)
+            if not available:
+                message += f"（诊断编号：{check_id}）"
+            return {
+                **(details or {}),
+                "proxy_running": manager.running,
+                "proxy_started": proxy_started,
+                "monitoring_active": available,
+                "opened": opened,
+                "browser_open": bool(browsers) or opened,
+                "browser_restored": browser_restored,
+                "diagnostic_id": check_id,
+                "message": message,
+            }
+
+        def restore_existing_browser():
+            nonlocal browser_restored
+            if browsers and browsers[0].get("minimized"):
+                hwnd = browsers[0]["hwnd"]
+                if hwnd not in restore_attempted:
+                    restore_attempted.add(hwnd)
+                    restored = restore_wechat_browser_window(hwnd)
+                    browser_restored = browser_restored or restored
+                    diagnostic("restore_browser", hwnd=hwnd, restored=restored)
+                    return restored
+            return False
+
+        diagnostic("check_started", detection_timeout=detection_timeout, open_timeout=open_timeout)
         if not manager.running:
             proxy_started = bool(manager.start())
             if not proxy_started:
+                diagnostic("proxy_start_failed")
                 raise RuntimeError("微信极速同步助手启动失败，请检查本地代理端口")
 
         # A minimized Chromium webview may suspend/throttle its injected poll.
         # Restore that exact browser, not the WeChat main window or sidebar.
-        browser_restored = False
-        if browsers and browsers[0].get("minimized"):
-            browser_restored = restore_wechat_browser_window(browsers[0]["hwnd"])
+        restore_existing_browser()
 
-        # Allow an already-open page to reconnect after a client/proxy restart.
-        # Require a fresh response: old state can belong to a now-closed page.
+        # Require a response after this check began, including throughout all
+        # recovery steps. An old heartbeat cannot prove a closed page is usable.
         # Legacy pages report every 15 seconds while collecting, so allow 20.
         page = wait_for_channels_page(checked_at, timeout=detection_timeout)
         if page is not None:
-            return {
-                "proxy_running": manager.running,
-                "proxy_started": proxy_started,
-                "monitoring_active": True,
-                "opened": False,
-                "browser_open": bool(browsers),
-                "browser_restored": browser_restored,
-                "message": (
-                    "已恢复现有视频号浏览器，采集接口已就绪，未重新打开页面"
-                    if browser_restored else "检测到现有微信视频号页面可用，已跳过打开步骤"
-                ),
-            }
+            return result(True, (
+                "已恢复现有视频号浏览器，采集接口已就绪，未重新打开页面"
+                if browser_restored else "检测到现有微信视频号页面可用，已跳过打开步骤"
+            ))
 
-        # No heartbeat is not proof that the browser is absent. Recheck native
-        # windows in case the user opened one while we waited, and never click
-        # the sidebar again when an embedded browser already exists.
+        diagnostic("heartbeat_timeout")
+        # A browser or heartbeat can appear while detection is waiting. Restore
+        # newly discovered minimized browsers and recheck before any navigation.
         browsers = find_wechat_browser_windows()
+        restore_existing_browser()
+        diagnostic("rechecking_connection")
+        page = wait_for_channels_page(checked_at, timeout=open_timeout)
+        if page is not None:
+            return result(True, "视频号采集连接已恢复，已复用现有页面")
+        if not browsers:
+            # The recovery wait can also outlive the native snapshot. Recheck
+            # immediately before deciding it is safe to open another browser.
+            browsers = find_wechat_browser_windows()
+            restored = restore_existing_browser()
+            page = wait_for_channels_page(checked_at, timeout=open_timeout if restored else 0)
+            if page is not None:
+                return result(True, "视频号采集连接已恢复，已复用现有页面")
         if browsers:
-            return {
-                "proxy_running": manager.running,
-                "proxy_started": proxy_started,
-                "monitoring_active": False,
-                "opened": False,
-                "browser_open": True,
-                "browser_restored": browser_restored,
-                "message": "检测到微信内置浏览器已打开，未重复打开；视频号采集连接尚未就绪，请在现有窗口打开或刷新视频号页面后重试",
-            }
+            if recover_browser:
+                try:
+                    reloaded = _reload_wechat_browser_window(browsers[0])
+                    diagnostic("browser_reload", reloaded=reloaded)
+                except RuntimeError as exc:
+                    diagnostic("browser_reload_failed", error=str(exc))
+                page = wait_for_channels_page(checked_at, timeout=open_timeout)
+                if page is not None:
+                    return result(True, "视频号采集连接已自动恢复，继续使用现有页面")
+            return result(False, "检测到微信内置浏览器已打开，未重复打开；视频号采集连接尚未就绪，请在现有窗口打开或刷新视频号页面后重试")
 
-        started_at = time.time()
-        result = open_wechat_video_channels()
-        page = wait_for_channels_page(started_at, timeout=open_timeout)
+        diagnostic("opening_wechat")
+        try:
+            opened = open_wechat_video_channels()
+        except RuntimeError as exc:
+            # Focus failure is not evidence that collection is offline. A poll
+            # arriving during/after activation still permits background work.
+            try:
+                foreground_hwnd = int(ctypes.windll.user32.GetForegroundWindow() or 0)
+            except Exception:
+                foreground_hwnd = None
+            diagnostic("open_failed", error=str(exc), foreground_hwnd_after_open=foreground_hwnd)
+            page = wait_for_channels_page(checked_at, timeout=open_timeout)
+            if page is not None:
+                return result(True, "微信窗口自动打开未成功，但视频号采集连接已恢复，继续使用现有页面")
+            failure = result(False, f"视频号采集连接尚未就绪，自动打开微信也未成功：{exc}")
+            raise RuntimeError(failure["message"]) from exc
+
+        page = wait_for_channels_page(checked_at, timeout=open_timeout)
         available = page is not None
-        return {
-            **(result or {}),
-            "proxy_running": manager.running,
-            "proxy_started": proxy_started,
-            "monitoring_active": available,
-            "opened": True,
-            "message": (
-                "视频号已自动打开，采集接口已就绪"
-                if available else
-                "已尝试打开视频号，但采集页面尚未就绪，请检查微信中的视频号页面"
-            ),
-        }
+        return result(available, (
+            "视频号已自动打开，采集接口已就绪"
+            if available else
+            "已尝试打开视频号，但采集页面尚未就绪，请检查微信中的视频号页面"
+        ), opened=True, details=opened)
