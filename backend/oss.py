@@ -16,6 +16,8 @@ import sys
 import threading
 import time
 import uuid
+from collections import deque
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote, urlsplit
@@ -38,6 +40,12 @@ OSS_UPLOAD_TASKS_FILE = DATA_DIR / "oss_upload_tasks.json"
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9_-]+$")
 _SAFE_ACCESS_KEY_ID = re.compile(r"^[A-Za-z0-9._-]+$")
 _SAFE_BUCKET = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def validate_transfer_workers(value, label):
+    if type(value) is not int or not 1 <= value <= 8:
+        raise ValueError(f"{label}必须是 1 到 8 之间的整数")
+    return value
 
 
 def persistent_config_dir() -> Path:
@@ -450,10 +458,12 @@ class OSSUploadManager:
 
     def clear_finished(self):
         with self.lock:
+            running = bool(self.worker and self.worker.is_alive())
             self.tasks = [
                 task
                 for task in self.tasks
                 if task.get("status") in {"pending", "downloading", "uploading"}
+                or (running and task.get("batch_id") == self.active_batch_id)
             ]
             self._persist()
 
@@ -500,7 +510,9 @@ class OSSUploadManager:
             raise ValueError("当前创作者暂无可同步作品")
         return self._start_candidates(batch_id, candidates)
 
-    def start_selected_sync(self, author: dict, videos: list[dict]):
+    def start_selected_sync(self, author: dict, videos: list[dict], *, transfer=None,
+                            reuse_remote=False, resume_event=None, stop_event=None,
+                            pause_checkpoint=None):
         """Sync only selected works for one author.
 
         The Pinchuang pipeline uses this interface after its database diff so
@@ -518,7 +530,10 @@ class OSSUploadManager:
         )
         if not candidates:
             raise ValueError("新增作品缺少可同步的视频 ID")
-        return self._start_candidates(batch_id, candidates)
+        return self._start_candidates(
+            batch_id, candidates, transfer=transfer, reuse_remote=reuse_remote,
+            resume_event=resume_event, stop_event=stop_event, pause_checkpoint=pause_checkpoint,
+        )
 
     @staticmethod
     def _build_candidates(authors, feeds_db):
@@ -571,7 +586,14 @@ class OSSUploadManager:
         candidates.sort(key=lambda item: item[0]["published_at"], reverse=True)
         return candidates, batch_id
 
-    def _start_candidates(self, batch_id, candidates):
+    def _start_candidates(self, batch_id, candidates, *, transfer=None, **pipeline_options):
+        if transfer is not None:
+            if not isinstance(transfer, dict):
+                raise ValueError("下载上传配置必须是一个对象")
+            transfer = {
+                key: validate_transfer_workers(transfer.get(key), label)
+                for key, label in (("download_workers", "下载并发数"), ("upload_workers", "上传并发数"))
+            }
         if not get_oss_config()["configured"]:
             raise ValueError("请先完成 OSS 配置")
         with self.lock:
@@ -582,13 +604,151 @@ class OSSUploadManager:
             self.active_batch_id = batch_id
             self._persist()
             self.worker = threading.Thread(
-                target=self._run_batch,
+                target=self._run_parallel_batch if transfer is not None else self._run_batch,
                 args=(batch_id, candidates),
+                kwargs={"transfer": transfer, **pipeline_options} if transfer is not None else {},
                 daemon=True,
                 name=f"oss-sync-{batch_id[:8]}",
             )
             self.worker.start()
         return {"batch_id": batch_id, "total": len(candidates)}
+
+    def _run_parallel_batch(self, batch_id, candidates, *, transfer, reuse_remote=False,
+                            resume_event=None, stop_event=None, pause_checkpoint=None):
+        """Bound network concurrency and the files awaiting upload.
+
+        Only the coordinator writes feed results. Workers own their HTTP sessions
+        and task cache files; no session or read/modify/write cycle is shared.
+        """
+        pending, ready = deque(candidates), deque()
+        downloads, uploads = {}, {}
+        services = []
+        local = threading.local()
+        cached_paths = set()
+        download_limit, upload_limit = transfer["download_workers"], transfer["upload_workers"]
+
+        def stopped():
+            return stop_event is not None and stop_event.is_set()
+
+        def paused():
+            return resume_event is not None and not resume_event.is_set()
+
+        def service_for_thread():
+            if not hasattr(local, "service"):
+                local.service = OSSService(access_key_id, secret, bucket=bucket)
+                with self.lock:
+                    services.append(local.service)
+            return local.service
+
+        def prepare(task, video):
+            existing = str(video.get("oss_video_url") or "").strip()
+            if existing and video.get("oss_upload_status") in (None, "", "completed"):
+                return None, {"url": existing, "object_key": video.get("oss_object_key", ""),
+                              "bucket": video.get("oss_bucket", "")}
+            if reuse_remote:
+                self._update(task["id"], status="downloading", progress=0, error="")
+                remote = service_for_thread().find_uploaded_video(task["video_id"], video.get("createtime"))
+                if remote:
+                    return None, remote
+            return self._download_video(task["id"], video, isolated=True), None
+
+        def upload(task, video, path):
+            last_percent, last_time = -1, 0.0
+
+            def progress(sent, total):
+                nonlocal last_percent, last_time
+                percent = int(sent / total * 100) if total else 0
+                now = time.monotonic()
+                if sent != total and last_percent >= 0 and (percent == last_percent or now - last_time < 1):
+                    return
+                last_percent, last_time = percent, now
+                self._update(task["id"], status="uploading", progress=min(100, max(0, percent)),
+                             uploaded_bytes=sent, total_bytes=total)
+
+            self._update(task["id"], status="uploading", progress=0, uploaded_bytes=0, error="")
+            return service_for_thread().upload_video(path, task["video_id"], video.get("createtime"), progress)
+
+        def record(task, result, status):
+            self._save_video_result(task, result)
+            self._update(task["id"], status=status, progress=100, oss_url=result["url"],
+                         object_key=result["object_key"], uploaded_bytes=result.get("size", 0),
+                         total_bytes=result.get("size", 0), error="")
+
+        try:
+            # Freeze credentials and destination once for this entire batch.
+            initial = OSSService.from_saved_config()
+            try:
+                access_key_id, secret, bucket = initial.access_key_id, initial.access_key_secret, initial.bucket
+            finally:
+                initial.session.close()
+            with (ThreadPoolExecutor(max_workers=download_limit, thread_name_prefix="oss-download") as download_pool,
+                  ThreadPoolExecutor(max_workers=upload_limit, thread_name_prefix="oss-upload") as upload_pool):
+                while pending or ready or downloads or uploads:
+                    if stopped():
+                        for task, _ in pending:
+                            self._update(task["id"], status="failed", error="同步已停止，请重新执行")
+                        for task, _, _ in ready:
+                            self._update(task["id"], status="failed", error="同步已停止，请重新执行")
+                        pending.clear()
+                        ready.clear()
+                    elif paused() and not downloads and not uploads:
+                        # Acknowledge a pause only after all HTTP operations drain.
+                        if pause_checkpoint is not None:
+                            pause_checkpoint()
+                        else:
+                            resume_event.wait(0.1)
+                        continue
+                    if not stopped() and not paused():
+                        while ready and len(uploads) < upload_limit and not paused() and not stopped():
+                            task, video, path = ready.popleft()
+                            uploads[upload_pool.submit(upload, task, video, path)] = (task, video, path)
+                        while (pending and len(downloads) < download_limit
+                               and len(ready) + len(downloads) < download_limit + upload_limit
+                               and not paused() and not stopped()):
+                            task, video = pending.popleft()
+                            downloads[download_pool.submit(prepare, task, video)] = (task, video)
+                    active = list(downloads) + list(uploads)
+                    if not active:
+                        continue
+                    finished, _ = wait(active, timeout=0.1, return_when=FIRST_COMPLETED)
+                    for future in finished:
+                        if future in downloads:
+                            task, video = downloads.pop(future)
+                            try:
+                                path, remote = future.result()
+                                if remote:
+                                    record(task, remote, "skipped")
+                                else:
+                                    cached_paths.add(path)
+                                    ready.append((task, video, path))
+                                    self._update(task["id"], status="pending", progress=0, uploaded_bytes=0)
+                            except Exception as exc:
+                                self._update(task["id"], status="failed", error=str(exc))
+                        else:
+                            task, _, path = uploads.pop(future)
+                            try:
+                                record(task, future.result(), "completed")
+                            except Exception as exc:
+                                self._update(task["id"], status="failed", error=str(exc))
+                            finally:
+                                self._remove_cache_file(path)
+                                cached_paths.discard(path)
+        except Exception as exc:
+            for task, _ in candidates:
+                if task.get("status") in {"pending", "downloading", "uploading"}:
+                    self._update(task["id"], status="failed", error=str(exc))
+        finally:
+            for service in services:
+                service.session.close()
+            for path in cached_paths:
+                self._remove_cache_file(path)
+
+    @staticmethod
+    def _remove_cache_file(path):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     def _run_batch(self, batch_id, candidates):
         try:
@@ -660,7 +820,7 @@ class OSSUploadManager:
             except Exception as exc:
                 self._update(task_id, status="failed", error=str(exc))
 
-    def _download_video(self, task_id: str, video: dict) -> Path:
+    def _download_video(self, task_id: str, video: dict, *, isolated=False) -> Path:
         from backend.channels import decrypt_channels_data
 
         source_url = str(
@@ -672,7 +832,8 @@ class OSSUploadManager:
         base_dir = Path(settings.get("download_dir") or str(OUTPUT_DIR))
         cache_dir = base_dir / "channels" / "oss_cache"
         cache_dir.mkdir(parents=True, exist_ok=True)
-        file_path = cache_dir / f"{video.get('id')}.mp4"
+        cache_name = f"{task_id}-{video.get('id')}" if isolated else str(video.get("id"))
+        file_path = cache_dir / f"{cache_name}.mp4"
         if file_path.is_file() and file_path.stat().st_size > 0:
             self._update(
                 task_id,
@@ -695,11 +856,12 @@ class OSSUploadManager:
             stream=True,
             timeout=(10, 120),
         )
-        response.raise_for_status()
-        total = int(response.headers.get("content-length", 0) or 0)
         downloaded = 0
         last_download_percent = -1
+        last_download_at = 0.0
         try:
+            response.raise_for_status()
+            total = int(response.headers.get("content-length", 0) or 0)
             with partial.open("wb") as output:
                 for chunk in response.iter_content(chunk_size=256 * 1024):
                     if not chunk:
@@ -707,8 +869,11 @@ class OSSUploadManager:
                     output.write(chunk)
                     downloaded += len(chunk)
                     progress = int(downloaded / total * 100) if total else 0
-                    if progress != last_download_percent or (total and downloaded >= total):
+                    now = time.monotonic()
+                    if (last_download_percent < 0 or (total and downloaded >= total)
+                            or (progress != last_download_percent and now - last_download_at >= 1.0)):
                         last_download_percent = progress
+                        last_download_at = now
                         self._update(
                             task_id,
                             status="downloading",
@@ -716,6 +881,13 @@ class OSSUploadManager:
                             uploaded_bytes=downloaded,
                             total_bytes=total,
                         )
+            decrypt_key = video.get("decode_key") or video.get("decrypt_key")
+            if decrypt_key and int(decrypt_key) > 0:
+                with partial.open("r+b") as output:
+                    data = bytearray(output.read(131072))
+                    decrypt_channels_data(data, int(decrypt_key))
+                    output.seek(0)
+                    output.write(data)
             partial.replace(file_path)
         except Exception:
             try:
@@ -726,15 +898,6 @@ class OSSUploadManager:
         finally:
             response.close()
 
-        decrypt_key = video.get("decode_key") or video.get("decrypt_key")
-        if decrypt_key:
-            key_value = int(decrypt_key)
-            if key_value > 0:
-                with file_path.open("r+b") as output:
-                    data = bytearray(output.read(131072))
-                    decrypt_channels_data(data, key_value)
-                    output.seek(0)
-                    output.write(data)
         return file_path
 
     @staticmethod

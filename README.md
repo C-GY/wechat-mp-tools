@@ -136,14 +136,15 @@ python app.py    # 浏览器模式（访问 http://localhost:5200）
 - 每位创作者完成刷新后，只同步本轮实际采到的作品。原始采集数据与接收时间额外保存在本地 `rpa_payload`、`collected_at`，避免旧缓存中的互动数被当作新数据。不可见或未再次采到的旧作品继续保留数据库历史，不生成本轮快照。
 - 主表按 `(platform, source_video_key)` 去重，保存最新作者、标题、封面、发布时间、毫秒时长、四项互动数和原始数据；`video_url` 沿用品创规则保存可持久访问的 OSS 地址，已有地址复用。
 - 本地缺少上传记录时，先核验当前 OSS 桶中相同作品的文件：公开链接可访问、非空且文件头为 MP4 时直接复用；未找到有效文件则按原流程上传。仅读取文件头，不下载整段视频进行核验。
+- “下载与 OSS 上传”可分别设置下载并发数和上传并发数，范围均为 1–8，默认各 2 路。下载与上传同时推进，已下载待上传的文件数量受限；创作者采集及三表写入仍按作者顺序执行。配置保存在 `transfer.download_workers`、`transfer.upload_workers`，随配置备份导入导出；旧备份缺少这些字段时使用默认值。每轮任务固定使用启动时的并发设置，执行中保存的新设置从下一轮生效。
 - 视频标签字段和描述中的 `#话题` 写入标签表，以 `(video_id, tag_name)` 去重；没有标签时不生成空标签。同步仅补充标签，保留已有人工标签。
 - 快照按 `(video_id, sync_batch_id)` 去重，保存本次四项互动总数。同批次重试更新对应快照，不改变主键和入库时间；不同批次即使指标相同也新增快照。较旧采集不会覆盖主表或同批次较新的快照，时间相同按 `snapshot_id` 决定最新快照。
 - `likeCount → like_count`、`forwardCount → share_count`、`favCount → favorite_count`、`commentCount → comment_count`。真实零值保存为 `0`；本次缺失、未知或只返回下界（如 `1万+`）的指标保存为 `NULL`。毫秒时长从本次采集原文计算，避免整数秒缓存丢失精度。
 - 发布时间、采集时间及数据库会话统一为东八区，保留毫秒；`last_synced_at`/`synced_at` 是接收本次作品数据的时间，上传耗时不会改变采集时间。`raw_payload` 保存作者和本地视频记录，其中 `video.rpa_payload` 是本次采集原文。
 - 同一创作者的待写作品在一个事务中写入三表；任一 SQL 失败则全部回滚，并在看板记录失败。字段超长或越界会报告对应作品，避免截断视频 ID、URL、标签或写入错误数值。
-- 每日定时初始关闭，飞书机器人可选。暂停在当前刷新、OSS 或数据库步骤结束后生效，继续使用原批次；微信连接暂不可用时沿用自动等待恢复逻辑。
+- 每日定时初始关闭，飞书机器人可选。OSS 同步期间暂停会停止启动新的下载和上传，正在传输的文件完成后进入暂停，继续时处理原队列中的剩余作品。刷新或数据库写入期间仍在当前步骤结束后暂停；微信连接暂不可用时沿用自动等待恢复逻辑。
 
-相关回归：`python -m pytest tests/test_competitor_monitor.py tests/test_channels_interaction_metrics.py tests/test_hub_config_transfer.py tests/test_hub_config_transfer_ui.py -q`。实际 MySQL 事务测试另见 `tests/test_competitor_monitor_mysql.py`，需显式设置 `COMPETITOR_MYSQL_INTEGRATION=1`；测试使用唯一标记并最终回滚，不保留测试业务数据。
+相关回归：`python -m pytest tests/test_competitor_monitor.py tests/test_oss.py tests/test_oss_concurrency.py tests/test_channels_interaction_metrics.py tests/test_hub_config_transfer.py tests/test_hub_config_transfer_ui.py -q`。实际 MySQL 事务测试另见 `tests/test_competitor_monitor_mysql.py`，需显式设置 `COMPETITOR_MYSQL_INTEGRATION=1`；测试使用唯一标记并最终回滚，不保留测试业务数据。
 
 完整采集及数据库核对结果见 [2026-09-08 验证记录](docs/competitor-monitor-verification-2026-09-08.md)。
 

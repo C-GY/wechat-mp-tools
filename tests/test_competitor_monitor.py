@@ -135,15 +135,14 @@ def test_existing_remote_video_is_reused_when_local_upload_record_is_missing(hub
     manager = MagicMock()
     manager.start_selected_sync.return_value = {"batch_id": "upload-1"}
     manager.snapshot.return_value = {"items": [{"batch_id": "upload-1", "video_id": "video-1", "status": "skipped", "oss_url": "https://oss.example/existing.mp4"}]}
-    service = MagicMock()
-    service.find_uploaded_video.return_value = {"url": "https://oss.example/existing.mp4", "object_key": "video-1.mp4", "bucket": "library"}
-    with patch.object(monitor, "upload_manager", manager), patch.object(monitor.OSSService, "from_saved_config", return_value=service):
+    with patch.object(monitor, "upload_manager", manager):
         assert hub._sync_new_videos_to_oss("run-1", AUTHOR, [video(oss_video_url="")]) == (1, [])
-    candidate = manager.start_selected_sync.call_args.args[1][0]
-    assert candidate["oss_video_url"] == "https://oss.example/existing.mp4"
-    assert candidate["oss_upload_status"] == "completed"
-    assert hub._uploaded_video_urls["video-1"] == candidate["oss_video_url"]
-    service.session.close.assert_called_once()
+    options = manager.start_selected_sync.call_args.kwargs
+    assert options["reuse_remote"] is True
+    assert options["transfer"] == {"download_workers": 2, "upload_workers": 2}
+    assert options["resume_event"] is hub.resume_event
+    assert options["stop_event"] is hub.stop_event
+    assert hub._uploaded_video_urls["video-1"] == "https://oss.example/existing.mp4"
 
 
 def test_independent_config_api_backup_schedule_and_pause_resume(hub):
@@ -184,3 +183,56 @@ def test_independent_config_api_backup_schedule_and_pause_resume(hub):
             hub._scheduler_tick()
             start.assert_called_once_with(trigger="scheduled", scheduled_time="09:00")
         assert monitor.CONFIG_FILE != pinchuang.PINCHUANG_CONFIG_FILE
+
+
+@pytest.mark.parametrize("key", ["download_workers", "upload_workers"])
+@pytest.mark.parametrize("value", [0, 9, -1, 1.5, True, None, "2", [], {}])
+def test_transfer_config_rejects_invalid_limits_without_changing_saved_settings(hub, key, value):
+    hub.save_config({"transfer": {"download_workers": 3, "upload_workers": 4}})
+    before = hub.config_path.read_bytes()
+    app = Flask(__name__)
+    app.register_blueprint(monitor.competitor_monitor_bp)
+    with patch.object(monitor, "competitor_monitor_hub", hub):
+        response = app.test_client().post("/api/competitor_monitor/config", json={"transfer": {key: value}})
+    assert response.status_code == 400
+    assert "1 到 8" in response.json["error"]
+    assert hub.config_path.read_bytes() == before
+
+
+def test_transfer_settings_round_trip_and_legacy_backup_defaults(hub):
+    assert hub.get_config()["transfer"] == monitor.DEFAULT_TRANSFER
+    result = hub.save_config({"transfer": {"download_workers": 8, "upload_workers": 1}})
+    assert result["transfer"] == {"download_workers": 8, "upload_workers": 1}
+    hub.save_config({"schedule": {"creator_interval_seconds": 15}})
+    backup = hub.export_config_backup()
+    assert backup["config"]["transfer"] == result["transfer"]
+    hub.save_config({"transfer": {"upload_workers": 5}})
+    hub.import_config_backup(backup)
+    restarted = monitor.CompetitorMonitorHub(hub.config_path, hub.state_path)
+    assert restarted.config["transfer"] == result["transfer"]
+    legacy = copy.deepcopy(backup)
+    del legacy["config"]["transfer"]
+    hub.import_config_backup(legacy)
+    assert hub.get_config()["transfer"] == monitor.DEFAULT_TRANSFER
+    hub.import_config_backup(legacy["config"])
+    assert hub.config["transfer"] == monitor.DEFAULT_TRANSFER
+    assert "transfer" not in pinchuang.DEFAULT_CONFIG
+
+
+def test_running_transfer_limits_are_frozen_and_monitor_waits_for_queue_shutdown(hub):
+    hub.config["transfer"] = {"download_workers": 3, "upload_workers": 1}
+    hub.state["current_run"] = {"run_id": "run-1"}
+    with patch.object(pinchuang.PinchuangHub, "_run_pipeline"):
+        hub._run_pipeline("run-1")
+        hub.save_config({"transfer": {"download_workers": 8, "upload_workers": 8}})
+        hub._run_pipeline("run-1")  # Recovery must retain the same limits.
+    assert hub.state["current_run"]["transfer"] == {"download_workers": 3, "upload_workers": 1}
+    manager = MagicMock()
+    manager.start_selected_sync.return_value = {"batch_id": "upload-1"}
+    tasks = [{"batch_id": "upload-1", "video_id": "video-1", "status": "completed", "oss_url": "https://oss.invalid/1.mp4"}]
+    manager.snapshot.side_effect = [{"items": tasks, "running": True, "batch_id": "upload-1"},
+                                    {"items": tasks, "running": False, "batch_id": "upload-1"}]
+    with patch.object(monitor, "upload_manager", manager), patch.object(monitor.time, "sleep") as sleep:
+        assert hub._sync_new_videos_to_oss("run-1", AUTHOR, [video()]) == (1, [])
+    assert manager.start_selected_sync.call_args.kwargs["transfer"] == {"download_workers": 3, "upload_workers": 1}
+    sleep.assert_called_once()

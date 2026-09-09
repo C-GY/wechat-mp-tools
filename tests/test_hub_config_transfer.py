@@ -123,7 +123,9 @@ class HubConfigTransferTests(HubConfigFixture):
                 bad_field["config"][connection][number] = -1
                 incomplete = copy.deepcopy(backup)
                 del incomplete["config"][connection]["password" if connection == "database" else "api_key"]
-                other = next(other for other in self.hubs.values() if set(other.config) != set(hub.config))
+                # Legacy database backups may omit the optional transfer section.
+                other = next(other for other in self.hubs.values()
+                             if set(other.config) - {"transfer"} != set(hub.config) - {"transfer"})
                 payloads = [
                     None, [], {}, {"format": hub.config_backup_format},
                     {**backup, "format_version": 2}, {**backup, "format_version": True},

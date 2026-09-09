@@ -158,6 +158,40 @@ class HubConfigTransferUiTests(HubConfigFixture):
         self.assertIsNone(page.evaluate("window.__copied"))
         self.assertTrue(page.locator("#btn-creative-radar-export-config").is_enabled())
 
+    def test_competitor_transfer_limits_save_reload_validate_and_export(self):
+        hub = self.hubs["competitor_monitor"]
+        other_before = self.hubs["pinchuang"].config_path.read_bytes()
+        page = self.page_for("competitor_monitor")
+        errors = []
+        page.on("pageerror", lambda error: errors.append(str(error)))
+        download = page.locator("#competitor_monitor-download-workers")
+        upload = page.locator("#competitor_monitor-upload-workers")
+        self.assertEqual(download.input_value(), "2")
+        self.assertEqual(upload.input_value(), "2")
+        download.fill("3")
+        upload.fill("4")
+        with page.expect_response(lambda r: r.url.endswith("/api/competitor_monitor/config") and r.request.method == "POST") as saved:
+            page.locator("#btn-competitor_monitor-save-transfer").click()
+        self.assertEqual(saved.value.status, 200)
+        page.wait_for_function("!document.getElementById('btn-competitor_monitor-save-transfer').disabled")
+        self.assertEqual(hub.config["transfer"], {"download_workers": 3, "upload_workers": 4})
+        self.assertEqual(self.hubs["pinchuang"].config_path.read_bytes(), other_before)
+        page.evaluate("() => ChannelsCompetitorMonitorPage.loadConfig()")
+        self.assertEqual(download.input_value(), "3")
+        self.assertEqual(upload.input_value(), "4")
+        before = hub.config_path.read_bytes()
+        for invalid in ("0", "9", "1.5", ""):
+            download.fill(invalid)
+            self.assertFalse(page.evaluate("() => ChannelsCompetitorMonitorPage.saveConfig()"))
+            self.assertEqual(hub.config_path.read_bytes(), before)
+            self.assertIn("1 到 8", page.evaluate("window.__messages.at(-1).message"))
+        page.evaluate("() => ChannelsCompetitorMonitorPage.loadConfig()")
+        page.locator("#btn-competitor_monitor-export-config").click()
+        page.wait_for_function("window.__copied !== null")
+        backup = json.loads(page.evaluate("window.__copied"))
+        self.assertEqual(backup["config"]["transfer"], hub.config["transfer"])
+        self.assertEqual(errors, [])
+
     def test_guangce_navigation_save_progress_and_pause_are_independent(self):
         page = self.browser.new_page(viewport={"width": 1440, "height": 1000})
         self.addCleanup(page.close)

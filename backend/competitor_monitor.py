@@ -12,22 +12,26 @@ import pymysql
 from backend import pinchuang
 from backend.competitor_author_tags import CompetitorAuthorTagStore
 from backend.competitor_monitor_store import CompetitorMySQLAdapter, TABLES, build_row, source_key
-from backend.oss import OSSService, persistent_config_dir, upload_manager
+from backend.oss import persistent_config_dir, upload_manager, validate_transfer_workers
 
 
 competitor_monitor_bp = Blueprint("competitor_monitor", __name__, url_prefix="/api/competitor_monitor")
 CONFIG_FILE = persistent_config_dir() / "competitor_monitor_config.json"
 STATE_FILE = persistent_config_dir() / "competitor_monitor_state.json"
 DEFAULT_DATABASE = "competitor_monitor"
+DEFAULT_TRANSFER = {"download_workers": 2, "upload_workers": 2}
 
 
 def merged_config(raw: dict | None) -> dict:
     raw = raw if isinstance(raw, dict) else {}
     database = raw.get("database") if isinstance(raw.get("database"), dict) else {}
-    return pinchuang._merged_config({
+    result = pinchuang._merged_config({
         **raw,
         "database": {"database": DEFAULT_DATABASE, **database},
     })
+    transfer = raw.get("transfer") if isinstance(raw.get("transfer"), dict) else {}
+    result["transfer"] = {**DEFAULT_TRANSFER, **transfer}
+    return result
 
 
 def normalize_config(payload: dict, current: dict | None = None) -> dict:
@@ -39,6 +43,13 @@ def normalize_config(payload: dict, current: dict | None = None) -> dict:
     result["database"]["database"] = pinchuang._clean_text(
         database.get("database", current["database"]["database"]), 128, "数据库名称"
     ) or DEFAULT_DATABASE
+    transfer = payload.get("transfer", {})
+    if not isinstance(transfer, dict):
+        raise ValueError("下载上传配置必须是一个对象")
+    result["transfer"] = {
+        key: validate_transfer_workers(transfer.get(key, current["transfer"][key]), label)
+        for key, label in (("download_workers", "下载并发数"), ("upload_workers", "上传并发数"))
+    }
     return result
 
 
@@ -47,6 +58,7 @@ def public_config(config: dict) -> dict:
     result["storage_path"] = str(CONFIG_FILE)
     result.pop("table", None)
     result["tables"] = list(TABLES)
+    result["transfer"] = dict(merged_config(config)["transfer"])
     return result
 
 
@@ -65,40 +77,67 @@ class CompetitorMonitorHub(pinchuang.PinchuangHub):
     def _database_adapter(self, config=None):
         return CompetitorMySQLAdapter((config if config is not None else self.config)["database"])
 
+    def import_config_backup(self, payload):
+        # Backups made before transfer settings existed remain importable.
+        if isinstance(payload, dict):
+            config = payload.get("config") if "config" in payload else payload
+            if isinstance(config, dict) and set(config) == {"database", "schedule", "feishu"}:
+                config = {**config, "transfer": dict(DEFAULT_TRANSFER)}
+                payload = {**payload, "config": config} if "config" in payload else config
+        return super().import_config_backup(payload)
+
+    def _run_pipeline(self, run_id):
+        with self.lock:
+            run = self.state.get("current_run") or {}
+            if run.get("run_id") == run_id:
+                # Keep one set of limits for every creator, including recovered runs.
+                run.setdefault("transfer", dict(self.config["transfer"]))
+                self._persist_state_locked()
+        return super()._run_pipeline(run_id)
+
     def _sync_new_videos_to_oss(self, run_id, author, videos):
         self._uploaded_video_urls = {}
         if not videos:
             return 0, []
         prepared, identities = [], {}
-        service = None
-        try:
-            for index, video in enumerate(videos, 1):
-                self._pause_checkpoint(run_id)
-                key, _ = source_key(video)
-                upload_id = str(video.get("id") or "")
-                if not re.fullmatch(r"[A-Za-z0-9_-]+", upload_id):
-                    upload_id = hashlib.sha256(key.encode("utf-8")).hexdigest()
-                identities[upload_id] = key
-                # An upload filename is not a platform ID. Keep the original feed unchanged.
-                candidate = {**video, "id": upload_id}
-                if not video.get("oss_video_url"):
-                    self._update_run(run_id, phase="uploading_oss", message=f"正在核验已有 OSS 文件：{index}/{len(videos)}")
-                    service = service or OSSService.from_saved_config()
-                    remote = service.find_uploaded_video(upload_id, video.get("createtime"))
-                    if remote:
-                        candidate.update(oss_video_url=remote["url"], oss_upload_status="completed", oss_object_key=remote["object_key"], oss_bucket=remote["bucket"])
-                prepared.append(candidate)
-        finally:
-            if service:
-                service.session.close()
-        batch_id = upload_manager.start_selected_sync(author, prepared)["batch_id"]
+        for video in videos:
+            self._pause_checkpoint(run_id)
+            if self.stop_event.is_set():
+                raise pinchuang._RunStopping()
+            key, _ = source_key(video)
+            upload_id = str(video.get("id") or "")
+            if not re.fullmatch(r"[A-Za-z0-9_-]+", upload_id):
+                upload_id = hashlib.sha256(key.encode("utf-8")).hexdigest()
+            identities[upload_id] = key
+            # An upload filename is not a platform ID. Keep the original feed unchanged.
+            prepared.append({**video, "id": upload_id})
+        with self.lock:
+            run = self.state.get("current_run") or {}
+            transfer = dict(run.get("transfer", self.config["transfer"]))
+        batch_id = upload_manager.start_selected_sync(
+            author, prepared, transfer=transfer, reuse_remote=True,
+            resume_event=self.resume_event, stop_event=self.stop_event,
+            pause_checkpoint=lambda: self._pause_checkpoint(run_id),
+        )["batch_id"]
         while True:
-            tasks = [t for t in upload_manager.snapshot().get("items", []) if t.get("batch_id") == batch_id]
+            snapshot = upload_manager.snapshot()
+            tasks = [t for t in snapshot.get("items", []) if t.get("batch_id") == batch_id]
             if not tasks:
                 raise RuntimeError("OSS 同步任务状态丢失")
             done = [t for t in tasks if t.get("status") in {"completed", "skipped"}]
-            self._update_run(run_id, phase="uploading_oss", message=f"正在同步 OSS：{len(done)}/{len(tasks)}")
-            if not any(t.get("status") in {"pending", "downloading", "uploading"} for t in tasks):
+            with self.lock:
+                # Do not overwrite a pause acknowledgement from the OSS coordinator.
+                if self.resume_event.is_set() and (self.state.get("current_run") or {}).get("status") != "paused":
+                    downloading = sum(t.get("status") == "downloading" for t in tasks)
+                    uploading = sum(t.get("status") == "uploading" for t in tasks)
+                    self._update_run(run_id, phase="uploading_oss", message=(
+                        f"正在同步 OSS：{len(done)}/{len(tasks)}"
+                        f"（下载 {downloading}/{transfer['download_workers']}，上传 {uploading}/{transfer['upload_workers']}）"
+                    ))
+            running = snapshot.get("running") and snapshot.get("batch_id") == batch_id
+            if not running and not any(t.get("status") in {"pending", "downloading", "uploading"} for t in tasks):
+                if self.stop_event.is_set():
+                    raise pinchuang._RunStopping()
                 self._uploaded_video_urls = {identities[t["video_id"]]: t["oss_url"] for t in done if t.get("oss_url")}
                 failures = [{**t, "video_id": identities.get(t.get("video_id"), t.get("video_id"))}
                             for t in tasks if t.get("status") == "failed"]

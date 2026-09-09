@@ -95,6 +95,24 @@ const ChannelsCompetitorMonitorPage = {
 
             <div class="card animate-fade-in" style="margin-top:var(--spacing-lg);">
                 <div class="card-header" style="border-bottom:1px solid var(--border-color); padding-bottom:var(--spacing-md); margin-bottom:var(--spacing-md);">
+                    <h3 class="card-title" style="margin:0;">☁️ 下载与 OSS 上传</h3>
+                </div>
+                <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:14px;">
+                    <div class="form-group" style="margin:0;">
+                        <label class="form-label" for="competitor_monitor-download-workers">下载并发数</label>
+                        <input id="competitor_monitor-download-workers" class="form-input" type="number" min="1" max="8" step="1" value="2">
+                    </div>
+                    <div class="form-group" style="margin:0;">
+                        <label class="form-label" for="competitor_monitor-upload-workers">上传并发数</label>
+                        <input id="competitor_monitor-upload-workers" class="form-input" type="number" min="1" max="8" step="1" value="2">
+                    </div>
+                </div>
+                <p style="font-size:.82rem; color:var(--text-muted); margin:12px 0; line-height:1.7;">各支持 1–8 路，默认各 2 路。上传与下载可同时进行，创作者按顺序采集。保存后从下一轮任务生效。暂停时，当前传输完成后暂停，继续后处理剩余作品。</p>
+                <button class="btn btn-primary" id="btn-competitor_monitor-save-transfer" onclick="ChannelsCompetitorMonitorPage.saveConfig()">保存并发配置</button>
+            </div>
+
+            <div class="card animate-fade-in" style="margin-top:var(--spacing-lg);">
+                <div class="card-header" style="border-bottom:1px solid var(--border-color); padding-bottom:var(--spacing-md); margin-bottom:var(--spacing-md);">
                     <h3 class="card-title" style="margin:0;">🔔 飞书机器人（可选）</h3>
                     <div style="font-size:.8rem; color:var(--text-muted); margin-top:5px;">配置后，创作者失败、任务异常或计划任务未能启动时发送通知；发送失败自动重试 3 次。未配置也可同步。</div>
                 </div>
@@ -165,6 +183,8 @@ const ChannelsCompetitorMonitorPage = {
             this.setValue('competitor_monitor-db-database', db.database || 'competitor_monitor');
             this.setSecretPlaceholder('competitor_monitor-db-password', db.has_password, '数据库密码');
             this.setValue('competitor_monitor-creator-interval', schedule.creator_interval_seconds ?? 10);
+            this.setValue('competitor_monitor-download-workers', config.transfer?.download_workers ?? 2);
+            this.setValue('competitor_monitor-upload-workers', config.transfer?.upload_workers ?? 2);
             const enabled = document.getElementById('competitor_monitor-schedule-enabled');
             if (enabled) enabled.checked = !!schedule.enabled;
             this.scheduleTimes = Array.isArray(schedule.times) ? [...schedule.times] : [];
@@ -196,6 +216,10 @@ const ChannelsCompetitorMonitorPage = {
 
     collectConfig() {
         return {
+            transfer: {
+                download_workers: Number(this.value('competitor_monitor-download-workers')),
+                upload_workers: Number(this.value('competitor_monitor-upload-workers')),
+            },
             database: {
                 host: this.value('competitor_monitor-db-host'),
                 port: Number(this.value('competitor_monitor-db-port') || 3306),
@@ -216,9 +240,19 @@ const ChannelsCompetitorMonitorPage = {
     },
 
     async saveConfig(showToast = true) {
+        for (const id of ['competitor_monitor-download-workers', 'competitor_monitor-upload-workers']) {
+            const input = document.getElementById(id);
+            const count = Number(input?.value);
+            if (!Number.isInteger(count) || count < 1 || count > 8) {
+                Toast.warning('下载并发数和上传并发数必须是 1 到 8 之间的整数');
+                input?.focus();
+                return false;
+            }
+        }
         const buttons = [
             [document.getElementById('btn-competitor_monitor-save'), '保存全部配置'],
             [document.getElementById('btn-competitor_monitor-save-schedule'), '保存定时配置'],
+            [document.getElementById('btn-competitor_monitor-save-transfer'), '保存并发配置'],
         ].filter(([button]) => !!button);
         try {
             buttons.forEach(([button]) => {
