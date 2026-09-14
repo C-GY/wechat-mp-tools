@@ -16,6 +16,9 @@ def redact_error(value):
 def error_details(exc, stage):
     details = {"error": redact_error(exc), "error_type": type(exc).__name__, "stage": stage,
                "error_trace": redact_error("".join(traceback.format_exception(exc)))[-12000:]}
+    capture_diagnostic = getattr(exc, 'capture_diagnostic', None)
+    if isinstance(capture_diagnostic, dict):
+        details['capture_diagnostic'] = capture_diagnostic
     code = getattr(exc, "status_code", None)
     if isinstance(exc, requests.exceptions.HTTPError) and exc.response is not None:
         code = exc.response.status_code

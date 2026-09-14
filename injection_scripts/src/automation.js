@@ -223,80 +223,139 @@
   async function refreshFavoriteAuthor(author, taskId, authorIndex, authorCount, totals) {
     var marker = "";
     var authorVideos = 0;
-    var pageNumber = 0;
+    var pageNumber = 1;
+    var pageAttempt = 0;
+    var retryDelays = [2000, 5000];
     var hasMore = true;
     var seenIds = new Set();
     var seenMarkers = new Set();
     var label = author.nickname || author.username;
 
-    while (hasMore && !cancelled && !circuitOpen) {
-      pageNumber++;
-      var headline =
-        "正在刷新 " + authorIndex + "/" + authorCount + "：" + esc(label) +
-        "<br>第 " + pageNumber + " 页 · 已同步 " + authorVideos + " 个作品";
-      setPanel("running", headline);
-      await reportRemoteProgress(taskId, {
-        status: "running",
-        completed_authors: totals.completed,
-        failed_authors: totals.failed,
-        total_videos: totals.videos + authorVideos,
-        current_username: author.username,
-        current_nickname: label,
-        message: "正在刷新 " + authorIndex + "/" + authorCount + "：" + label + "（第 " + pageNumber + " 页）",
-      });
-
-      var r = await callWithRetry("finderUserPage", function () {
-        return WXU.API.finderUserPage({
-          username: author.username,
-          finderUsername: my_username || author.username,
-          lastBuffer: marker,
-          needFansCount: 0,
-          objectId: "0",
-        });
-      }, { author: label, remoteRefresh: true });
-
-      if (!r || r.errCode !== 0) {
-        noteFailure();
-        throw new Error((r && r.errMsg) || "作者作品接口调用失败");
-      }
-
-      var raw = (r.data && r.data.object) || [];
-      var rawVideoObjects = raw.filter(function (obj) {
-        return obj.objectDesc && obj.objectDesc.mediaType === 4;
-      });
-      if (rawVideoObjects.length > 0) {
-        var receipt = await WXU.request({
-          method: "POST",
-          url: "/__wx_channels_api/sync-feed",
-          body: { username: author.username, feeds: rawVideoObjects, task_id: taskId },
-          timeout: 30000,
-        });
-        if (receipt[0]) throw receipt[0];
-        var saved = receipt[1];
-        var requestedIds = Array.from(new Set(rawVideoObjects.map(function (obj) { return String(obj.id || ""); })));
-        if (!saved || saved.capture_task_id !== taskId || !Array.isArray(saved.saved_ids) ||
-            requestedIds.includes("") || saved.saved_ids.length !== requestedIds.length ||
-            requestedIds.some(function (id) { return !saved.saved_ids.includes(id); })) {
-          throw new Error("采集保存未得到完整确认，请重新打开微信视频号页面后重试");
-        }
-        saved.saved_ids.forEach(function (id) { seenIds.add(id); });
-        authorVideos = seenIds.size;
-      }
-
-      marker = (r.data && r.data.lastBuffer) || "";
-      hasMore = !!marker;
-      if (!marker && r.data && (r.data.hasMore === true || r.data.continueFlag === 1)) {
-        throw new Error("作品分页未完整结束：仍有更多作品但没有下一页游标");
-      }
-      if (hasMore && (seenMarkers.has(marker) || raw.length === 0)) {
-        throw new Error("作品分页未完整结束：游标重复或空页仍有下一页");
-      }
-      if (hasMore) seenMarkers.add(marker);
-      if (hasMore && !cancelled) await jitterSleep(PAGE_JITTER_MS);
+    function pageFlag(value) {
+      if (value === true || value === 1 || value === "1" || value === "true") return true;
+      if (value === false || value === 0 || value === "0" || value === "false") return false;
+      return null;
     }
 
-    if (cancelled || circuitOpen || hasMore) throw new Error("采集已停止，尚未到达最后一页");
-    return authorVideos;
+    try {
+      while (hasMore && !cancelled && !circuitOpen) {
+        pageAttempt++;
+        var headline =
+          "正在刷新 " + authorIndex + "/" + authorCount + "：" + esc(label) +
+          "<br>第 " + pageNumber + " 页 · 已同步 " + authorVideos + " 个作品";
+        setPanel("running", headline);
+        await reportRemoteProgress(taskId, {
+          status: "running",
+          completed_authors: totals.completed,
+          failed_authors: totals.failed,
+          total_videos: totals.videos + authorVideos,
+          current_username: author.username,
+          current_nickname: label,
+          message: "正在刷新 " + authorIndex + "/" + authorCount + "：" + label + "（第 " + pageNumber + " 页）",
+        });
+
+        var r = await callWithRetry("finderUserPage", function () {
+          return WXU.API.finderUserPage({
+            username: author.username,
+            finderUsername: my_username || author.username,
+            lastBuffer: marker,
+            needFansCount: 0,
+            objectId: "0",
+          });
+        }, { author: label, remoteRefresh: true, task_id: taskId, page_number: pageNumber, page_attempt: pageAttempt });
+
+        if (!r || r.errCode !== 0) {
+          noteFailure();
+          throw new Error((r && r.errMsg) || "作者作品接口调用失败");
+        }
+
+        var data = r.data || {};
+        var validList = Array.isArray(data.object);
+        var raw = validList ? data.object : [];
+        var rawVideoObjects = raw.filter(function (obj) {
+          return obj && obj.objectDesc && obj.objectDesc.mediaType === 4;
+        });
+        if (rawVideoObjects.length > 0) {
+          var receipt = await WXU.request({
+            method: "POST",
+            url: "/__wx_channels_api/sync-feed",
+            body: { username: author.username, feeds: rawVideoObjects, task_id: taskId },
+            timeout: 30000,
+          });
+          if (receipt[0]) throw receipt[0];
+          var saved = receipt[1];
+          var requestedIds = Array.from(new Set(rawVideoObjects.map(function (obj) { return String(obj.id || ""); })));
+          if (!saved || saved.capture_task_id !== taskId || !Array.isArray(saved.saved_ids) ||
+              requestedIds.includes("") || saved.saved_ids.length !== requestedIds.length ||
+              requestedIds.some(function (id) { return !saved.saved_ids.includes(id); })) {
+            throw new Error("采集保存未得到完整确认，请重新打开微信视频号页面后重试");
+          }
+          saved.saved_ids.forEach(function (id) { seenIds.add(id); });
+          authorVideos = seenIds.size;
+        }
+
+        var nextMarker = typeof data.lastBuffer === "string" ? data.lastBuffer : "";
+        var moreFlag = pageFlag(data.hasMore);
+        var continueFlag = pageFlag(data.continueFlag);
+        var explicitMore = moreFlag === true || continueFlag === true;
+        var explicitEnd = moreFlag === false || continueFlag === false;
+        var repeated = !!nextMarker && (nextMarker === marker || seenMarkers.has(nextMarker));
+        var reason = "";
+        if (!validList) reason = "invalid_response";
+        else if (data.lastBuffer != null && typeof data.lastBuffer !== "string") reason = "invalid_cursor";
+        else if ((data.hasMore != null && moreFlag === null) || (data.continueFlag != null && continueFlag === null)) reason = "invalid_flags";
+        else if (explicitMore && explicitEnd) reason = "conflicting_flags";
+        else if (explicitEnd) hasMore = false; // A terminal response may retain its old cursor.
+        else if (!nextMarker && explicitMore) reason = "missing_cursor";
+        else if (!nextMarker) hasMore = false;
+        else if (repeated) reason = "repeated_cursor";
+        else if (raw.length === 0) reason = "empty_page";
+
+        // Keep opaque cursors and response payloads out of diagnostics.
+        var diagnostic = {
+          page_number: pageNumber, attempt: pageAttempt,
+          raw_count: raw.length, video_count: rawVideoObjects.length, saved_count: authorVideos,
+          input_cursor_present: !!marker, output_cursor_present: !!nextMarker,
+          cursor_changed: marker !== nextMarker, cursor_repeated: repeated,
+          has_more: moreFlag, continue_flag: continueFlag,
+          reason: reason || (explicitEnd ? "explicit_end" : hasMore ? "advance" : "no_cursor"),
+          action: reason ? (pageAttempt <= retryDelays.length ? "retry" : "fail") : hasMore ? "advance" : "complete",
+        };
+        logCall("finderUserPage.pagination", 0, "", 0, {
+          author: label, task_id: taskId, remoteRefresh: true, ...diagnostic,
+        });
+        if (reason) {
+          if (pageAttempt <= retryDelays.length) {
+            // Re-request the same input cursor: advancing here could skip works.
+            await jitterSleep(retryDelays[pageAttempt - 1]);
+            continue;
+          }
+          var descriptions = {
+            repeated_cursor: "游标重复", empty_page: "返回空页但仍有下一页游标",
+            missing_cursor: "仍有更多作品但没有下一页游标", conflicting_flags: "分页结束标志互相矛盾",
+            invalid_response: "作品列表结构异常", invalid_cursor: "分页游标格式异常", invalid_flags: "分页结束标志格式异常",
+          };
+          var error = new Error("作品分页未完整结束：" + descriptions[reason] +
+            "（第 " + pageNumber + " 页，已重试 " + (pageAttempt - 1) + " 次，已保存 " + authorVideos + " 个作品）");
+          error.pagination = diagnostic;
+          throw error;
+        }
+        if (hasMore) {
+          seenMarkers.add(nextMarker);
+          marker = nextMarker;
+          pageNumber++;
+          pageAttempt = 0;
+        }
+        if (hasMore && !cancelled) await jitterSleep(PAGE_JITTER_MS);
+      }
+
+      if (cancelled || circuitOpen || hasMore) throw new Error("采集已停止，尚未到达最后一页");
+      return authorVideos;
+    } catch (error) {
+      error = error instanceof Error ? error : new Error(String(error));
+      error.captured_count = authorVideos;
+      throw error;
+    }
   }
 
   async function runRemoteFavoritesRefresh(command) {
@@ -347,7 +406,12 @@
           authorResults[author.username] = {count: count, pagination_complete: true};
         } catch (error) {
           totals.failed++;
-          authorResults[author.username] = {count: 0, pagination_complete: false, error: error.message || String(error)};
+          var capturedCount = error.captured_count || 0;
+          totals.videos += capturedCount;
+          authorResults[author.username] = {
+            count: capturedCount, pagination_complete: false, error: error.message || String(error),
+            pagination: error.pagination || null,
+          };
         }
 
         await reportRemoteProgress(command.task_id, {

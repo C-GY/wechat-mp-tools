@@ -11,6 +11,7 @@ from flask import Blueprint, jsonify, request
 import pymysql
 
 from backend import pinchuang
+from backend.channels_refresh import CaptureRefreshError
 from backend.competitor_recovery import CompetitorRecovery
 from backend.sync_errors import error_details
 from backend.competitor_author_tags import CompetitorAuthorTagStore
@@ -201,7 +202,19 @@ class CompetitorMonitorHub(CompetitorRecovery, pinchuang.PinchuangHub):
         if captured is None:
             refresh_started = time.time()
             self._last_refresh_task_id = None
-            refreshed_count = self._refresh_author(run_id, author)
+            capture_error = None
+            try:
+                refreshed_count = self._refresh_author(run_id, author)
+            except CaptureRefreshError as exc:
+                # Only continue with server-confirmed records from this task.
+                # Cancellation, lost task state and unconfirmed cache remain failures.
+                if (not exc.pagination_incomplete or not exc.captured_count
+                        or not self._last_refresh_task_id
+                        or exc.capture_diagnostic.get("task_id") != self._last_refresh_task_id):
+                    raise
+                capture_error = exc
+                refreshed_count = exc.captured_count
+                failures["__pagination__"] = error_details(exc, "capture")
             self._pause_checkpoint(run_id)
             task_id = self._last_refresh_task_id
             fresh = [v for v in self._load_author_videos(author)
@@ -211,10 +224,13 @@ class CompetitorMonitorHub(CompetitorRecovery, pinchuang.PinchuangHub):
             fresh = list(transport.values())
             progress["refreshed_videos"] = len(fresh)
             if refreshed_count and not fresh:
+                if capture_error is not None:
+                    raise capture_error
                 raise RuntimeError("刷新已返回，但没有本轮采集原文，请重启采集工具后重新同步")
             if refreshed_count != len(fresh):
                 failures["__capture__"] = {"stage": "capture", "error_type": "CaptureCountMismatch",
                     "error": f"采集数量不一致：刷新上报 {refreshed_count} 条，实际保存 {len(fresh)} 条"}
+            progress["failures"] = list(failures.values())
             captured = fresh
             # A compensation run refreshes expiring download addresses, but
             # retains the original observation's metrics and capture time.
@@ -318,10 +334,18 @@ class CompetitorMonitorHub(CompetitorRecovery, pinchuang.PinchuangHub):
                         if c.get("author_id") == author_id and c.get("status") == "completed"]
             if previous and previous[0].get("refreshed_videos", 0) >= 20 and len(videos) < previous[0]["refreshed_videos"] / 2:
                 warnings.append(f"本轮采集 {len(videos)} 条，上次 {previous[0]['refreshed_videos']} 条；请核验下架或可见范围变化")
+        capture_errors = [f["error"] for f in failures.values()
+                          if f.get("stage") == "capture" and not f.get("video_id")]
+        status = "partial" if failures else "completed"
+        message = "部分作品失败" if failures else "三表同步完成"
+        if capture_errors:
+            status = "partial" if written else "failed"
+            message = (f"{'部分失败' if written else '同步失败'}：本轮采集 {len(videos)} 条，"
+                       f"已入库 {written} 条；采集异常：" + "；".join(capture_errors))
         return {
             "author_id": author_id, "author_name": str(author.get("nickname") or author_id),
-            "status": "partial" if failures else "completed",
-            "message": ("部分作品失败" if failures else "三表同步完成") + ("；" + "；".join(warnings) if warnings else ""),
+            "status": status,
+            "message": message + ("；" + "；".join(warnings) if warnings else ""),
             "started_at": started_at, "finished_at": pinchuang.format_beijing(self.now()),
             "refreshed_videos": len(videos), "existing_videos": len(existing),
             "new_videos": len(keyed) - len(existing), "uploaded_videos": uploaded,

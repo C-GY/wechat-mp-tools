@@ -14,6 +14,45 @@ _task_lock = threading.RLock()
 _refresh_task = None
 
 
+def _pagination_diagnostic(value):
+    """Keep bounded paging metadata, never opaque cursors or raw responses."""
+    if not isinstance(value, dict):
+        return None
+    result = {}
+    for key in ('page_number', 'attempt', 'raw_count', 'video_count', 'saved_count'):
+        if type(value.get(key)) is int and 0 <= value[key] <= 1000000:
+            result[key] = value[key]
+    for key in ('input_cursor_present', 'output_cursor_present', 'cursor_changed',
+                'cursor_repeated', 'has_more', 'continue_flag'):
+        if key in value and (type(value[key]) is bool or value[key] is None):
+            result[key] = value[key]
+    if isinstance(value.get('reason'), str) and value['reason'] in {'repeated_cursor', 'empty_page', 'missing_cursor', 'conflicting_flags',
+                               'invalid_response', 'invalid_cursor', 'invalid_flags',
+                               'explicit_end', 'advance', 'no_cursor'}:
+        result['reason'] = value['reason']
+    if isinstance(value.get('action'), str) and value['action'] in {'retry', 'fail', 'advance', 'complete'}:
+        result['action'] = value['action']
+    return result or None
+
+
+class CaptureRefreshError(RuntimeError):
+    def __init__(self, status, username):
+        super().__init__(status.get('message') or '创作者刷新失败')
+        result = status.get('author_results', {}).get(username, {})
+        self.pagination_incomplete = (
+            status.get('status') in {'failed', 'completed'}
+            and result.get('pagination_complete') is False
+        )
+        self.captured_count = max(0, int(result.get('persisted_count', 0)))
+        self.capture_diagnostic = {
+            'task_id': str(status.get('task_id', ''))[:128],
+            'captured_count': self.captured_count,
+        }
+        pagination = _pagination_diagnostic(result.get('pagination'))
+        if pagination:
+            self.capture_diagnostic['pagination'] = pagination
+
+
 def _public_task(task):
     if task is None:
         return None
@@ -124,8 +163,10 @@ def update_refresh_task(payload):
                 if username in allowed and isinstance(result, dict):
                     _refresh_task["author_results"][username] = {
                         "count": int(result.get("count", 0)),
+                        "persisted_count": len(_refresh_task["persisted_ids"].get(username, [])),
                         "pagination_complete": result.get("pagination_complete") is True,
                         "error": str(result.get("error", "")),
+                        "pagination": _pagination_diagnostic(result.get("pagination")),
                     }
         if status == "completed" and _refresh_task.get("require_receipt"):
             errors = []

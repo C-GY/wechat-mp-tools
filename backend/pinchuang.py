@@ -1173,7 +1173,7 @@ class PinchuangHub:
             self.resume_event.set()
 
     def _refresh_author(self, run_id: str, author: dict) -> int:
-        from backend.channels_refresh import get_refresh_status, start_refresh_task, update_refresh_task
+        from backend.channels_refresh import CaptureRefreshError, get_refresh_status, start_refresh_task, update_refresh_task
 
         task, created = start_refresh_task([author], require_receipt=getattr(self, "require_capture_receipt", False))
         if not created:
@@ -1193,12 +1193,14 @@ class PinchuangHub:
                 phase="refreshing",
                 message=status.get("message") or "正在刷新创作者作品",
             )
-            if status.get("status") == "completed":
-                if int(status.get("failed_authors") or 0):
-                    raise RuntimeError(status.get("message") or "创作者刷新失败")
+            if status.get("status") == "completed" and not int(status.get("failed_authors") or 0):
                 return int(status.get("total_videos") or 0)
-            if status.get("status") in {"failed", "cancelled"}:
-                raise RuntimeError(status.get("message") or "创作者刷新失败")
+            if status.get("status") in {"failed", "cancelled", "completed"}:
+                error = CaptureRefreshError(status, author['username'])
+                progress = getattr(self, '_current_creator_progress', None)
+                if isinstance(progress, dict):
+                    progress['refreshed_videos'] = error.captured_count
+                raise error
             time.sleep(1)
         update_refresh_task({"task_id": task_id, "status": "cancelled", "message": "创作者刷新超过 30 分钟，已结束该采集任务"})
         raise TimeoutError("创作者刷新超过 30 分钟")
@@ -1419,9 +1421,10 @@ class PinchuangHub:
                     else:
                         totals["failed_creators"] += 1
                         notifier.send(
-                            f"{self.module_name}创作者部分失败",
+                            f"{self.module_name}创作者{'同步失败' if result['status'] == 'failed' else '部分失败'}",
                             f"创作者：{author_name}\n批次：{run['sync_batch_id']}\n"
-                            f"{self.failure_items_label}：{result['failed_items']} 条",
+                            f"{self.failure_items_label}：{result['failed_items']} 条\n"
+                            f"说明：{result.get('message', '')}",
                         )
                 except _RunStopping:
                     raise

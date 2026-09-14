@@ -153,10 +153,11 @@ const fn = source.slice(source.indexOf('  async function refreshFavoriteAuthor')
 let cancelled = false, circuitOpen = false, my_username = '', PAGE_JITTER_MS = 0;
 const esc = x => x, setPanel = () => {}, noteFailure = () => {};
 const reportRemoteProgress = async () => {}, jitterSleep = async () => {};
+const logCall = () => {};
 const callWithRetry = async (_name, call) => call();
 let pages, saved, calls, failSave;
 const object = id => ({id, objectDesc:{mediaType:4}});
-const WXU = {API:{finderUserPage:async () => {calls++; return pages.shift();}}, request:async ({body}) => {
+const WXU = {API:{finderUserPage:async () => {calls++; return pages.length>1 ? pages.shift() : pages[0];}}, request:async ({body}) => {
   if (failSave) return [new Error('disk full'), null];
   saved.push(...body.feeds.map(v=>v.id));
   return [null, {saved_ids:body.feeds.map(v=>v.id), capture_task_id:body.task_id}];
@@ -177,3 +178,42 @@ eval(fn);
 '''
     result = subprocess.run(["node", "-e", script], cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True, encoding="utf-8", timeout=20)
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_pagination_failure_details_survive_capture_and_monitor_journal(capture, tmp_path):
+    from backend import competitor_monitor
+
+    mitm_proxy.save_synced_feeds('author', [feed()], task_id=capture)
+    diagnostic = {
+        'page_number': 7, 'attempt': 3, 'raw_count': 0, 'video_count': 0,
+        'saved_count': 1, 'input_cursor_present': True, 'output_cursor_present': True,
+        'cursor_changed': False, 'cursor_repeated': True, 'has_more': True,
+        'continue_flag': None, 'reason': 'repeated_cursor', 'action': 'fail',
+        'lastBuffer': 'SECRET_CURSOR_MUST_NOT_BE_SAVED',
+    }
+    status = channels_refresh.update_refresh_task({
+        'task_id': capture, 'status': 'completed',
+        'author_results': {'author': {'count': 999, 'pagination_complete': False,
+                                     'error': '第 7 页游标重复，重试 2 次后仍失败', 'pagination': diagnostic}},
+    })
+    assert status['status'] == 'failed'
+    assert status['total_videos'] == 1
+    assert status['author_results']['author']['pagination']['page_number'] == 7
+    assert 'SECRET_CURSOR' not in json.dumps(status)
+
+    hub = competitor_monitor.CompetitorMonitorHub(tmp_path / 'config.json', tmp_path / 'state.json')
+    hub.state['current_run'] = {'run_id': 'run', 'sync_batch_id': 'batch', 'status': 'running', 'creators': []}
+    hub._current_creator_progress = {'stage': 'capture'}
+    with patch.object(channels_refresh, 'start_refresh_task', return_value=({'task_id': capture}, True)):
+        with pytest.raises(RuntimeError) as caught:
+            hub._refresh_author('run', {'username': 'author'})
+    result = hub._creator_failure_result({'username': 'author'}, caught.value, '2026-09-14 00:00:00')
+    hub._creator_result('run', result)
+    assert result['status'] == 'failed'
+    assert result['refreshed_videos'] == 1  # confirmed storage count, not the page's 999
+    restarted = competitor_monitor.CompetitorMonitorHub(hub.config_path, hub.state_path)
+    failure = restarted.journal.failures('run')['items'][0]
+    assert failure['capture_diagnostic']['task_id'] == capture
+    assert failure['capture_diagnostic']['pagination']['page_number'] == 7
+    assert failure['capture_diagnostic']['pagination']['attempt'] == 3
+    assert 'SECRET_CURSOR' not in json.dumps(failure)
