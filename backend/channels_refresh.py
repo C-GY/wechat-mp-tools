@@ -10,7 +10,7 @@ _ACTIVE_STATUSES = {"waiting", "running"}
 _TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
 _ALL_STATUSES = _ACTIVE_STATUSES | _TERMINAL_STATUSES
 COMMAND_STALE_SECONDS = 75
-_task_lock = threading.Lock()
+_task_lock = threading.RLock()
 _refresh_task = None
 
 
@@ -20,7 +20,7 @@ def _public_task(task):
     return {
         key: copy.deepcopy(value)
         for key, value in task.items()
-        if key not in {"authors", "claimed"}
+        if key not in {"authors", "claimed", "persisted_ids"}
     }
 
 
@@ -39,7 +39,7 @@ def _normalize_authors(authors):
     return normalized
 
 
-def start_refresh_task(authors):
+def start_refresh_task(authors, *, require_receipt=False):
     """Create a refresh task, or return the currently active one."""
     global _refresh_task
     normalized = _normalize_authors(authors)
@@ -56,6 +56,9 @@ def start_refresh_task(authors):
             "status": "waiting",
             "authors": normalized,
             "claimed": False,
+            "require_receipt": require_receipt,
+            "persisted_ids": {},
+            "author_results": {},
             "total_authors": len(normalized),
             "completed_authors": 0,
             "failed_authors": 0,
@@ -97,6 +100,7 @@ def claim_refresh_command():
         return {
             "task_id": _refresh_task["task_id"],
             "authors": copy.deepcopy(_refresh_task["authors"]),
+            "capture_protocol": 1,
         }
 
 
@@ -110,7 +114,35 @@ def update_refresh_task(payload):
         if not _refresh_task or task_id != _refresh_task["task_id"]:
             raise ValueError("刷新任务不存在或已失效")
 
+        if _refresh_task["status"] in _TERMINAL_STATUSES:
+            return _public_task(_refresh_task)
         status = payload.get("status")
+        results = payload.get("author_results")
+        if isinstance(results, dict):
+            allowed = {a["username"] for a in _refresh_task["authors"]}
+            for username, result in results.items():
+                if username in allowed and isinstance(result, dict):
+                    _refresh_task["author_results"][username] = {
+                        "count": int(result.get("count", 0)),
+                        "pagination_complete": result.get("pagination_complete") is True,
+                        "error": str(result.get("error", "")),
+                    }
+        if status == "completed" and _refresh_task.get("require_receipt"):
+            errors = []
+            verified = 0
+            for author in _refresh_task["authors"]:
+                username = author["username"]
+                result = _refresh_task["author_results"].get(username, {})
+                count = len(_refresh_task["persisted_ids"].get(username, []))
+                verified += count
+                if not result.get("pagination_complete") or result.get("error"):
+                    errors.append(result.get("error") or "未收到完整分页确认，请重新打开微信视频号页面后重试")
+                elif result.get("count") != count:
+                    errors.append(f"采集落盘数量不一致：上报 {result.get('count')}，已保存 {count}")
+            if errors:
+                status = "failed"
+                payload = {**payload, "failed_authors": len(errors), "message": "；".join(errors)}
+            payload = {**payload, "total_videos": verified}
         if status is not None:
             if status not in _ALL_STATUSES:
                 raise ValueError("刷新任务状态无效")
@@ -134,6 +166,27 @@ def update_refresh_task(payload):
             _refresh_task["message"] = "收藏创作者作品刷新完成"
         _refresh_task["updated_at"] = time.time()
         return _public_task(_refresh_task)
+
+
+def validate_capture(task_id, username):
+    if not task_id:
+        return
+    with _task_lock:
+        if (not _refresh_task or _refresh_task["task_id"] != task_id
+                or _refresh_task["status"] not in _ACTIVE_STATUSES
+                or username not in {a["username"] for a in _refresh_task["authors"]}):
+            raise ValueError("采集结果不属于当前刷新任务或作者")
+
+
+def record_capture(task_id, username, video_ids):
+    if not task_id:
+        return
+    with _task_lock:
+        validate_capture(task_id, username)
+        current = set(_refresh_task["persisted_ids"].get(username, []))
+        current.update(str(value) for value in video_ids)
+        _refresh_task["persisted_ids"][username] = sorted(current)
+        _refresh_task["updated_at"] = time.time()
 
 
 def get_refresh_status(task_id=None):

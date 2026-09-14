@@ -170,6 +170,51 @@ def test_pause_drains_current_requests_and_resume_keeps_queue(transfer, monkeypa
     assert all(task["status"] == "completed" for task in t.manager.tasks)
 
 
+def test_out_of_order_completion_keeps_files_urls_and_authors_matched(transfer, monkeypatch):
+    t = transfer
+    selected = [{**video, "description": "相同标题"} for video in t.videos[:6]]
+    other_author = [{**video, "description": "相同标题"} for video in selected]
+    oss.save_json(channels.CHANNELS_FEEDS_FILE, {
+        AUTHOR["username"]: selected,
+        "other-author": other_author,
+    })
+    second_saved = threading.Event()
+    completion_order = []
+    save_result = t.manager._save_video_result
+
+    def upload(service, path, video_id, created_at, callback):
+        # Derive the returned URL from actual file bytes, not from the task ID.
+        content_id = path.read_bytes().decode()
+        assert content_id == video_id
+        if video_id == "video-0":
+            assert second_saved.wait(4), "video-1 must finish before video-0"
+        return {"size": path.stat().st_size, "url": f"https://oss.invalid/{content_id}.mp4",
+                "object_key": f"{content_id}.mp4", "bucket": service.bucket}
+
+    def record(task, result):
+        save_result(task, result)
+        completion_order.append(task["video_id"])
+        if task["video_id"] == "video-1":
+            second_saved.set()
+
+    monkeypatch.setattr(oss.OSSService, "upload_video", upload)
+    monkeypatch.setattr(t.manager, "_save_video_result", record)
+    t.manager.start_selected_sync(AUTHOR, selected, transfer={"download_workers": 2, "upload_workers": 2})
+    join(t.manager)
+    assert completion_order.index("video-1") < completion_order.index("video-0")
+    saved = oss.load_json(channels.CHANNELS_FEEDS_FILE)
+    assert saved["other-author"] == other_author
+    assert len(saved[AUTHOR["username"]]) == len(selected)
+    for video in saved[AUTHOR["username"]]:
+        assert video["oss_video_url"] == f"https://oss.invalid/{video['id']}.mp4"
+        assert video["oss_object_key"] == f"{video['id']}.mp4"
+        assert video["oss_upload_status"] == "completed"
+    for task in t.manager.tasks:
+        assert task["username"] == AUTHOR["username"]
+        assert task["oss_url"] == f"https://oss.invalid/{task['video_id']}.mp4"
+        assert task["status"] == "completed"
+
+
 def test_failures_and_remote_reuse_do_not_drop_other_results(transfer, monkeypatch):
     t = transfer
     downloads, uploads = [], []

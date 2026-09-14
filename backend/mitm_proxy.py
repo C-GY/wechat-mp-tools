@@ -552,16 +552,16 @@ class ChannelsAddon:
             if path == "/__wx_channels_api/sync-feed":
                 try:
                     payload = json.loads(flow.request.get_text())
-                    save_synced_feeds(payload.get("username"), payload.get("feeds", []))
+                    receipt = save_synced_feeds(payload.get("username"), payload.get("feeds", []), task_id=payload.get("task_id", ""))
                     self._local_json(
                         flow, 200,
-                        b'{"code":0,"success":true,"message":"Feeds synced successfully"}',
+                        json.dumps({"code": 0, "success": True, "data": receipt}).encode("utf-8"),
                     )
                 except Exception as ex:
                     print(f"Error handling sync-feed: {ex}")
                     self._local_json(
                         flow, 500,
-                        json.dumps({"success": False, "error": str(ex)}).encode("utf-8"),
+                        json.dumps({"code": 1, "success": False, "msg": str(ex), "error": str(ex)}).encode("utf-8"),
                     )
                 return
             if path in ("/__wx_channels_api/error", "/__wx_channels_api/log-error"):
@@ -870,7 +870,11 @@ class ChannelsAddon:
 
 # ── Synced Data Saving (同步数据持久化) ──────────────────────────
 
-def save_synced_feeds(username, feeds):
+from backend.channels_storage import locked_feeds, read_feeds, atomic_json
+
+
+@locked_feeds
+def save_synced_feeds(username, feeds, *, task_id=""):
     import urllib.parse
     from backend.channels_capture import capture_metadata
     from backend.config import load_json, save_json
@@ -882,10 +886,15 @@ def save_synced_feeds(username, feeds):
         extract_video_duration,
     )
     
-    if not username or not feeds:
-        return
+    if not username or not isinstance(feeds, list):
+        raise ValueError("采集结果缺少作者或作品列表")
         
     username = urllib.parse.unquote(username)
+    from backend.channels_refresh import validate_capture, record_capture
+    validate_capture(task_id, username)
+    if not feeds:
+        return {"saved_ids": [], "capture_task_id": task_id}
+    saved_ids = set()
         
     first_feed = feeds[0]
     contact = first_feed.get("contact", {})
@@ -946,7 +955,7 @@ def save_synced_feeds(username, feeds):
         save_favorites_atomic(CHANNELS_FAVORITES_FILE, favs)
     
     # 2. Update/Merge Feeds DB
-    feeds_db = load_json(CHANNELS_FEEDS_FILE, {})
+    feeds_db = read_feeds(CHANNELS_FEEDS_FILE)
     
     # If there are old feeds saved under the nickname (placeholder), move/merge them
     old_feeds = []
@@ -1033,7 +1042,8 @@ def save_synced_feeds(username, feeds):
             "createtime": createtime,
             "decode_key": decode_key
         }
-        item.update(capture_metadata(feed))
+        saved_ids.add(str(feed_id))
+        item.update(capture_metadata(feed, task_id))
         item.update(extract_interaction_metrics(feed))
         duration_seconds = extract_video_duration(feed)
         if duration_seconds is not None:
@@ -1048,7 +1058,9 @@ def save_synced_feeds(username, feeds):
         if not found:
             feeds_db[username].append(item)
             
-    save_json(CHANNELS_FEEDS_FILE, feeds_db)
+    atomic_json(CHANNELS_FEEDS_FILE, feeds_db)
+    record_capture(task_id, username, saved_ids)
+    return {"saved_ids": sorted(saved_ids), "capture_task_id": task_id}
 
 
 # ── Custom Injected Script Content (注入 JS 模板) ───────────────

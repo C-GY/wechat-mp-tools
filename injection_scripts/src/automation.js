@@ -209,13 +209,14 @@
     var body = progress || {};
     body.task_id = taskId;
     body.page_id = pageId;
-    try {
-      await WXU.request({
-        method: "POST",
-        url: "/__wx_channels_api/refresh-progress",
-        body: body,
-      });
-    } catch (_) {}
+    var result = await WXU.request({
+      method: "POST", url: "/__wx_channels_api/refresh-progress", body: body, timeout: 30000,
+    });
+    if (result[0]) throw result[0];
+    if (result[1] && result[1].status === "cancelled" && body.status === "running") {
+      throw new Error(result[1].message || "刷新任务已取消");
+    }
+    return result[1];
   }
 
   // 与作者主页「同步作品」保持一致：从第一页开始翻到末页，后端按 feed id 合并更新。
@@ -224,6 +225,8 @@
     var authorVideos = 0;
     var pageNumber = 0;
     var hasMore = true;
+    var seenIds = new Set();
+    var seenMarkers = new Set();
     var label = author.nickname || author.username;
 
     while (hasMore && !cancelled && !circuitOpen) {
@@ -262,19 +265,37 @@
         return obj.objectDesc && obj.objectDesc.mediaType === 4;
       });
       if (rawVideoObjects.length > 0) {
-        await WXU.request({
+        var receipt = await WXU.request({
           method: "POST",
           url: "/__wx_channels_api/sync-feed",
-          body: { username: author.username, feeds: rawVideoObjects },
+          body: { username: author.username, feeds: rawVideoObjects, task_id: taskId },
+          timeout: 30000,
         });
-        authorVideos += rawVideoObjects.length;
+        if (receipt[0]) throw receipt[0];
+        var saved = receipt[1];
+        var requestedIds = Array.from(new Set(rawVideoObjects.map(function (obj) { return String(obj.id || ""); })));
+        if (!saved || saved.capture_task_id !== taskId || !Array.isArray(saved.saved_ids) ||
+            requestedIds.includes("") || saved.saved_ids.length !== requestedIds.length ||
+            requestedIds.some(function (id) { return !saved.saved_ids.includes(id); })) {
+          throw new Error("采集保存未得到完整确认，请重新打开微信视频号页面后重试");
+        }
+        saved.saved_ids.forEach(function (id) { seenIds.add(id); });
+        authorVideos = seenIds.size;
       }
 
       marker = (r.data && r.data.lastBuffer) || "";
-      hasMore = !!(marker && raw.length >= 15);
+      hasMore = !!marker;
+      if (!marker && r.data && (r.data.hasMore === true || r.data.continueFlag === 1)) {
+        throw new Error("作品分页未完整结束：仍有更多作品但没有下一页游标");
+      }
+      if (hasMore && (seenMarkers.has(marker) || raw.length === 0)) {
+        throw new Error("作品分页未完整结束：游标重复或空页仍有下一页");
+      }
+      if (hasMore) seenMarkers.add(marker);
       if (hasMore && !cancelled) await jitterSleep(PAGE_JITTER_MS);
     }
 
+    if (cancelled || circuitOpen || hasMore) throw new Error("采集已停止，尚未到达最后一页");
     return authorVideos;
   }
 
@@ -287,10 +308,11 @@
 
     var authors = Array.isArray(command.authors) ? command.authors : [];
     var totals = { completed: 0, failed: 0, videos: 0 };
+    var authorResults = {};
     var heartbeatTimer = setInterval(function () {
       reportRemoteProgress(command.task_id, {
         status: "running",
-      });
+      }).catch(function () {});
     }, 15000);
     function stopHeartbeat() {
       if (heartbeatTimer) {
@@ -322,8 +344,10 @@
           );
           totals.videos += count;
           totals.completed++;
-        } catch (_) {
+          authorResults[author.username] = {count: count, pagination_complete: true};
+        } catch (error) {
           totals.failed++;
+          authorResults[author.username] = {count: 0, pagination_complete: false, error: error.message || String(error)};
         }
 
         await reportRemoteProgress(command.task_id, {
@@ -331,6 +355,7 @@
           completed_authors: totals.completed,
           failed_authors: totals.failed,
           total_videos: totals.videos,
+          author_results: authorResults,
           current_username: author.username,
           current_nickname: author.nickname || author.username,
           message:
@@ -350,6 +375,7 @@
           completed_authors: totals.completed,
           failed_authors: totals.failed,
           total_videos: totals.videos,
+          author_results: authorResults,
           message: "刷新已停止",
         });
         finish("已停止 · 已刷新 " + totals.completed + " 个作者");
@@ -360,6 +386,7 @@
           completed_authors: totals.completed,
           failed_authors: totals.failed,
           total_videos: totals.videos,
+          author_results: authorResults,
           message: "接口连续异常，任务已暂停，请稍后重试",
         });
         finish("接口连续异常，任务已暂停");
@@ -373,6 +400,7 @@
           completed_authors: totals.completed,
           failed_authors: totals.failed,
           total_videos: totals.videos,
+          author_results: authorResults,
           current_username: "",
           current_nickname: "",
           message: finalMessage,
@@ -387,6 +415,7 @@
         completed_authors: totals.completed,
         failed_authors: totals.failed,
         total_videos: totals.videos,
+          author_results: authorResults,
         message: errorMessage,
       });
       finish("刷新失败：" + errorMessage);

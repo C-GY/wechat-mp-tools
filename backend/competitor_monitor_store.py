@@ -10,6 +10,16 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from backend import pinchuang
+from backend.database_retry import retry_database_operation
+
+
+def _close_connection(connection):
+    try:
+        connection.close()
+    except Exception:
+        # Closing an already broken connection cannot invalidate a committed
+        # result or replace the query exception that triggered cleanup.
+        pass
 
 PLATFORM = pinchuang.PLATFORM
 VIDEO_TABLE = "competitor_videos"
@@ -246,9 +256,15 @@ class CompetitorMySQLAdapter(pinchuang.MySQLSnapshotAdapter):
                             raise RuntimeError(f"目标表 {table} 缺少关联 competitor_videos.video_id 的外键")
             return {"version": version, "tables": list(TABLES), "timezone": "Asia/Shanghai"}
         finally:
-            connection.close()
+            _close_connection(connection)
 
     def latest_rows(self, source_keys):
+        # Materialize iterators before retrying; a failed query must not consume
+        # the input and turn its retry into a successful empty database result.
+        return self._latest_rows(tuple(source_keys))
+
+    @retry_database_operation
+    def _latest_rows(self, source_keys):
         keys = list(dict.fromkeys(key for key in source_keys if key))
         if not keys:
             return {}
@@ -264,8 +280,9 @@ class CompetitorMySQLAdapter(pinchuang.MySQLSnapshotAdapter):
                         result[row["source_video_key"]] = row
             return result
         finally:
-            connection.close()
+            _close_connection(connection)
 
+    @retry_database_operation
     def write_snapshots(self, rows):
         """Commit all three tables together. Lock each master before its children."""
         if not rows:
@@ -308,8 +325,11 @@ class CompetitorMySQLAdapter(pinchuang.MySQLSnapshotAdapter):
                                            "ON DUPLICATE KEY UPDATE video_tag_id=video_tag_id", (video_id, tag))
             connection.commit()
             return len({(r["platform"], r["source_video_key"], r["sync_batch_id"]) for r in rows})
-        except Exception:
-            connection.rollback()
+        except Exception as original:
+            try:
+                connection.rollback()
+            except Exception as rollback_error:
+                original.add_note(f"回滚也失败：{type(rollback_error).__name__}；保留原始数据库异常")
             raise
         finally:
-            connection.close()
+            _close_connection(connection)

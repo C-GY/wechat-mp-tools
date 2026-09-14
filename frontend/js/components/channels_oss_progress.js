@@ -84,6 +84,10 @@ const ChannelsOSSProgressPage = {
         }
         body.innerHTML = items.map(item => {
             const state = this.status(item.status);
+            if (item.status === 'pending' && item.next_retry_at) {
+                state.text = '等待重试';
+                state.color = 'var(--warning)';
+            }
             const percent = Math.max(0, Math.min(100, Number(item.progress || 0)));
             const size = item.total_bytes
                 ? `${this.bytes(item.uploaded_bytes)} / ${this.bytes(item.total_bytes)}`
@@ -93,9 +97,9 @@ const ChannelsOSSProgressPage = {
                 : '<span style="color:var(--text-muted);">—</span>';
             return `<tr>
                 <td><div style="font-weight:600;">${this.esc(item.author || '未知创作者')}</div><div style="font-size:0.8rem; color:var(--text-muted); margin-top:4px; max-width:360px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${this.attr(item.title || '')}">${this.esc(item.title || item.video_id || '')}</div></td>
-                <td><span class="badge" style="color:${state.color};">${state.text}</span></td>
+                <td><span class="badge" style="color:${state.color};">${state.text}</span><div style="font-size:.72rem;color:var(--text-muted);margin-top:4px;">${item.download_attempts ? `下载尝试 ${Number(item.download_attempts)} 次` : ''}${item.upload_attempts ? `<br>上传尝试 ${Number(item.upload_attempts)} 次` : ''}</div></td>
                 <td><div style="height:7px; background:rgba(0,0,0,0.08); border-radius:999px; overflow:hidden;"><div style="height:100%; width:${percent}%; background:${state.color}; transition:width .2s;"></div></div><div style="font-size:.76rem; color:var(--text-muted); margin-top:5px;">${size}</div></td>
-                <td>${link}</td><td style="max-width:260px; color:var(--error); font-size:.8rem;">${this.esc(item.error || '')}</td>
+                <td>${link}</td><td style="max-width:260px; overflow-wrap:anywhere; color:var(--error); font-size:.8rem;">${this.esc(item.error || '')}${item.next_retry_at ? `<div style="color:var(--text-muted);">下次尝试：${this.esc(item.next_retry_at)}</div>` : ''}</td>
                 <td style="font-size:.8rem; color:var(--text-muted);">${this.esc(item.updated_at || '')}</td>
             </tr>`;
         }).join('');

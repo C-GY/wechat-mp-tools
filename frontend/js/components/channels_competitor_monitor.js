@@ -2,6 +2,8 @@
 const ChannelsCompetitorMonitorPage = {
     pollTimer: null,
     scheduleTimes: [],
+    failureView: null,
+    actionPending: false,
 
     render() {
         return `
@@ -31,6 +33,7 @@ const ChannelsCompetitorMonitorPage = {
                     <div id="competitor_monitor-main-progress" style="height:100%; width:0; background:var(--primary); transition:width .25s;"></div>
                 </div>
                 <div id="competitor_monitor-run-message" style="font-size:.84rem; color:var(--text-secondary); margin-top:10px;">—</div>
+                <div id="competitor_monitor-recovery-actions" style="display:flex; gap:8px; margin-top:10px; flex-wrap:wrap;"></div>
                 <div id="competitor_monitor-current-creator" style="display:none; align-items:center; gap:10px; margin-top:12px; padding:10px 12px; border-radius:9px; background:rgba(37,99,235,.08); color:var(--text-secondary);">
                     <span id="competitor_monitor-current-creator-position" style="font-size:.78rem; white-space:nowrap;">当前创作者</span>
                     <strong id="competitor_monitor-current-creator-name" style="color:var(--text-primary); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">—</strong>
@@ -107,7 +110,7 @@ const ChannelsCompetitorMonitorPage = {
                         <input id="competitor_monitor-upload-workers" class="form-input" type="number" min="1" max="8" step="1" value="2">
                     </div>
                 </div>
-                <p style="font-size:.82rem; color:var(--text-muted); margin:12px 0; line-height:1.7;">各支持 1–8 路，默认各 2 路。上传与下载可同时进行，创作者按顺序采集。保存后从下一轮任务生效。暂停时，当前传输完成后暂停，继续后处理剩余作品。</p>
+                <p style="font-size:.82rem; color:var(--text-muted); margin:12px 0; line-height:1.7;">各支持 1–8 路，默认各 2 路。保存后从下一轮任务生效。下载中断和暂时性网络错误最多额外重试 3 次；网络不稳定时可将下载并发降至 2。暂停后不启动新尝试，当前请求结束后暂停；软件重启后继续未完成任务，原已暂停任务等待点击继续。</p>
                 <button class="btn btn-primary" id="btn-competitor_monitor-save-transfer" onclick="ChannelsCompetitorMonitorPage.saveConfig()">保存并发配置</button>
             </div>
 
@@ -138,6 +141,7 @@ const ChannelsCompetitorMonitorPage = {
                 </div>
             </div>
 
+            <div id="competitor_monitor-failures-panel" class="card" style="display:none; margin-top:var(--spacing-lg);"></div>
             <div class="card animate-fade-in" style="margin-top:var(--spacing-lg); margin-bottom:var(--spacing-lg);">
                 <div class="card-header" style="border-bottom:1px solid var(--border-color); padding-bottom:var(--spacing-md); margin-bottom:var(--spacing-md);">
                     <h3 class="card-title" style="margin:0;">🧾 最近运行记录</h3>
@@ -342,6 +346,62 @@ const ChannelsCompetitorMonitorPage = {
         }
     },
 
+    async recoverRun(runId, retry = false) {
+        if (this.actionPending) return;
+        this.actionPending = true;
+        try {
+            await (retry ? API.competitor_monitor.retryFailed(runId) : API.competitor_monitor.continueRun(runId));
+            Toast.success(retry ? '已创建失败项重试任务' : '正在继续已保存的进度');
+            await this.loadStatus();
+        } catch (error) {
+            Toast.error(`操作失败：${error.message || error}`);
+        } finally {
+            this.actionPending = false;
+        }
+    },
+
+    recoveryButtons(run, running) {
+        if (!run.run_id) return '';
+        const id = this.jsValue(run.run_id);
+        const buttons = [];
+        if (!running && ['interrupted', 'paused', 'pausing', 'queued', 'running'].includes(run.status)) {
+            buttons.push(`<button class="btn btn-secondary btn-sm" onclick="ChannelsCompetitorMonitorPage.recoverRun(${id})">继续未完成任务</button>`);
+        }
+        if (Number(run.failed_items || 0) > 0) {
+            buttons.push(`<button class="btn btn-secondary btn-sm" onclick="ChannelsCompetitorMonitorPage.showFailures(${id})">查看失败明细</button>`);
+            if (!running && !['queued', 'running', 'paused', 'pausing'].includes(run.status)) {
+                buttons.push(`<button class="btn btn-secondary btn-sm" onclick="ChannelsCompetitorMonitorPage.recoverRun(${id}, true)">仅重试失败项</button>`);
+            }
+        }
+        return buttons.join(' ');
+    },
+
+    async showFailures(runId, authorId = '', offset = 0) {
+        const panel = document.getElementById('competitor_monitor-failures-panel');
+        if (!panel) return;
+        const view = { runId, authorId, offset };
+        this.failureView = view;
+        panel.style.display = 'block';
+        panel.textContent = '正在读取失败明细…';
+        try {
+            const result = await API.competitor_monitor.getFailures(runId, authorId, offset);
+            if (this.failureView !== view) return;
+            panel.innerHTML = `<div style="display:flex;justify-content:space-between;gap:8px;"><strong>失败明细 · 共 ${Number(result.total)} 条</strong><button class="btn btn-secondary btn-sm" data-failure-close>关闭</button></div>
+                ${result.legacy_details_missing ? `<p style="color:var(--warning);">旧版本缺少 ${Number(result.legacy_details_missing)} 条明细；重试时会重新采集相关作者并比对数据库，补传缺失作品。</p>` : ''}
+                <div style="overflow:auto;margin-top:12px;"><table class="data-table" style="width:100%;min-width:720px;"><thead><tr><th>作品 / 作者 ID</th><th>阶段</th><th>尝试次数</th><th>原始错误</th></tr></thead><tbody>${result.items.map(item => `<tr><td>${this.esc(item.video_id || item.author_id)}</td><td>${this.esc(this.failureStage(item.stage))}</td><td>${Number(item.download_attempts || item.upload_attempts || 0) || '—'}</td><td style="overflow-wrap:anywhere;">${this.esc(item.error_type || '')} ${this.esc(item.error || '')}</td></tr>`).join('')}</tbody></table></div>
+                <div style="display:flex;gap:8px;margin-top:12px;align-items:center;"><button class="btn btn-secondary btn-sm" data-failure-prev ${offset <= 0 ? 'disabled' : ''}>上一页</button><span>${Number(result.total) ? offset + 1 : 0}–${Math.min(offset + Number(result.limit), Number(result.total))} / ${Number(result.total)}</span><button class="btn btn-secondary btn-sm" data-failure-next ${result.has_more ? '' : 'disabled'}>下一页</button></div>`;
+            panel.querySelector('[data-failure-close]').onclick = () => { this.failureView = null; panel.style.display = 'none'; };
+            panel.querySelector('[data-failure-prev]').onclick = () => this.showFailures(runId, authorId, Math.max(0, offset - 50));
+            panel.querySelector('[data-failure-next]').onclick = () => this.showFailures(runId, authorId, offset + 50);
+        } catch (error) {
+            if (this.failureView === view) panel.textContent = `读取失败：${error.message || error}`;
+        }
+    },
+
+    failureStage(stage) {
+        return ({download:'下载', upload:'上传', upload_verify:'上传后校验', capture:'采集', database_read:'数据库比对', database_write:'数据库写入', validation:'数据校验', persist:'结果保存', transfer:'传输'})[stage] || stage || '旧记录未保存阶段';
+    },
+
     addTime() {
         const input = document.getElementById('competitor_monitor-new-time');
         const value = input?.value || '';
@@ -378,6 +438,9 @@ const ChannelsCompetitorMonitorPage = {
 
     renderStatus(status) {
         const run = status.current_run || {};
+        this.isRunning = !!status.running;
+        const recovery = document.getElementById('competitor_monitor-recovery-actions');
+        if (recovery) recovery.innerHTML = this.recoveryButtons(run, status.running);
         const total = Number(run.total_creators || 0);
         const done = Number(run.completed_creators || 0) + Number(run.failed_creators || 0);
         const currentIndex = Number(run.current_creator_index || 0);
@@ -457,7 +520,7 @@ const ChannelsCompetitorMonitorPage = {
         }
         body.innerHTML = rows.map(item => `<tr>
             <td><strong>${this.esc(item.author_name || item.author_id)}</strong><div style="font-size:.72rem; color:var(--primary); margin-top:2px;">第 ${Number(item.creator_index || 0)}/${Number(item.total_creators || total)} 位</div><div style="font-size:.72rem; color:var(--text-muted); max-width:250px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${this.attr(item.author_id || '')}">${this.esc(item.author_id || '')}</div></td>
-            <td>${this.statusLabel(item.status)}</td><td>${Number(item.refreshed_videos || 0)}</td><td>${Number(item.existing_videos || 0)}</td><td>${Number(item.new_videos || 0)}</td><td>${Number(item.uploaded_videos || 0)}</td><td>${Number(item.database_written || 0)}</td><td style="color:${item.failed_items ? 'var(--error)' : 'inherit'}">${Number(item.failed_items || 0)}</td><td style="max-width:270px; font-size:.8rem; color:${item.status === 'failed' ? 'var(--error)' : 'var(--text-secondary)'};">${this.esc(item.message || '')}</td>
+            <td>${this.statusLabel(item.status)}</td><td>${Number(item.refreshed_videos || 0)}</td><td>${Number(item.existing_videos || 0)}</td><td>${Number(item.new_videos || 0)}</td><td>${Number(item.uploaded_videos || 0)}</td><td>${item.database_outcome === 'unknown' ? '待核验' : Number(item.database_written || 0)}</td><td style="color:${item.failed_items ? 'var(--error)' : 'inherit'}">${item.failed_items ? `<button class="btn btn-secondary btn-sm" onclick="ChannelsCompetitorMonitorPage.showFailures(${this.jsValue(run.run_id)}, ${this.jsValue(item.author_id)})">${Number(item.failed_items)} 项 · 查看</button>` : '0'}</td><td style="max-width:270px; font-size:.8rem; color:${item.status === 'failed' ? 'var(--error)' : 'var(--text-secondary)'};">${this.esc(item.message || '')}</td>
         </tr>`).join('');
     },
 
@@ -470,7 +533,7 @@ const ChannelsCompetitorMonitorPage = {
         }
         container.innerHTML = items.slice(0, 20).map(item => `<div style="display:flex; justify-content:space-between; gap:12px; flex-wrap:wrap; padding:10px 12px; background:rgba(0,0,0,.025); border-radius:8px;">
             <div><strong>${this.statusLabel(item.status)}</strong><span style="color:var(--text-muted); margin-left:8px; font-size:.78rem;">${item.trigger === 'scheduled' ? `定时 ${this.esc(item.scheduled_time || '')}` : '手动触发'}</span><div style="font-size:.78rem; color:var(--text-secondary); margin-top:4px;">${this.esc(item.message || '')}</div></div>
-            <div style="font-size:.76rem; color:var(--text-muted); text-align:right;">${this.esc(item.started_at || '')}<br>批次 ${this.esc(item.sync_batch_id || '')}</div>
+            <div style="font-size:.76rem; color:var(--text-muted); text-align:right;">${this.esc(item.started_at || '')}<br>批次 ${this.esc(item.sync_batch_id || '')}<div style="margin-top:6px;">${this.recoveryButtons(item, this.isRunning)}</div></div>
         </div>`).join('');
     },
 
@@ -478,12 +541,13 @@ const ChannelsCompetitorMonitorPage = {
         return ({ queued:'等待中', running:'执行中', pausing:'正在暂停', paused:'已暂停', completed:'已完成', partial:'部分失败', failed:'失败', interrupted:'已中断' })[value] || '空闲';
     },
     phaseLabel(value) {
-        return ({ queued:'任务排队', preflight:'环境检查', checking_wechat:'检查视频号', waiting_wechat:'等待自动恢复', refreshing:'刷新创作者', checking_database:'比对数据库', uploading_oss:'同步 OSS', writing_database:'数据库处理', creator_interval:'创作者间隔', paused:'已暂停', finished:'已结束', interrupted:'已中断' })[value] || '准备中';
+        return ({ queued:'任务排队', recovering:'恢复进度', preflight:'环境检查', checking_wechat:'检查视频号', waiting_wechat:'等待自动恢复', refreshing:'刷新创作者', checking_database:'比对数据库', uploading_oss:'同步 OSS', writing_database:'数据库处理', creator_interval:'创作者间隔', paused:'已暂停', finished:'已结束', interrupted:'已中断' })[value] || '准备中';
     },
     value(id) { return document.getElementById(id)?.value.trim() || ''; },
     setValue(id, value) { const el = document.getElementById(id); if (el) el.value = value == null ? '' : value; },
     setSecretPlaceholder(id, saved, label) { const el = document.getElementById(id); if (el) { el.value = ''; el.placeholder = saved ? '已保存；不修改请留空' : `请输入${label}`; } },
     text(id, value) { const el = document.getElementById(id); if (el) el.textContent = value; },
     esc(value) { const div = document.createElement('div'); div.textContent = value == null ? '' : String(value); return div.innerHTML; },
-    attr(value) { return this.esc(value).replace(/`/g, '&#96;').replace(/'/g, '&#39;'); },
+    attr(value) { return this.esc(value).replace(/"/g, '&quot;').replace(/`/g, '&#96;').replace(/'/g, '&#39;'); },
+    jsValue(value) { return this.attr(JSON.stringify(String(value || ''))); },
 };

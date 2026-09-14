@@ -270,6 +270,13 @@ const API = {
         startRun() { return API.post('/api/competitor_monitor/runs'); },
         pauseRun() { return API.post('/api/competitor_monitor/runs/pause'); },
         resumeRun() { return API.post('/api/competitor_monitor/runs/resume'); },
+        continueRun(runId) { return API.post(`/api/competitor_monitor/runs/${encodeURIComponent(runId)}/continue`); },
+        retryFailed(runId) { return API.post(`/api/competitor_monitor/runs/${encodeURIComponent(runId)}/retry-failed`); },
+        getFailures(runId, authorId, offset = 0) {
+            const query = new URLSearchParams({ offset, limit: 50 });
+            if (authorId) query.set('author_id', authorId);
+            return API.get(`/api/competitor_monitor/runs/${encodeURIComponent(runId)}/failures?${query}`, { showError: false });
+        },
         getStatus() { return API.get('/api/competitor_monitor/status', { showError: false }); },
     },
 

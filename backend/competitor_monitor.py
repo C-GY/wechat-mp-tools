@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import copy
 import re
 import time
 
@@ -10,6 +11,8 @@ from flask import Blueprint, jsonify, request
 import pymysql
 
 from backend import pinchuang
+from backend.competitor_recovery import CompetitorRecovery
+from backend.sync_errors import error_details
 from backend.competitor_author_tags import CompetitorAuthorTagStore
 from backend.competitor_monitor_store import CompetitorMySQLAdapter, TABLES, build_row, source_key
 from backend.oss import persistent_config_dir, upload_manager, validate_transfer_workers
@@ -20,6 +23,19 @@ CONFIG_FILE = persistent_config_dir() / "competitor_monitor_config.json"
 STATE_FILE = persistent_config_dir() / "competitor_monitor_state.json"
 DEFAULT_DATABASE = "competitor_monitor"
 DEFAULT_TRANSFER = {"download_workers": 2, "upload_workers": 2}
+
+
+def _index_observations(videos):
+    indexed = {}
+    for index, video in enumerate(videos):
+        try:
+            key = source_key(video)[0]
+        except ValueError:
+            # Keep malformed items for per-video validation below. One bad
+            # identity must not prevent valid observations from being saved.
+            key = ("invalid", index)
+        indexed[key] = video
+    return indexed
 
 
 def merged_config(raw: dict | None) -> dict:
@@ -62,7 +78,7 @@ def public_config(config: dict) -> dict:
     return result
 
 
-class CompetitorMonitorHub(pinchuang.PinchuangHub):
+class CompetitorMonitorHub(CompetitorRecovery, pinchuang.PinchuangHub):
     module_name = "竞对监测"
     require_feishu = False
     config_backup_format = "competitor_monitor_config"
@@ -73,6 +89,16 @@ class CompetitorMonitorHub(pinchuang.PinchuangHub):
 
     def __init__(self, config_path=CONFIG_FILE, state_path=STATE_FILE, *, now=pinchuang.beijing_now):
         super().__init__(config_path, state_path, now=now)
+
+    @staticmethod
+    def _load_author_videos(author):
+        from backend import channels
+        from backend.channels_storage import read_feeds
+        feeds = read_feeds(channels.CHANNELS_FEEDS_FILE)
+        videos = feeds.get(str(author.get("username") or ""))
+        if videos is None:
+            videos = feeds.get(str(author.get("nickname") or ""), [])
+        return [dict(v) for v in videos if isinstance(v, dict)]
 
     def _database_adapter(self, config=None):
         return CompetitorMySQLAdapter((config if config is not None else self.config)["database"])
@@ -120,11 +146,22 @@ class CompetitorMonitorHub(pinchuang.PinchuangHub):
             pause_checkpoint=lambda: self._pause_checkpoint(run_id),
         )["batch_id"]
         while True:
-            snapshot = upload_manager.snapshot()
+            snapshot = upload_manager.snapshot(batch_id=batch_id)
             tasks = [t for t in snapshot.get("items", []) if t.get("batch_id") == batch_id]
             if not tasks:
                 raise RuntimeError("OSS 同步任务状态丢失")
             done = [t for t in tasks if t.get("status") in {"completed", "skipped"}]
+            receipts = {identities[t["video_id"]]: t["oss_url"] for t in done if t.get("oss_url")}
+            progress = getattr(self, "_current_creator_progress", None)
+            if progress is not None:
+                progress["uploaded_videos"] = len(receipts)
+            context = getattr(self, "_active_monitor_checkpoint", None)
+            if context and context[0] == run_id:
+                checkpoint = context[2]
+                if any(checkpoint.get("uploads", {}).get(k) != v for k, v in receipts.items()):
+                    checkpoint.setdefault("uploads", {}).update(receipts)
+                    checkpoint["progress"] = copy.deepcopy(progress or {})
+                    self.journal.save_checkpoint(context[0], context[1], checkpoint)
             with self.lock:
                 # Do not overwrite a pause acknowledgement from the OSS coordinator.
                 if self.resume_event.is_set() and (self.state.get("current_run") or {}).get("status") != "paused":
@@ -138,39 +175,113 @@ class CompetitorMonitorHub(pinchuang.PinchuangHub):
             if not running and not any(t.get("status") in {"pending", "downloading", "uploading"} for t in tasks):
                 if self.stop_event.is_set():
                     raise pinchuang._RunStopping()
-                self._uploaded_video_urls = {identities[t["video_id"]]: t["oss_url"] for t in done if t.get("oss_url")}
+                self._uploaded_video_urls = receipts
                 failures = [{**t, "video_id": identities.get(t.get("video_id"), t.get("video_id"))}
                             for t in tasks if t.get("status") == "failed"]
-                return len(done), failures
+                failures.extend({"video_id": identities[t["video_id"]], "stage": "upload_verify",
+                                 "error": "传输任务已结束，但未返回可用的 OSS 地址"} for t in done if not t.get("oss_url"))
+                return len(receipts), failures
             time.sleep(1)
 
     def _run_creator(self, run_id, sync_batch_id, author, adapter):
-        started_at = pinchuang.format_beijing(self.now())
-        refresh_started = time.time()
-        refreshed_count = self._refresh_author(run_id, author)
-        self._pause_checkpoint(run_id)
-        # Cache entries for deleted/unavailable videos must not become new observations.
-        videos = [v for v in self._load_author_videos(author)
-                  if isinstance(v.get("collected_at"), (int, float)) and v["collected_at"] >= refresh_started]
-        if refreshed_count and not videos:
-            raise RuntimeError("刷新已返回，但没有本轮采集原文，请重启采集工具后重新同步")
-        keyed = {}
+        if isinstance(adapter, CompetitorMySQLAdapter):
+            adapter.retry_checkpoint = lambda: self._pause_checkpoint(run_id)
+        author_id = str(author.get("username") or "")
+        checkpoint = self.journal.checkpoint(run_id, author_id)
+        with self.lock:
+            run = dict(self.state.get("current_run") or {})
+        selection = run.get("retry_selection", {}).get(author_id, {})
+        source = self.journal.checkpoint(run["retry_source_run_id"], author_id) if run.get("retry_source_run_id") else {}
+        started_at = checkpoint.get("started_at") or pinchuang.format_beijing(self.now())
+        progress = self._current_creator_progress = {"started_at": started_at, "stage": "capture"}
+        self._active_monitor_checkpoint = (run_id, author_id, checkpoint)
         failures = {}
+        timings = {}
+        captured = checkpoint.get("observations")
+        if captured is None:
+            refresh_started = time.time()
+            self._last_refresh_task_id = None
+            refreshed_count = self._refresh_author(run_id, author)
+            self._pause_checkpoint(run_id)
+            task_id = self._last_refresh_task_id
+            fresh = [v for v in self._load_author_videos(author)
+                     if (v.get("capture_task_id") == task_id if task_id else
+                         isinstance(v.get("collected_at"), (int, float)) and v["collected_at"] >= refresh_started)]
+            transport = _index_observations(fresh)
+            fresh = list(transport.values())
+            progress["refreshed_videos"] = len(fresh)
+            if refreshed_count and not fresh:
+                raise RuntimeError("刷新已返回，但没有本轮采集原文，请重启采集工具后重新同步")
+            if refreshed_count != len(fresh):
+                failures["__capture__"] = {"stage": "capture", "error_type": "CaptureCountMismatch",
+                    "error": f"采集数量不一致：刷新上报 {refreshed_count} 条，实际保存 {len(fresh)} 条"}
+            captured = fresh
+            # A compensation run refreshes expiring download addresses, but
+            # retains the original observation's metrics and capture time.
+            if source.get("observations") and (selection.get("ids") or selection.get("preserve_observations")):
+                old = _index_observations(source["observations"])
+                captured = []
+                for key in selection.get("ids", old):
+                    observation = copy.deepcopy(old.get(key) or transport.get(key))
+                    if observation is None:
+                        continue
+                    for field in ("video_url", "video_url_h264", "video_url_h265", "decode_key", "decrypt_key"):
+                        if field in transport.get(key, {}):
+                            observation[field] = transport[key][field]
+                    if source.get("uploads", {}).get(key):
+                        observation["oss_video_url"] = source["uploads"][key]
+                        observation["oss_upload_status"] = "completed"
+                    captured.append(observation)
+            if "ids" in selection:
+                wanted = set(selection["ids"])
+                captured_by_key = _index_observations(captured)
+                captured = [v for key, v in captured_by_key.items() if key in wanted]
+                for key in wanted - captured_by_key.keys():
+                    failures[key] = {"video_id": key, "stage": "capture", "error_type": "MissingRetryVideo",
+                                     "error": "未找到待重试作品的采集原文，请核验作品是否仍然可见"}
+            checkpoint.update(observations=copy.deepcopy(captured), started_at=started_at,
+                              capture_failures=list(failures.values()), refreshed_count=refreshed_count,
+                              uploads=checkpoint.get("uploads", {}))
+            self.journal.save_checkpoint(run_id, author_id, checkpoint)
+            timings["capture_seconds"] = round(time.time() - refresh_started, 3)
+        else:
+            for i, failure in enumerate(checkpoint.get("capture_failures", [])):
+                failures[failure.get("video_id") or f"__capture_{i}__"] = failure
+        videos = copy.deepcopy(captured)
+        keyed = {}
         for video in videos:
             try:
                 key, _ = source_key(video)
                 keyed[key] = video
             except ValueError as exc:
-                failures[str(video.get("id") or "未知作品")] = str(exc)
+                key = str(video.get("id") or "未知作品")
+                failures[key] = {"video_id": key, **error_details(exc, "validation")}
+        progress.update(refreshed_videos=len(videos), stage="database_read", failures=list(failures.values()))
         self._update_run(run_id, phase="checking_database", message="正在比对竞对视频主表")
-        existing = adapter.latest_rows(keyed)
-        # Existing rows with a missing URL also need the upload repair path.
-        pending = [v for key, v in keyed.items() if not (existing.get(key) or {}).get("video_url")]
+        existing = adapter.latest_rows(list(keyed))
+        if selection.get("missing_only"):
+            keyed = {k: v for k, v in keyed.items() if not (existing.get(k) or {}).get("video_url")}
+            existing = {k: v for k, v in existing.items() if k in keyed}
+        progress.update(existing_videos=len(existing), new_videos=len(keyed) - len(existing), stage="transfer")
+        pending = []
+        for key, video in keyed.items():
+            if not (existing.get(key) or {}).get("video_url"):
+                if checkpoint.get("uploads", {}).get(key):
+                    video["oss_video_url"] = checkpoint["uploads"][key]
+                    video["oss_upload_status"] = "completed"
+                pending.append(video)
         self._pause_checkpoint(run_id)
+        transfer_started = time.monotonic()
         uploaded, upload_failures = self._sync_new_videos_to_oss(run_id, author, pending)
+        timings["transfer_seconds"] = round(time.monotonic() - transfer_started, 3)
+        progress["uploaded_videos"] = uploaded
         self._pause_checkpoint(run_id)
         for failure in upload_failures:
-            failures[str(failure.get("video_id") or "未知作品")] = str(failure.get("error") or "OSS 同步失败")
+            key = str(failure.get("video_id") or "未知作品")
+            failures[key] = {k: v for k, v in failure.items() if k in {
+                "video_id", "error", "error_type", "error_code", "stage", "error_trace", "download_attempts", "upload_attempts", "attempt_errors"}}
+            failures[key].setdefault("stage", "transfer")
+            failures[key].setdefault("error", "OSS 同步失败")
         latest = {}
         for video in self._load_author_videos(author):
             try:
@@ -179,7 +290,8 @@ class CompetitorMonitorHub(pinchuang.PinchuangHub):
                 pass
         rows = []
         for key, video in keyed.items():
-            # Use the observed counts/time from before uploading; only reload OSS results.
+            if key in failures:
+                continue
             prepared = dict(video)
             for field in ("oss_video_url", "oss_object_key", "oss_bucket", "oss_uploaded_at", "oss_upload_status"):
                 if field in latest.get(key, {}):
@@ -190,19 +302,31 @@ class CompetitorMonitorHub(pinchuang.PinchuangHub):
                 rows.append(build_row(author, prepared, sync_batch_id,
                                       existing_video_url=(existing.get(key) or {}).get("video_url", "")))
             except ValueError as exc:
-                failures[key] = str(exc)
+                failures.setdefault(key, {"video_id": key, **error_details(exc, "validation")})
+        progress.update(stage="database_write", failures=list(failures.values()))
+        checkpoint["progress"] = copy.deepcopy(progress)
+        self.journal.save_checkpoint(run_id, author_id, checkpoint)
         self._update_run(run_id, phase="writing_database", message="正在事务写入视频主表、标签和互动快照")
+        self._pause_checkpoint(run_id)
+        database_started = time.monotonic()
         written = adapter.write_snapshots(rows)
+        timings["database_seconds"] = round(time.monotonic() - database_started, 3)
+        progress["database_written"] = written
+        warnings = []
+        if not selection:
+            previous = [c for r in self.state.get("history", []) for c in r.get("creators", [])
+                        if c.get("author_id") == author_id and c.get("status") == "completed"]
+            if previous and previous[0].get("refreshed_videos", 0) >= 20 and len(videos) < previous[0]["refreshed_videos"] / 2:
+                warnings.append(f"本轮采集 {len(videos)} 条，上次 {previous[0]['refreshed_videos']} 条；请核验下架或可见范围变化")
         return {
-            "author_id": str(author.get("username") or ""),
-            "author_name": str(author.get("nickname") or author.get("username") or ""),
+            "author_id": author_id, "author_name": str(author.get("nickname") or author_id),
             "status": "partial" if failures else "completed",
-            "message": "部分作品失败" if failures else "三表同步完成",
+            "message": ("部分作品失败" if failures else "三表同步完成") + ("；" + "；".join(warnings) if warnings else ""),
             "started_at": started_at, "finished_at": pinchuang.format_beijing(self.now()),
             "refreshed_videos": len(videos), "existing_videos": len(existing),
             "new_videos": len(keyed) - len(existing), "uploaded_videos": uploaded,
             "database_written": written, "failed_items": len(failures),
-            "failures": [{"video_id": key, "error": value} for key, value in failures.items()][:100],
+            "failures": list(failures.values()), "warnings": warnings, "timings": timings,
         }
 
 
@@ -293,6 +417,38 @@ def resume_run_endpoint():
 @competitor_monitor_bp.get("/status")
 def status_endpoint():
     return jsonify(competitor_monitor_hub.snapshot())
+
+
+@competitor_monitor_bp.get("/runs/<run_id>/failures")
+def failures_endpoint(run_id):
+    try:
+        response = jsonify(competitor_monitor_hub.failure_page(
+            run_id, request.args.get("author_id"), int(request.args.get("offset", 0)),
+            int(request.args.get("limit", 50))))
+        response.headers["Cache-Control"] = "no-store"
+        return response
+    except (ValueError, TypeError) as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@competitor_monitor_bp.post("/runs/<run_id>/retry-failed")
+def retry_failed_endpoint(run_id):
+    try:
+        return jsonify(competitor_monitor_hub.retry_failed_run(run_id)), 202
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 409
+
+
+@competitor_monitor_bp.post("/runs/<run_id>/continue")
+def continue_saved_run_endpoint(run_id):
+    try:
+        return jsonify(competitor_monitor_hub.resume_saved_run(run_id)), 202
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 409
 
 
 def _author_tag_store():

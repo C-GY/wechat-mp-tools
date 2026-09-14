@@ -17,6 +17,7 @@ from pathlib import Path
 from flask import Blueprint, jsonify, request
 
 from backend.config import DATA_DIR, OUTPUT_DIR, get_settings, load_json, save_json
+from backend.channels_storage import locked_feeds, read_feeds, atomic_json
 from backend.runtime import launch_chromium
 from backend.channels_favorites import (
     FAVORITES_LOCK, build_favorites_backup, merge_favorites,
@@ -533,6 +534,7 @@ def cookie_acquisition_status():
         return jsonify(_cookie_task)
 
 
+@locked_feeds
 def save_parsed_video_to_db(result):
     """把解析成功的视频和作者信息自动保存到本地作者库和收藏列表"""
     if not result or result.get("errCode") != 0:
@@ -578,7 +580,7 @@ def save_parsed_video_to_db(result):
         
     # 2. 把视频加到作者的作品库中 (CHANNELS_FEEDS_FILE)
     try:
-        feeds_db = load_json(CHANNELS_FEEDS_FILE, {})
+        feeds_db = read_feeds(CHANNELS_FEEDS_FILE)
         if username not in feeds_db:
             feeds_db[username] = []
             
@@ -626,7 +628,7 @@ def save_parsed_video_to_db(result):
             if not exists:
                 feeds_db[username].append(item)
                 
-            save_json(CHANNELS_FEEDS_FILE, feeds_db)
+            atomic_json(CHANNELS_FEEDS_FILE, feeds_db)
     except Exception as ev:
         print(f"自动保存视频到作者库失败: {ev}")
 
@@ -1048,6 +1050,7 @@ def import_favorites_config():
 
 
 @channels_bp.route("/favorites/<username>", methods=["DELETE"])
+@locked_feeds
 def remove_favorite(username):
     """从收藏列表删除视频号作者及其同步的数据"""
     if not username:
@@ -1068,12 +1071,12 @@ def remove_favorite(username):
         save_favorites_atomic(CHANNELS_FAVORITES_FILE, new_favorites)
 
     # 从 Feeds 数据库移除该作者的所有视频/同步数据
-    feeds_db = load_json(CHANNELS_FEEDS_FILE, {})
+    feeds_db = read_feeds(CHANNELS_FEEDS_FILE)
     if username in feeds_db:
         feeds_db.pop(username, None)
     if nickname and nickname in feeds_db:
         feeds_db.pop(nickname, None)
-    save_json(CHANNELS_FEEDS_FILE, feeds_db)
+    atomic_json(CHANNELS_FEEDS_FILE, feeds_db)
 
     return jsonify({"message": "已删除作者及同步数据", "favorites": new_favorites})
 
@@ -1084,12 +1087,13 @@ def get_author_videos(username):
     if not username:
         return jsonify([])
     username = urllib.parse.unquote(username)
-    feeds_db = load_json(CHANNELS_FEEDS_FILE, {})
+    feeds_db = read_feeds(CHANNELS_FEEDS_FILE)
     author_videos = feeds_db.get(username, [])
     return jsonify(author_videos)
 
 
 @channels_bp.route("/author-videos/<username>", methods=["POST"])
+@locked_feeds
 def add_author_video(username):
     """为指定作者添加/保存一条解析成功的视频信息"""
     if not username:
@@ -1100,7 +1104,7 @@ def add_author_video(username):
     if not feed_id:
         return jsonify({"error": "视频 ID 不能为空"}), 400
 
-    feeds_db = load_json(CHANNELS_FEEDS_FILE, {})
+    feeds_db = read_feeds(CHANNELS_FEEDS_FILE)
     if username not in feeds_db:
         feeds_db[username] = []
 
@@ -1116,7 +1120,7 @@ def add_author_video(username):
     if not exists:
         feeds_db[username].append(feed)
 
-    save_json(CHANNELS_FEEDS_FILE, feeds_db)
+    atomic_json(CHANNELS_FEEDS_FILE, feeds_db)
     return jsonify({"message": "视频已保存到作者作品列表", "videos": feeds_db[username]})
 
 
@@ -1128,7 +1132,7 @@ def export_authors():
     data = request.get_json(silent=True) or {}
     username = str(data.get("username") or "").strip()
     favorites = load_json(CHANNELS_FAVORITES_FILE, [])
-    feeds_db = load_json(CHANNELS_FEEDS_FILE, {})
+    feeds_db = read_feeds(CHANNELS_FEEDS_FILE)
 
     try:
         payload = build_authors_export_payload(

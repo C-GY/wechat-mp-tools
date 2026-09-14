@@ -12,6 +12,7 @@ import hmac
 import json
 import os
 import re
+import random
 import sys
 import threading
 import time
@@ -26,6 +27,8 @@ import requests
 from flask import Blueprint, jsonify, request
 
 from backend.config import DATA_DIR, OUTPUT_DIR, get_settings, load_json, save_json
+from backend.channels_storage import locked_feeds, read_feeds, atomic_json
+from backend.sync_errors import IncompleteDownload, TransferHTTPError, error_details, transient_transfer_error
 
 
 oss_bp = Blueprint("oss", __name__, url_prefix="/api/oss")
@@ -37,6 +40,7 @@ DEFAULT_OSS_REGION = "oss-cn-hangzhou"
 LEGACY_OSS_BUCKET = "marketing-video-dashboard"
 DEFAULT_OSS_OBJECT_PREFIX = "wechat_channel"
 OSS_UPLOAD_TASKS_FILE = DATA_DIR / "oss_upload_tasks.json"
+TRANSFER_RETRY_DELAYS = (1, 3, 8)
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9_-]+$")
 _SAFE_ACCESS_KEY_ID = re.compile(r"^[A-Za-z0-9._-]+$")
 _SAFE_BUCKET = re.compile(r"^[A-Za-z0-9._-]+$")
@@ -287,9 +291,9 @@ class OSSService:
         if 200 <= response.status_code < 300:
             return
         body = str(getattr(response, "text", "") or "").strip()[:1000]
-        raise RuntimeError(
+        raise TransferHTTPError(
             f"{operation}失败: HTTP {response.status_code}"
-            + (f": {body}" if body else "")
+            + (f": {body}" if body else ""), response.status_code
         )
 
     def find_uploaded_video(self, material_id: str, scraped_at=None):
@@ -391,6 +395,7 @@ class OSSService:
 class OSSUploadManager:
     def __init__(self):
         self.lock = threading.RLock()
+        self._last_persist_at = 0.0
         self.tasks = []
         self.active_batch_id = ""
         self.worker = None
@@ -409,19 +414,25 @@ class OSSUploadManager:
             self._persist()
 
     def _persist(self):
-        save_json(OSS_UPLOAD_TASKS_FILE, self.tasks[-100000:])
+        atomic_json(OSS_UPLOAD_TASKS_FILE, self.tasks[-100000:])
+        self._last_persist_at = time.monotonic()
 
     def _update(self, task_id: str, **changes):
         with self.lock:
             for task in self.tasks:
                 if task.get("id") == task_id:
+                    state_changed = any(task.get(key) != changes[key] for key in ("status", "stage") if key in changes)
                     task.update(changes)
                     task["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-                    self._persist()
+                    # Polling reads memory. Persist every transition/receipt,
+                    # but coalesce byte counters across all network workers.
+                    if (state_changed or "attempt_errors" in changes or "oss_url" in changes
+                            or time.monotonic() - self._last_persist_at >= 3):
+                        self._persist()
                     return task.copy()
         return None
 
-    def snapshot(self):
+    def snapshot(self, batch_id=None):
         with self.lock:
             # Keep live work visible first, then show newer published works first.
             # The original list is retained for persistence; only the API view is sorted.
@@ -439,9 +450,10 @@ class OSSUploadManager:
                     -index,
                 )
 
-            ordered_tasks = sorted(enumerate(self.tasks), key=sort_key)
+            selected = [t for t in self.tasks if batch_id is None or t.get("batch_id") == batch_id]
+            ordered_tasks = sorted(enumerate(selected), key=sort_key)
             items = [dict(task) for _, task in ordered_tasks]
-            statuses = [task.get("status") for task in self.tasks]
+            statuses = [task.get("status") for task in selected]
             return {
                 "items": items,
                 "stats": {
@@ -471,7 +483,7 @@ class OSSUploadManager:
         from backend import channels
 
         favorites = load_json(channels.CHANNELS_FAVORITES_FILE, [])
-        feeds_db = load_json(channels.CHANNELS_FEEDS_FILE, {})
+        feeds_db = read_feeds(channels.CHANNELS_FEEDS_FILE)
         if not isinstance(favorites, list) or not favorites:
             raise ValueError("暂无已收藏创作者")
 
@@ -489,7 +501,7 @@ class OSSUploadManager:
             raise ValueError("作者 ID 不能为空或过长")
 
         favorites = load_json(channels.CHANNELS_FAVORITES_FILE, [])
-        feeds_db = load_json(channels.CHANNELS_FEEDS_FILE, {})
+        feeds_db = read_feeds(channels.CHANNELS_FEEDS_FILE)
         if not isinstance(feeds_db, dict):
             feeds_db = {}
         favorite = next(
@@ -625,6 +637,7 @@ class OSSUploadManager:
         services = []
         local = threading.local()
         cached_paths = set()
+        retry_due = {}
         download_limit, upload_limit = transfer["download_workers"], transfer["upload_workers"]
 
         def stopped():
@@ -632,6 +645,32 @@ class OSSUploadManager:
 
         def paused():
             return resume_event is not None and not resume_event.is_set()
+
+        def due(queue):
+            for _ in range(len(queue)):
+                candidate = queue.popleft()
+                if retry_due.get(candidate[0]["id"], 0) <= time.monotonic():
+                    return candidate
+                queue.append(candidate)
+            return None
+
+        def attempt(task, stage):
+            field = stage + "_attempts"
+            self._update(task["id"], **{field: int(task.get(field, 0)) + 1}, stage=stage,
+                         next_retry_at="")
+
+        def failed(task, exc, stage):
+            details = error_details(exc, stage)
+            attempts = int(task.get(stage + "_attempts", 1))
+            history = [*task.get("attempt_errors", []), {**{k: v for k, v in details.items() if k != "error_trace"}, "attempt": attempts,
+                       "at": time.strftime("%Y-%m-%d %H:%M:%S")}]
+            retry = not stopped() and transient_transfer_error(exc) and attempts <= len(TRANSFER_RETRY_DELAYS)
+            delay = TRANSFER_RETRY_DELAYS[attempts - 1] * random.uniform(0.8, 1.2) if retry else 0
+            retry_due[task["id"]] = time.monotonic() + delay
+            self._update(task["id"], **details, attempt_errors=history,
+                         status="pending" if retry else "failed",
+                         next_retry_at=time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() + delay)) if retry else "")
+            return retry
 
         def service_for_thread():
             if not hasattr(local, "service"):
@@ -672,7 +711,7 @@ class OSSUploadManager:
             self._save_video_result(task, result)
             self._update(task["id"], status=status, progress=100, oss_url=result["url"],
                          object_key=result["object_key"], uploaded_bytes=result.get("size", 0),
-                         total_bytes=result.get("size", 0), error="")
+                         total_bytes=result.get("size", 0), error="", stage="completed", next_retry_at="")
 
         try:
             # Freeze credentials and destination once for this entire batch.
@@ -700,43 +739,65 @@ class OSSUploadManager:
                         continue
                     if not stopped() and not paused():
                         while ready and len(uploads) < upload_limit and not paused() and not stopped():
-                            task, video, path = ready.popleft()
+                            candidate = due(ready)
+                            if candidate is None:
+                                break
+                            task, video, path = candidate
+                            attempt(task, "upload")
                             uploads[upload_pool.submit(upload, task, video, path)] = (task, video, path)
                         while (pending and len(downloads) < download_limit
                                and len(ready) + len(downloads) < download_limit + upload_limit
                                and not paused() and not stopped()):
-                            task, video = pending.popleft()
+                            candidate = due(pending)
+                            if candidate is None:
+                                break
+                            task, video = candidate
+                            attempt(task, "download")
                             downloads[download_pool.submit(prepare, task, video)] = (task, video)
                     active = list(downloads) + list(uploads)
                     if not active:
+                        if stop_event is not None:
+                            stop_event.wait(0.05)
+                        else:
+                            time.sleep(0.05)
                         continue
                     finished, _ = wait(active, timeout=0.1, return_when=FIRST_COMPLETED)
                     for future in finished:
                         if future in downloads:
                             task, video = downloads.pop(future)
+                            stage = "download"
                             try:
                                 path, remote = future.result()
                                 if remote:
+                                    stage = "persist"
                                     record(task, remote, "skipped")
                                 else:
                                     cached_paths.add(path)
                                     ready.append((task, video, path))
                                     self._update(task["id"], status="pending", progress=0, uploaded_bytes=0)
                             except Exception as exc:
-                                self._update(task["id"], status="failed", error=str(exc))
+                                if failed(task, exc, stage):
+                                    pending.append((task, video))
                         else:
-                            task, _, path = uploads.pop(future)
+                            task, video, path = uploads.pop(future)
+                            retry = False
+                            stage = "upload"
                             try:
-                                record(task, future.result(), "completed")
+                                result = future.result()
+                                stage = "persist"
+                                record(task, result, "completed")
                             except Exception as exc:
-                                self._update(task["id"], status="failed", error=str(exc))
+                                retry = failed(task, exc, stage)
+                                if retry:
+                                    ready.append((task, video, path))
                             finally:
-                                self._remove_cache_file(path)
-                                cached_paths.discard(path)
+                                if not retry:
+                                    self._remove_cache_file(path)
+                                    cached_paths.discard(path)
         except Exception as exc:
             for task, _ in candidates:
                 if task.get("status") in {"pending", "downloading", "uploading"}:
-                    self._update(task["id"], status="failed", error=str(exc))
+                    self._update(task["id"], status="failed", **error_details(exc, "configuration"))
         finally:
             for service in services:
                 service.session.close()
@@ -750,12 +811,26 @@ class OSSUploadManager:
         except OSError:
             pass
 
+    def _retry_transfer(self, task, stage, operation):
+        history = list(task.get("attempt_errors", []))
+        for attempt in range(1, len(TRANSFER_RETRY_DELAYS) + 2):
+            self._update(task["id"], stage=stage, **{stage + "_attempts": attempt})
+            try:
+                return operation()
+            except Exception as exc:
+                details = error_details(exc, stage)
+                history.append({**{k: v for k, v in details.items() if k != "error_trace"}, "attempt": attempt, "at": time.strftime("%Y-%m-%d %H:%M:%S")})
+                self._update(task["id"], **details, attempt_errors=history)
+                if not transient_transfer_error(exc) or attempt > len(TRANSFER_RETRY_DELAYS):
+                    raise
+                time.sleep(TRANSFER_RETRY_DELAYS[attempt - 1] * random.uniform(0.8, 1.2))
+
     def _run_batch(self, batch_id, candidates):
         try:
             service = OSSService.from_saved_config()
         except Exception as exc:
             for task, _ in candidates:
-                self._update(task["id"], status="failed", error=str(exc))
+                self._update(task["id"], status="failed", **error_details(exc, "configuration"))
             return
 
         for task, video in candidates:
@@ -771,8 +846,9 @@ class OSSUploadManager:
                 )
                 continue
             temp_path = None
+            stage = "download"
             try:
-                temp_path = self._download_video(task_id, video)
+                temp_path = self._retry_transfer(task, stage, lambda: self._download_video(task_id, video))
                 last_saved_percent = -1
                 last_saved_at = 0.0
 
@@ -796,12 +872,10 @@ class OSSUploadManager:
                         total_bytes=total,
                     )
 
-                result = service.upload_video(
-                    temp_path,
-                    task["video_id"],
-                    video.get("createtime"),
-                    on_progress,
-                )
+                stage = "upload"
+                result = self._retry_transfer(task, stage, lambda: service.upload_video(
+                    temp_path, task["video_id"], video.get("createtime"), on_progress))
+                stage = "persist"
                 self._save_video_result(task, result)
                 self._update(
                     task_id,
@@ -818,7 +892,7 @@ class OSSUploadManager:
                 except OSError:
                     pass
             except Exception as exc:
-                self._update(task_id, status="failed", error=str(exc))
+                self._update(task_id, status="failed", **error_details(exc, stage))
 
     def _download_video(self, task_id: str, video: dict, *, isolated=False) -> Path:
         from backend.channels import decrypt_channels_data
@@ -881,6 +955,8 @@ class OSSUploadManager:
                             uploaded_bytes=downloaded,
                             total_bytes=total,
                         )
+            if downloaded <= 0 or (total and downloaded != total):
+                raise IncompleteDownload(f"视频下载不完整：已收到 {downloaded} 字节，预期 {total} 字节")
             decrypt_key = video.get("decode_key") or video.get("decrypt_key")
             if decrypt_key and int(decrypt_key) > 0:
                 with partial.open("r+b") as output:
@@ -901,10 +977,11 @@ class OSSUploadManager:
         return file_path
 
     @staticmethod
+    @locked_feeds
     def _save_video_result(task: dict, result: dict):
         from backend import channels
 
-        feeds_db = load_json(channels.CHANNELS_FEEDS_FILE, {})
+        feeds_db = read_feeds(channels.CHANNELS_FEEDS_FILE)
         feed_key = task.get("feed_key") or task.get("username")
         videos = feeds_db.get(feed_key)
         if not isinstance(videos, list):
@@ -918,7 +995,7 @@ class OSSUploadManager:
                 video["oss_upload_status"] = "completed"
                 video["oss_uploaded_at"] = int(time.time())
                 break
-        save_json(channels.CHANNELS_FEEDS_FILE, feeds_db)
+        atomic_json(channels.CHANNELS_FEEDS_FILE, feeds_db)
 
 
 upload_manager = OSSUploadManager()

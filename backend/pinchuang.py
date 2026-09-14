@@ -660,7 +660,15 @@ class PinchuangHub:
         current = self.state.get("current_run")
         self.interrupted_run = None
         self.recoverable_run_id = None
-        if (isinstance(current, dict) and current.get("wechat_recovery")
+        if (getattr(self, "resume_after_restart", False) and isinstance(current, dict)
+                and current.get("status") in _ACTIVE_RUN_STATUSES):
+            current["interruption_detected_at"] = format_beijing(self.now())
+            if current.get("status") in {"paused", "pausing"}:
+                current.update(status="paused", phase="paused", message="软件已重启，点击继续恢复已保存的进度")
+            else:
+                self.recoverable_run_id = current["run_id"]
+                current.update(phase="recovering", message="软件已重启，将继续未完成任务")
+        elif (isinstance(current, dict) and current.get("wechat_recovery")
                 and current.get("status") in {"queued", "running"}):
             self.recoverable_run_id = current["run_id"]
             current.update(phase="waiting_wechat", message="软件已重启，将自动恢复等待中的视频号同步")
@@ -685,8 +693,8 @@ class PinchuangHub:
         if not isinstance(current, dict):
             return
         history = self.state.setdefault("history", [])
-        if not any(item.get("run_id") == current.get("run_id") for item in history):
-            history.insert(0, json.loads(json.dumps(current, default=str)))
+        history[:] = [item for item in history if item.get("run_id") != current.get("run_id")]
+        history.insert(0, json.loads(json.dumps(current, default=str)))
         self.state["history"] = history[:100]
 
     def get_config(self) -> dict:
@@ -938,7 +946,7 @@ class PinchuangHub:
             "timezone": "Asia/Shanghai",
         }
 
-    def start_run(self, *, trigger="manual", scheduled_time="") -> dict:
+    def start_run(self, *, trigger="manual", scheduled_time="", run_options=None) -> dict:
         with self.lock:
             self._validate_database_config(self.config)
             if not get_oss_config().get("configured"):
@@ -947,6 +955,9 @@ class PinchuangHub:
                 raise ValueError("请先配置飞书机器人 Webhook")
             if self.worker and self.worker.is_alive():
                 raise RuntimeError(f"已有{self.module_name}同步任务正在运行")
+            if (getattr(self, "resume_after_restart", False)
+                    and (self.state.get("current_run") or {}).get("status") in _ACTIVE_RUN_STATUSES):
+                raise RuntimeError("存在未完成的同步任务，请先继续该任务")
             self.resume_event.set()
             self._pause_context.clear()
             now_text = format_beijing(self.now())
@@ -975,7 +986,11 @@ class PinchuangHub:
                 "failed_items": 0,
                 "creators": [],
             }
+            if run_options:
+                run.update(run_options)
+            self._archive_current_locked()
             self.state["current_run"] = run
+            self.stop_event.clear()
             self._persist_state_locked()
             self.worker = threading.Thread(
                 target=self._run_pipeline,
@@ -1119,12 +1134,22 @@ class PinchuangHub:
             self._persist_state_locked()
             return dict(run)
 
+    def _creator_failure_result(self, author, exc, started_at):
+        from backend.sync_errors import error_details
+        details = error_details(exc, "creator")
+        return {"author_id": author["username"], "author_name": author.get("nickname") or author["username"],
+                "status": "failed", "message": details["error"], "started_at": started_at,
+                "finished_at": format_beijing(self.now()), "refreshed_videos": 0,
+                "existing_videos": 0, "new_videos": 0, "uploaded_videos": 0,
+                "database_written": 0, "failed_items": 1, "failures": [details]}
+
     def _creator_result(self, run_id: str, result: dict):
         with self.lock:
             run = self.state.get("current_run")
             if not isinstance(run, dict) or run.get("run_id") != run_id:
                 return
-            run.setdefault("creators", []).append(result)
+            run["creators"] = [r for r in run.get("creators", []) if r.get("author_id") != result.get("author_id")]
+            run["creators"].append(result)
             self._persist_state_locked()
 
     def _finish_run(self, run_id: str, status: str, message: str):
@@ -1148,14 +1173,18 @@ class PinchuangHub:
             self.resume_event.set()
 
     def _refresh_author(self, run_id: str, author: dict) -> int:
-        from backend.channels_refresh import get_refresh_status, start_refresh_task
+        from backend.channels_refresh import get_refresh_status, start_refresh_task, update_refresh_task
 
-        task, created = start_refresh_task([author])
+        task, created = start_refresh_task([author], require_receipt=getattr(self, "require_capture_receipt", False))
         if not created:
             raise RuntimeError("另一个视频号刷新任务正在运行")
         task_id = task["task_id"]
+        self._last_refresh_task_id = task_id
         deadline = time.monotonic() + 30 * 60
         while time.monotonic() < deadline:
+            if self.stop_event.is_set():
+                update_refresh_task({"task_id": task_id, "status": "cancelled", "message": "软件正在退出，保留进度供下次恢复"})
+                raise _RunStopping()
             status = get_refresh_status(task_id)
             if not status:
                 raise RuntimeError("视频号刷新任务状态丢失")
@@ -1171,6 +1200,7 @@ class PinchuangHub:
             if status.get("status") in {"failed", "cancelled"}:
                 raise RuntimeError(status.get("message") or "创作者刷新失败")
             time.sleep(1)
+        update_refresh_task({"task_id": task_id, "status": "cancelled", "message": "创作者刷新超过 30 分钟，已结束该采集任务"})
         raise TimeoutError("创作者刷新超过 30 分钟")
 
     def _sync_new_videos_to_oss(
@@ -1377,6 +1407,8 @@ class PinchuangHub:
                     current_creator_name=author_name,
                     message=f"正在检查视频号环境：{index}/{len(authors)} {author_name}",
                 )
+                creator_started_at = format_beijing(self.now())
+                self._current_creator_progress = {}
                 try:
                     self._wait_for_wechat(run_id)
                     result = self._run_creator(
@@ -1395,21 +1427,7 @@ class PinchuangHub:
                     raise
                 except Exception as exc:
                     totals["failed_creators"] += 1
-                    result = {
-                        "author_id": author_id,
-                        "author_name": author_name,
-                        "status": "failed",
-                        "message": str(exc),
-                        "started_at": format_beijing(self.now()),
-                        "finished_at": format_beijing(self.now()),
-                        "refreshed_videos": 0,
-                        "existing_videos": 0,
-                        "new_videos": 0,
-                        "uploaded_videos": 0,
-                        "database_written": 0,
-                        "failed_items": 1,
-                        "failures": [{"error": str(exc)}],
-                    }
+                    result = self._creator_failure_result(author, exc, creator_started_at)
                     notifier.send(
                         f"{self.module_name}创作者同步失败",
                         f"创作者：{author_name}\n批次：{run['sync_batch_id']}\n原因：{exc}",
