@@ -13,6 +13,8 @@ import threading
 import subprocess
 from pathlib import Path
 from backend.config import DATA_DIR
+from backend.proxy_logging import runtime_logger
+from backend.sync_errors import redact_error
 
 # Force unbuffered output for real-time background logging
 import builtins
@@ -238,6 +240,9 @@ def _run_certutil(args, check=False):
         return subprocess.run(
             [certutil] + list(args),
             capture_output=True, check=check, env=env, cwd=system32,
+            # Redirecting output does not suppress a console created by a
+            # windowless EXE; status polling must not flash a window each time.
+            creationflags=subprocess.CREATE_NO_WINDOW,
         )
     return subprocess.run(["certutil"] + list(args), capture_output=True, check=check)
 
@@ -466,6 +471,7 @@ def set_mac_proxy(enabled, host="127.0.0.1", port=5202):
             subprocess.run(["networksetup", "-setsecurewebproxystate", service, "off"], check=True)
     except Exception as e:
         print(f"Error setting Mac proxy state to {enabled}: {e}")
+        raise RuntimeError(f"设置 macOS 系统代理失败: {e}") from e
 
 def set_windows_proxy(enabled, host="127.0.0.1", port=5202):
     try:
@@ -496,6 +502,7 @@ def set_windows_proxy(enabled, host="127.0.0.1", port=5202):
         internet_set_option(0, 37, 0, 0) # INTERNET_OPTION_REFRESH
     except Exception as e:
         print(f"Error setting Windows proxy state to {enabled}: {e}")
+        raise RuntimeError(f"设置 Windows 系统代理失败: {e}") from e
 
 def set_system_proxy(enabled, port=5202):
     if sys.platform == "darwin":
@@ -1608,10 +1615,40 @@ class ProxyManager:
         self.loop = None
         self.master = None
         self.port = 5202
+        self.last_error = ""
+        self._lifecycle_lock = threading.RLock()
+        self._state_lock = threading.RLock()
+        self._startup_event = threading.Event()
+        self._stop_requested = threading.Event()
+        self._finished = threading.Event()
+        self._finished.set()
+        self._ready = False
+        self._proxy_enabled = False
+        self._no_proxy_set = False
+        self.startup_timeout = 10.0
 
     def start(self):
-        if self.running:
-            return True
+        # Serialize start/stop callers, without blocking the worker's cleanup.
+        with self._lifecycle_lock:
+            if self.running and self.thread and self.thread.is_alive():
+                return True
+            if self.thread and self.thread.is_alive():
+                raise RuntimeError("上一次监听服务仍在退出，请稍后重试。")
+            self.last_error = ""
+            logger = runtime_logger(DATA_DIR)
+            logger.info("Starting listener on 127.0.0.1:%s", self.port)
+            try:
+                return self._start()
+            except Exception as exc:
+                self.last_error = redact_error(exc)
+                logger.exception("Listener startup failed")
+                try:
+                    self.stop()
+                except Exception:
+                    logger.exception("Listener startup rollback failed")
+                raise RuntimeError(self.last_error) from exc
+
+    def _start(self):
 
         reset_channels_pages()
         cleanup_mitmproxy_logging_handlers()
@@ -1678,98 +1715,155 @@ class ProxyManager:
         # 1. 安装并信任证书
         cert_ok = install_system_cert(CA_CERT_PATH)
         if not cert_ok:
-            print("[WARNING] CA 证书可能未被系统信任，MITM 拦截可能失败。"
-                  "请检查是否有其他 VPN/安全软件的证书冲突。")
+            raise RuntimeError("CA 证书未能安装并受信任，未开启系统代理。请先完成证书安装后重试。")
 
         # 2. 把我们的 CA 喂给 mitmproxy
         confdir = prepare_mitm_confdir()
 
         # 3. 在后台线程里跑 mitmproxy 的 asyncio 事件循环
-        self.running = True
+        self._startup_event.clear()
+        self._stop_requested.clear()
+        self._finished.clear()
+        self._ready = False
+        self.master = None
+        self.loop = None
         self.thread = threading.Thread(
-            target=self._run_server, args=(str(confdir),), daemon=True
+            target=self._run_server, args=(str(confdir),), daemon=True, name="ChannelsProxy"
         )
         self.thread.start()
 
-        # 4. 设置 NO_PROXY=* 使 Python 后端代码绕过系统代理（仅浏览器需走 MITM）
-        _set_no_proxy()
-
-        # 5. 开启系统代理（浏览器/微信客户端会走此代理）
-        set_system_proxy(True, port=self.port)
+        # Never redirect WeChat traffic until mitmproxy has actually bound its socket.
+        if not self._startup_event.wait(self.startup_timeout):
+            raise RuntimeError(f"监听服务启动超时（端口 {self.port}），未开启系统代理。")
+        with self._state_lock:
+            if not self._ready or self._finished.is_set() or not self.thread.is_alive():
+                raise RuntimeError(self.last_error or "监听服务在启动期间退出，未开启系统代理。")
+            _set_no_proxy()
+            self._no_proxy_set = True
+            # Set first so even a partially failed OS update is undone on failure.
+            self._proxy_enabled = True
+            set_system_proxy(True, port=self.port)
+            self.running = True
+        runtime_logger(DATA_DIR).info("Listener ready; system proxy enabled on port %s", self.port)
         print(f"Channels MITM proxy started on 127.0.0.1:{self.port} and system proxy enabled.")
         return True
 
     def stop(self):
-        if not self.running:
+        with self._lifecycle_lock:
+            self._stop_requested.set()
+            with self._state_lock:
+                self._deactivate_locked()
+                master = self.master
+            if master and self.thread and self.thread.is_alive():
+                try:
+                    master.shutdown()
+                except RuntimeError:
+                    pass  # The event loop may have finished concurrently.
+            if self.thread and self.thread.is_alive():
+                self.thread.join(timeout=5)
+            if self.thread and self.thread.is_alive():
+                # Keep the reference: another start must not race this worker.
+                raise RuntimeError("系统代理已关闭，但监听线程尚未退出，请稍后重试。")
+            self.master = self.loop = self.thread = None
+            reset_channels_pages()
+            cleanup_mitmproxy_logging_handlers()
+            runtime_logger(DATA_DIR).info("Listener stopped")
+            if self._proxy_enabled:
+                raise RuntimeError(self.last_error)
             return True
 
+    def _deactivate_locked(self):
         self.running = False
-
-        # 还原系统代理
-        set_system_proxy(False, port=self.port)
-
-        # 关闭 mitmproxy
-        if self.master and self.loop:
+        if self._proxy_enabled:
             try:
-                self.loop.call_soon_threadsafe(self.master.shutdown)
-            except Exception as e:
-                print(f"Error shutting down mitmproxy: {e}")
-
-        # 等待后台线程完全退出以确保关闭完成
-        if self.thread and self.thread.is_alive():
-            try:
-                self.thread.join(timeout=5)
+                set_system_proxy(False, port=self.port)
+                self._proxy_enabled = False
             except Exception:
-                pass
-
-        self.master = None
-        self.loop = None
-        self.thread = None
-
-        reset_channels_pages()
-        cleanup_mitmproxy_logging_handlers()
-
-        # 还原 NO_PROXY 环境变量
-        _restore_no_proxy()
-
-        print("Channels MITM proxy stopped and system proxy disabled.")
-        return True
+                self.last_error = "关闭系统代理失败，请在 Windows 代理设置中关闭手动代理。"
+                runtime_logger(DATA_DIR).exception(self.last_error)
+        if self._no_proxy_set:
+            _restore_no_proxy()
+            self._no_proxy_set = False
 
     def _run_server(self, confdir):
         import asyncio
-        from mitmproxy.tools.dump import DumpMaster
-        from mitmproxy import options
-
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        self.loop = loop
-
-        async def _serve():
-            opts = options.Options(
-                listen_host="127.0.0.1",
-                listen_port=self.port,
-                confdir=confdir,
-                # 只解密这两个域名,其余 CONNECT 直接透传(不碰证书、不碰内容)
-                allow_hosts=[
-                    r"channels\.weixin\.qq\.com",
-                    r"mp\.weixin\.qq\.com",
-                    r"res\.wx\.qq\.com",
-                ],
-            )
-            master = DumpMaster(opts, with_termlog=False, with_dumper=False)
-            master.addons.add(ChannelsAddon())
-            self.master = master
-            try:
-                await master.run()
-            except Exception as e:
-                print(f"[Proxy] mitmproxy run error: {e}")
-
+        logger = runtime_logger(DATA_DIR)
+        loop = None
+        owner = self
         try:
+            from mitmproxy.tools.dump import DumpMaster
+            from mitmproxy import options
+
+            class ReadyAddon:
+                async def running(self):
+                    master = owner.master
+                    errorcheck = master.addons.get("errorcheck")
+                    if errorcheck:
+                        await errorcheck.shutdown_if_errored()
+                    server = master.addons.get("proxyserver")
+                    if not server or not any(addr[1] == owner.port for addr in server.listen_addrs()):
+                        raise RuntimeError("代理未绑定预期监听端口")
+                    with owner._state_lock:
+                        if owner._stop_requested.is_set():
+                            master.shutdown()
+                        else:
+                            owner._ready = True
+                            owner._startup_event.set()
+
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            self.loop = loop
+
+            async def _serve():
+                opts = options.Options(
+                    listen_host="127.0.0.1", listen_port=self.port, confdir=confdir,
+                    allow_hosts=[
+                        r"channels\.weixin\.qq\.com",
+                        r"mp\.weixin\.qq\.com",
+                        r"res\.wx\.qq\.com",
+                    ],
+                )
+                master = DumpMaster(opts, with_termlog=False, with_dumper=False)
+                self.master = master
+                master.addons.add(ChannelsAddon(), ReadyAddon())
+                if self._stop_requested.is_set():
+                    return
+                await master.run()
+
             loop.run_until_complete(_serve())
-        except Exception as e:
-            print(f"[Proxy] event loop error: {e}")
+        except BaseException as exc:
+            # mitmproxy's ErrorCheck uses SystemExit, which is not an Exception.
+            # Catch it at this worker boundary so it cannot strand the OS proxy.
+            details = ""
+            if self.master and (check := self.master.addons.get("errorcheck")):
+                details = "; ".join(r.getMessage() for r in check.logger.has_errored)
+            self.last_error = redact_error(details or f"{type(exc).__name__}: {exc}")[:2000]
+            logger.exception("Listener worker failed: %s", self.last_error)
         finally:
+            with self._state_lock:
+                self._finished.set()
+                if not self._stop_requested.is_set() and not self.last_error:
+                    self.last_error = "监听服务意外退出，请重新启动；详情见监听运行日志。"
+                    logger.error(self.last_error)
+                self._deactivate_locked()
+                self._startup_event.set()
+            reset_channels_pages()
             try:
-                loop.close()
+                if loop is not None:
+                    async def close_connections():
+                        if self.master and (server := self.master.addons.get("proxyserver")):
+                            await server.servers.update([])
+                    loop.run_until_complete(close_connections())
+                    pending = asyncio.all_tasks(loop)
+                    for task in pending:
+                        task.cancel()
+                    if pending:
+                        loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                    loop.run_until_complete(loop.shutdown_asyncgens())
             except Exception:
-                pass
+                logger.exception("Listener connection cleanup failed")
+            finally:
+                cleanup_mitmproxy_logging_handlers()
+                if loop is not None:
+                    loop.close()
+                logger.info("Listener worker exited")

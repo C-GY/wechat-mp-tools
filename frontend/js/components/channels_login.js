@@ -3,6 +3,7 @@
  */
 const ChannelsLoginPage = {
     cookiePollTimer: null,
+    proxyPollTimer: null,
     settings: {},
 
     render() {
@@ -88,6 +89,7 @@ const ChannelsLoginPage = {
                             3. 视频号网页打开后即进入监听，可继续同步作者作品。
                         </div>
                         <div id="wechat-environment-status" style="display: none; margin-top: 10px; padding: 8px 10px; border-radius: 8px; font-size: 0.8rem; line-height: 1.45;"></div>
+                        <div id="proxy-runtime-error" role="alert" style="display: none; margin-top: 10px; color: var(--error, #e53e3e); font-size: 0.85rem; white-space: pre-wrap; overflow-wrap: anywhere;"></div>
                         </div>
                     </div>
                     
@@ -116,9 +118,23 @@ const ChannelsLoginPage = {
     async init() {
         await this.loadSettings();
         await this.checkProxyStatus();
+        if (this.proxyPollTimer) clearInterval(this.proxyPollTimer);
+        this.proxyPollTimer = setInterval(() => {
+            // Cached routes are hidden rather than destroyed when navigating.
+            const badge = document.getElementById('proxy-status-badge');
+            if (badge && badge.getClientRects().length) this.checkProxyStatus();
+        }, 3000);
+    },
+
+    onShow() {
+        return this.checkProxyStatus();
     },
 
     destroy() {
+        if (this.proxyPollTimer) {
+            clearInterval(this.proxyPollTimer);
+            this.proxyPollTimer = null;
+        }
         if (this.cookiePollTimer) {
             clearInterval(this.cookiePollTimer);
             this.cookiePollTimer = null;
@@ -266,6 +282,13 @@ const ChannelsLoginPage = {
         const uninstallBtn = document.getElementById('btn-uninstall-cert');
         
         if (!proxyBadge || !toggleBtn) return;
+
+        const runtimeError = document.getElementById('proxy-runtime-error');
+        if (runtimeError) {
+            runtimeError.style.display = status.last_error ? 'block' : 'none';
+            runtimeError.textContent = status.last_error
+                ? `${status.last_error}\n运行日志：${status.log_path || ''}` : '';
+        }
         
         if (status.proxy_running) {
             proxyBadge.textContent = '运行中';
@@ -276,7 +299,7 @@ const ChannelsLoginPage = {
             toggleBtn.style.borderColor = 'rgba(255,59,48,0.2)';
             toggleBtn.style.color = '#ff3b30';
         } else {
-            proxyBadge.textContent = '已关闭';
+            proxyBadge.textContent = status.last_error ? '监听异常' : '已关闭';
             proxyBadge.style.background = 'rgba(0,0,0,0.08)';
             proxyBadge.style.color = 'var(--text-secondary)';
             toggleBtn.textContent = '🚀 启动同步助手';
@@ -315,6 +338,7 @@ const ChannelsLoginPage = {
             await this.checkProxyStatus();
         } catch (err) {
             Toast.error('同步助手操作失败: ' + err.message);
+            await this.checkProxyStatus();
         } finally {
             if (toggleBtn) toggleBtn.disabled = false;
         }

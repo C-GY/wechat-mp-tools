@@ -1215,7 +1215,9 @@ def get_proxy_status():
     return jsonify({
         "proxy_running": manager.running,
         "cert_installed": check_cert_trusted(),
-        "proxy_port": manager.port
+        "proxy_port": manager.port,
+        "last_error": manager.last_error,
+        "log_path": str(DATA_DIR / "proxy_runtime.log"),
     })
 
 
