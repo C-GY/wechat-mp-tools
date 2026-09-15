@@ -1,0 +1,429 @@
+{
+  "description": "Anonymized confirmed-save times from the 2026-09-14 timeout. No API payloads, identifiers or credentials.",
+  "progress": [
+    {
+      "seconds": 18.181,
+      "saved_count": 15
+    },
+    {
+      "seconds": 34.779,
+      "saved_count": 30
+    },
+    {
+      "seconds": 51.351,
+      "saved_count": 45
+    },
+    {
+      "seconds": 67.324,
+      "saved_count": 60
+    },
+    {
+      "seconds": 83.083,
+      "saved_count": 75
+    },
+    {
+      "seconds": 98.401,
+      "saved_count": 90
+    },
+    {
+      "seconds": 114.517,
+      "saved_count": 105
+    },
+    {
+      "seconds": 130.386,
+      "saved_count": 120
+    },
+    {
+      "seconds": 146.5,
+      "saved_count": 135
+    },
+    {
+      "seconds": 162.799,
+      "saved_count": 150
+    },
+    {
+      "seconds": 178.299,
+      "saved_count": 165
+    },
+    {
+      "seconds": 194.465,
+      "saved_count": 180
+    },
+    {
+      "seconds": 210.378,
+      "saved_count": 195
+    },
+    {
+      "seconds": 226.279,
+      "saved_count": 210
+    },
+    {
+      "seconds": 242.48,
+      "saved_count": 225
+    },
+    {
+      "seconds": 259.518,
+      "saved_count": 240
+    },
+    {
+      "seconds": 275.396,
+      "saved_count": 255
+    },
+    {
+      "seconds": 292.072,
+      "saved_count": 270
+    },
+    {
+      "seconds": 308.577,
+      "saved_count": 285
+    },
+    {
+      "seconds": 324.476,
+      "saved_count": 300
+    },
+    {
+      "seconds": 340.524,
+      "saved_count": 315
+    },
+    {
+      "seconds": 356.745,
+      "saved_count": 330
+    },
+    {
+      "seconds": 373.669,
+      "saved_count": 345
+    },
+    {
+      "seconds": 389.371,
+      "saved_count": 360
+    },
+    {
+      "seconds": 405.543,
+      "saved_count": 375
+    },
+    {
+      "seconds": 423.032,
+      "saved_count": 390
+    },
+    {
+      "seconds": 438.714,
+      "saved_count": 405
+    },
+    {
+      "seconds": 454.63,
+      "saved_count": 420
+    },
+    {
+      "seconds": 470.688,
+      "saved_count": 435
+    },
+    {
+      "seconds": 486.703,
+      "saved_count": 450
+    },
+    {
+      "seconds": 502.538,
+      "saved_count": 465
+    },
+    {
+      "seconds": 518.534,
+      "saved_count": 480
+    },
+    {
+      "seconds": 535.033,
+      "saved_count": 495
+    },
+    {
+      "seconds": 551.811,
+      "saved_count": 510
+    },
+    {
+      "seconds": 568.861,
+      "saved_count": 525
+    },
+    {
+      "seconds": 584.89,
+      "saved_count": 540
+    },
+    {
+      "seconds": 602.06,
+      "saved_count": 555
+    },
+    {
+      "seconds": 618.03,
+      "saved_count": 570
+    },
+    {
+      "seconds": 633.819,
+      "saved_count": 585
+    },
+    {
+      "seconds": 649.981,
+      "saved_count": 600
+    },
+    {
+      "seconds": 666.262,
+      "saved_count": 615
+    },
+    {
+      "seconds": 683.719,
+      "saved_count": 630
+    },
+    {
+      "seconds": 701.317,
+      "saved_count": 645
+    },
+    {
+      "seconds": 719.922,
+      "saved_count": 660
+    },
+    {
+      "seconds": 737.045,
+      "saved_count": 675
+    },
+    {
+      "seconds": 753.726,
+      "saved_count": 690
+    },
+    {
+      "seconds": 770.035,
+      "saved_count": 705
+    },
+    {
+      "seconds": 786.223,
+      "saved_count": 720
+    },
+    {
+      "seconds": 804.119,
+      "saved_count": 735
+    },
+    {
+      "seconds": 820.918,
+      "saved_count": 750
+    },
+    {
+      "seconds": 838.136,
+      "saved_count": 765
+    },
+    {
+      "seconds": 855.022,
+      "saved_count": 780
+    },
+    {
+      "seconds": 872.158,
+      "saved_count": 795
+    },
+    {
+      "seconds": 889.059,
+      "saved_count": 810
+    },
+    {
+      "seconds": 905.29,
+      "saved_count": 825
+    },
+    {
+      "seconds": 922.12,
+      "saved_count": 840
+    },
+    {
+      "seconds": 937.971,
+      "saved_count": 855
+    },
+    {
+      "seconds": 955.207,
+      "saved_count": 870
+    },
+    {
+      "seconds": 972.228,
+      "saved_count": 885
+    },
+    {
+      "seconds": 989.031,
+      "saved_count": 900
+    },
+    {
+      "seconds": 1006.27,
+      "saved_count": 915
+    },
+    {
+      "seconds": 1023.328,
+      "saved_count": 930
+    },
+    {
+      "seconds": 1040.897,
+      "saved_count": 945
+    },
+    {
+      "seconds": 1058.034,
+      "saved_count": 960
+    },
+    {
+      "seconds": 1075.357,
+      "saved_count": 975
+    },
+    {
+      "seconds": 1091.846,
+      "saved_count": 990
+    },
+    {
+      "seconds": 1108.364,
+      "saved_count": 1005
+    },
+    {
+      "seconds": 1125.284,
+      "saved_count": 1020
+    },
+    {
+      "seconds": 1142.266,
+      "saved_count": 1035
+    },
+    {
+      "seconds": 1159.658,
+      "saved_count": 1050
+    },
+    {
+      "seconds": 1177.427,
+      "saved_count": 1065
+    },
+    {
+      "seconds": 1194.411,
+      "saved_count": 1080
+    },
+    {
+      "seconds": 1212.442,
+      "saved_count": 1095
+    },
+    {
+      "seconds": 1229.255,
+      "saved_count": 1110
+    },
+    {
+      "seconds": 1246.375,
+      "saved_count": 1125
+    },
+    {
+      "seconds": 1264.274,
+      "saved_count": 1140
+    },
+    {
+      "seconds": 1281.549,
+      "saved_count": 1155
+    },
+    {
+      "seconds": 1299.536,
+      "saved_count": 1170
+    },
+    {
+      "seconds": 1316.501,
+      "saved_count": 1185
+    },
+    {
+      "seconds": 1333.407,
+      "saved_count": 1200
+    },
+    {
+      "seconds": 1350.463,
+      "saved_count": 1215
+    },
+    {
+      "seconds": 1367.529,
+      "saved_count": 1230
+    },
+    {
+      "seconds": 1384.648,
+      "saved_count": 1245
+    },
+    {
+      "seconds": 1401.507,
+      "saved_count": 1260
+    },
+    {
+      "seconds": 1419.193,
+      "saved_count": 1275
+    },
+    {
+      "seconds": 1436.379,
+      "saved_count": 1290
+    },
+    {
+      "seconds": 1453.488,
+      "saved_count": 1305
+    },
+    {
+      "seconds": 1471.695,
+      "saved_count": 1320
+    },
+    {
+      "seconds": 1488.79,
+      "saved_count": 1335
+    },
+    {
+      "seconds": 1506.077,
+      "saved_count": 1350
+    },
+    {
+      "seconds": 1523.875,
+      "saved_count": 1365
+    },
+    {
+      "seconds": 1541.191,
+      "saved_count": 1380
+    },
+    {
+      "seconds": 1557.824,
+      "saved_count": 1395
+    },
+    {
+      "seconds": 1574.764,
+      "saved_count": 1410
+    },
+    {
+      "seconds": 1591.733,
+      "saved_count": 1425
+    },
+    {
+      "seconds": 1608.928,
+      "saved_count": 1440
+    },
+    {
+      "seconds": 1625.97,
+      "saved_count": 1455
+    },
+    {
+      "seconds": 1643.023,
+      "saved_count": 1470
+    },
+    {
+      "seconds": 1661.018,
+      "saved_count": 1485
+    },
+    {
+      "seconds": 1678.035,
+      "saved_count": 1500
+    },
+    {
+      "seconds": 1695.98,
+      "saved_count": 1515
+    },
+    {
+      "seconds": 1713.92,
+      "saved_count": 1530
+    },
+    {
+      "seconds": 1730.967,
+      "saved_count": 1545
+    },
+    {
+      "seconds": 1747.911,
+      "saved_count": 1560
+    },
+    {
+      "seconds": 1767.522,
+      "saved_count": 1575
+    },
+    {
+      "seconds": 1788.409,
+      "saved_count": 1590
+    }
+  ]
+}

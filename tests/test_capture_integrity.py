@@ -92,9 +92,9 @@ def test_timed_out_refresh_releases_command_for_next_author(tmp_path):
     hub = competitor_monitor.CompetitorMonitorHub(tmp_path / "config.json", tmp_path / "state.json")
     try:
         with patch.object(pinchuang.time, "monotonic", side_effect=[0, 1801]):
-            with pytest.raises(TimeoutError):
+            with pytest.raises(channels_refresh.CaptureRefreshError, match="没有新增已保存作品"):
                 hub._refresh_author("run-1", {"username": "author"})
-        assert channels_refresh.get_refresh_status()["status"] == "cancelled"
+        assert channels_refresh.get_refresh_status()["status"] == "failed"
         _, created = channels_refresh.start_refresh_task([{"username": "next"}])
         assert created
     finally:

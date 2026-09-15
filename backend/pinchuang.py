@@ -1175,19 +1175,23 @@ class PinchuangHub:
     def _refresh_author(self, run_id: str, author: dict) -> int:
         from backend.channels_refresh import CaptureRefreshError, get_refresh_status, start_refresh_task, update_refresh_task
 
-        task, created = start_refresh_task([author], require_receipt=getattr(self, "require_capture_receipt", False))
+        require_receipt = getattr(self, "require_capture_receipt", False)
+        task, created = start_refresh_task([author], require_receipt=require_receipt)
         if not created:
             raise RuntimeError("另一个视频号刷新任务正在运行")
         task_id = task["task_id"]
         self._last_refresh_task_id = task_id
-        deadline = time.monotonic() + 30 * 60
-        while time.monotonic() < deadline:
+        started = last_progress_at = time.monotonic()
+        last_saved_count = 0
+        idle_limit = 5 * 60
+        while True:
             if self.stop_event.is_set():
                 update_refresh_task({"task_id": task_id, "status": "cancelled", "message": "软件正在退出，保留进度供下次恢复"})
                 raise _RunStopping()
             status = get_refresh_status(task_id)
             if not status:
                 raise RuntimeError("视频号刷新任务状态丢失")
+            now = time.monotonic()
             self._update_run(
                 run_id,
                 phase="refreshing",
@@ -1201,9 +1205,41 @@ class PinchuangHub:
                 if isinstance(progress, dict):
                     progress['refreshed_videos'] = error.captured_count
                 raise error
+            if require_receipt:
+                saved_count = int(status.get("persisted_counts", {}).get(author["username"], 0))
+                if saved_count > last_saved_count:
+                    last_progress_at = now
+                    last_saved_count = saved_count
+                progress = getattr(self, "_current_creator_progress", None)
+                if isinstance(progress, dict):
+                    progress["refreshed_videos"] = saved_count
+                if now - last_progress_at >= idle_limit:
+                    message = (f"创作者刷新连续 {idle_limit // 60} 分钟没有新增已保存作品，"
+                               f"本轮已确认保存 {saved_count} 条，采集未完整结束")
+                    # Timeout is a capture failure, distinct from user cancellation.
+                    # Seal the task before processing its confirmed partial records.
+                    status = update_refresh_task({
+                        "task_id": task_id, "status": "failed", "message": message,
+                        "failed_authors": 1, "total_videos": saved_count,
+                        "author_results": {author["username"]: {
+                            "count": saved_count, "pagination_complete": False, "error": message,
+                        }},
+                    })
+                    # Completion can win the race with the timeout under the task lock.
+                    if status.get("status") == "completed" and not int(status.get("failed_authors") or 0):
+                        return int(status.get("total_videos") or 0)
+                    error = CaptureRefreshError(status, author["username"])
+                    if status.get("message") == message:
+                        error.capture_diagnostic["timeout"] = {
+                            "reason": "no_saved_progress", "limit_seconds": idle_limit,
+                            "idle_seconds": round(now - last_progress_at, 3),
+                            "elapsed_seconds": round(now - started, 3),
+                        }
+                    raise error
+            elif now - started >= 30 * 60:
+                update_refresh_task({"task_id": task_id, "status": "cancelled", "message": "创作者刷新超过 30 分钟，已结束该采集任务"})
+                raise TimeoutError("创作者刷新超过 30 分钟")
             time.sleep(1)
-        update_refresh_task({"task_id": task_id, "status": "cancelled", "message": "创作者刷新超过 30 分钟，已结束该采集任务"})
-        raise TimeoutError("创作者刷新超过 30 分钟")
 
     def _sync_new_videos_to_oss(
         self, run_id: str, author: dict, videos: list[dict]

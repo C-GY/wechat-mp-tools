@@ -1,8 +1,8 @@
 """OSS configuration, upload service, and WeChat Channels sync queue.
 
 The endpoint is fixed; the bucket and access credentials are configured
-independently. Configuration lives in the user's profile so reinstalling the
-application does not wipe it.
+independently. Configuration and successful-upload receipts live in the user's
+profile so reinstalling the application does not wipe them.
 """
 
 from __future__ import annotations
@@ -21,13 +21,14 @@ from collections import deque
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 import requests
 from flask import Blueprint, jsonify, request
 
 from backend.config import DATA_DIR, OUTPUT_DIR, get_settings, load_json, save_json
 from backend.channels_storage import locked_feeds, read_feeds, atomic_json
+from backend.oss_receipts import UploadReceipts
 from backend.sync_errors import IncompleteDownload, TransferHTTPError, error_details, transient_transfer_error
 
 
@@ -64,6 +65,12 @@ def persistent_config_dir() -> Path:
 
 
 OSS_CONFIG_FILE = persistent_config_dir() / "oss_config.json"
+
+
+def upload_receipts():
+    # Share the stable per-user location with credentials, but keep a separate
+    # database: clearing credentials or task history must not clear successes.
+    return UploadReceipts(OSS_CONFIG_FILE.with_name("oss_upload_receipts.sqlite3"))
 
 
 def _read_raw_config() -> dict:
@@ -191,6 +198,29 @@ def build_oss_public_url(object_key: str, bucket: str | None = None) -> str:
         bucket = get_oss_config()["bucket"]
     encoded_key = quote(str(object_key).strip("/"), safe="/-_.~")
     return f"{build_oss_storage_url(bucket)}/{encoded_key}"
+
+
+def _legacy_upload_receipt(video_id, url, object_key="", bucket="", size=0):
+    """Recover the actual bucket from an old success, never today's settings."""
+    video_id, url = str(video_id or ""), str(url or "").strip()
+    if not _SAFE_IDENTIFIER.fullmatch(video_id):
+        return None
+    try:
+        parsed, endpoint = urlsplit(url), urlsplit(DEFAULT_OSS_ENDPOINT)
+        if (parsed.scheme, parsed.netloc) != (endpoint.scheme, endpoint.netloc) or parsed.query or parsed.fragment:
+            return None
+        url_bucket, key = unquote(parsed.path).lstrip("/").split("/", 1)
+        _validate_bucket(url_bucket)
+        if (bucket and bucket != url_bucket) or (object_key and object_key != key):
+            return None
+        if (not key.startswith(DEFAULT_OSS_OBJECT_PREFIX + "/")
+                or key.rsplit("/", 1)[-1] != video_id + ".mp4"
+                or any(part in {".", "..", ""} for part in key.split("/"))):
+            return None
+        return {"bucket": url_bucket, "object_key": key, "url": build_oss_public_url(key, url_bucket),
+                "size": max(0, int(size or 0))}
+    except (TypeError, ValueError):
+        return None
 
 
 class _ProgressFile:
@@ -399,7 +429,38 @@ class OSSUploadManager:
         self.tasks = []
         self.active_batch_id = ""
         self.worker = None
+        self._receipts_migrated = False
         self._load()
+
+    def migrate_upload_receipts(self):
+        """Backfill available old successes before history can be cleared."""
+        from backend import channels
+
+        with self.lock:
+            if self._receipts_migrated:
+                return
+            feeds_db = read_feeds(channels.CHANNELS_FEEDS_FILE)
+            records = []
+            for videos in feeds_db.values():
+                if not isinstance(videos, list):
+                    continue
+                for video in videos:
+                    if not isinstance(video, dict) or video.get("oss_upload_status") not in (None, "", "completed"):
+                        continue
+                    result = _legacy_upload_receipt(video.get("id"), video.get("oss_video_url"),
+                                                    video.get("oss_object_key"), video.get("oss_bucket"))
+                    if result:
+                        records.append((str(video["id"]), result))
+            for task in self.tasks:
+                if task.get("status") not in {"completed", "skipped"}:
+                    continue
+                result = _legacy_upload_receipt(task.get("video_id"), task.get("oss_url"),
+                                                task.get("object_key"), task.get("oss_bucket"),
+                                                task.get("total_bytes"))
+                if result:
+                    records.append((str(task["video_id"]), result))
+            upload_receipts().save_many(DEFAULT_OSS_ENDPOINT, DEFAULT_OSS_OBJECT_PREFIX, records)
+            self._receipts_migrated = True
 
     def _load(self):
         stored = load_json(OSS_UPLOAD_TASKS_FILE, [])
@@ -470,6 +531,7 @@ class OSSUploadManager:
 
     def clear_finished(self):
         with self.lock:
+            self.migrate_upload_receipts()
             running = bool(self.worker and self.worker.is_alive())
             self.tasks = [
                 task
@@ -611,6 +673,7 @@ class OSSUploadManager:
         with self.lock:
             if self.worker and self.worker.is_alive():
                 raise RuntimeError("OSS 同步任务正在进行中")
+            self.migrate_upload_receipts()
             self.tasks.extend(task for task, _ in candidates)
             self.tasks = self.tasks[-100000:]
             self.active_batch_id = batch_id
@@ -684,6 +747,10 @@ class OSSUploadManager:
             if existing and video.get("oss_upload_status") in (None, "", "completed"):
                 return None, {"url": existing, "object_key": video.get("oss_object_key", ""),
                               "bucket": video.get("oss_bucket", "")}
+            cached = upload_receipts().get(DEFAULT_OSS_ENDPOINT, bucket, DEFAULT_OSS_OBJECT_PREFIX, task["video_id"])
+            if cached:
+                self._update(task["id"], reuse_source="local_cache")
+                return None, cached
             if reuse_remote:
                 self._update(task["id"], status="downloading", progress=0, error="")
                 remote = service_for_thread().find_uploaded_video(task["video_id"], video.get("createtime"))
@@ -710,7 +777,7 @@ class OSSUploadManager:
         def record(task, result, status):
             self._save_video_result(task, result)
             self._update(task["id"], status=status, progress=100, oss_url=result["url"],
-                         object_key=result["object_key"], uploaded_bytes=result.get("size", 0),
+                         object_key=result["object_key"], oss_bucket=result.get("bucket", ""), uploaded_bytes=result.get("size", 0),
                          total_bytes=result.get("size", 0), error="", stage="completed", next_retry_at="")
 
         try:
@@ -846,8 +913,18 @@ class OSSUploadManager:
                 )
                 continue
             temp_path = None
-            stage = "download"
+            stage = "persist"
             try:
+                cached = upload_receipts().get(DEFAULT_OSS_ENDPOINT, getattr(service, "bucket", None),
+                                               DEFAULT_OSS_OBJECT_PREFIX, task["video_id"])
+                if cached:
+                    self._save_video_result(task, cached)
+                    self._update(task_id, status="skipped", progress=100, oss_url=cached["url"],
+                                 object_key=cached["object_key"], oss_bucket=cached["bucket"],
+                                 uploaded_bytes=cached["size"], total_bytes=cached["size"],
+                                 reuse_source="local_cache", error="", stage="completed")
+                    continue
+                stage = "download"
                 temp_path = self._retry_transfer(task, stage, lambda: self._download_video(task_id, video))
                 last_saved_percent = -1
                 last_saved_at = 0.0
@@ -885,6 +962,7 @@ class OSSUploadManager:
                     total_bytes=result["size"],
                     oss_url=result["url"],
                     object_key=result["object_key"],
+                    oss_bucket=result.get("bucket", ""),
                     error="",
                 )
                 try:
@@ -981,6 +1059,9 @@ class OSSUploadManager:
     def _save_video_result(task: dict, result: dict):
         from backend import channels
 
+        # Commit the verified receipt first, even if a fresh capture has no feed
+        # row yet or mirroring the result back into the capture cache fails.
+        upload_receipts().save(DEFAULT_OSS_ENDPOINT, DEFAULT_OSS_OBJECT_PREFIX, task["video_id"], result)
         feeds_db = read_feeds(channels.CHANNELS_FEEDS_FILE)
         feed_key = task.get("feed_key") or task.get("username")
         videos = feeds_db.get(feed_key)

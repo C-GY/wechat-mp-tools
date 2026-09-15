@@ -158,3 +158,26 @@ def test_partial_capture_checkpoint_survives_restart_without_losing_reason(scena
     assert run["database_written"] == 2
     assert PAGING_ERROR in run["creators"][0]["message"]
     assert restarted.failure_page("run")["items"][0]["capture_diagnostic"]["task_id"] == task_id
+
+
+def test_stalled_capture_delivers_confirmed_records_and_keeps_timeout(scenario):
+    hub, task_id, adapter, manager = scenario
+    mitm_proxy.save_synced_feeds('author', [
+        {'id': key, 'objectDesc': {'mediaType': 4, 'media': []}} for key in ('v1', 'v2')
+    ], task_id=task_id)
+    seconds = [0]
+    def sleep(_):
+        seconds[0] += 30
+    with patch.object(pinchuang.time, 'monotonic', side_effect=lambda: seconds[0]), \
+         patch.object(pinchuang.time, 'sleep', side_effect=sleep):
+        run, _ = run_pipeline(hub, adapter)
+    result = run['creators'][0]
+    assert result['status'] == 'partial'
+    assert result['refreshed_videos'] == result['database_written'] == 2
+    assert [v['id'] for v in manager.start_selected_sync.call_args.args[1]] == ['v1', 'v2']
+    assert result['failed_items'] == 1
+    failure = hub.failure_page('run')['items'][0]
+    assert failure['stage'] == 'capture'
+    assert failure['capture_diagnostic']['timeout']['reason'] == 'no_saved_progress'
+    assert failure['capture_diagnostic']['timeout']['elapsed_seconds'] == 300
+    assert channels_refresh.get_refresh_status()['status'] == 'failed'

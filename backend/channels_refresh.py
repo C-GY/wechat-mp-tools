@@ -43,7 +43,8 @@ class CaptureRefreshError(RuntimeError):
             status.get('status') in {'failed', 'completed'}
             and result.get('pagination_complete') is False
         )
-        self.captured_count = max(0, int(result.get('persisted_count', 0)))
+        self.captured_count = max(0, int(status.get('persisted_counts', {}).get(
+            username, result.get('persisted_count', 0))))
         self.capture_diagnostic = {
             'task_id': str(status.get('task_id', ''))[:128],
             'captured_count': self.captured_count,
@@ -56,11 +57,15 @@ class CaptureRefreshError(RuntimeError):
 def _public_task(task):
     if task is None:
         return None
-    return {
+    result = {
         key: copy.deepcopy(value)
         for key, value in task.items()
         if key not in {"authors", "claimed", "persisted_ids"}
     }
+    # Only successful local storage receipts contribute to progress. Heartbeats
+    # and the page's reported totals must not keep a stuck capture alive.
+    result["persisted_counts"] = {username: len(ids) for username, ids in task.get("persisted_ids", {}).items()}
+    return result
 
 
 def _normalize_authors(authors):

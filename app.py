@@ -106,6 +106,13 @@ app.register_blueprint(creative_radar_bp)
 from backend.account_pool import migrate_legacy_config
 migrate_legacy_config()
 
+# Save old OSS successes outside the installation before starting schedulers.
+from backend.oss import upload_manager
+try:
+    upload_manager.migrate_upload_receipts()
+except Exception:
+    app.logger.exception("OSS 历史上传记录迁移失败；下次同步时将重试迁移")
+
 # 启动 RSS 自动抓取调度器
 from backend.rss_scheduler import rss_scheduler
 rss_scheduler.start()
