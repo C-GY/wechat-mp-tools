@@ -38,14 +38,14 @@ import threading
 from pathlib import Path
 
 
-from flask import Flask, send_from_directory
+from flask import Flask, render_template, send_from_directory
 from flask_cors import CORS
 
 from backend.runtime import configure_runtime, resource_dir
 
 configure_runtime()
 
-from backend.config import ensure_dirs
+from backend.config import APP_TITLE, APP_VERSION, ensure_dirs
 from backend.auth import auth_bp
 from backend.accounts import accounts_bp
 from backend.articles import articles_bp
@@ -75,6 +75,7 @@ app = Flask(
     __name__,
     static_folder=str(static_folder_path),
     static_url_path="",
+    template_folder=str(static_folder_path),
 )
 CORS(app)
 
@@ -136,9 +137,10 @@ def favicon():
     return ("", 204)
 
 @app.route("/")
+@app.route("/index.html")
 def serve_index():
     """SPA 主页面"""
-    return send_from_directory(app.static_folder, "index.html")
+    return render_template("index.html", app_title=APP_TITLE, app_version=APP_VERSION)
 
 
 @app.route("/<path:path>")
@@ -148,7 +150,7 @@ def serve_static(path):
     if file_path.exists():
         return send_from_directory(app.static_folder, path)
     # SPA fallback
-    return send_from_directory(app.static_folder, "index.html")
+    return serve_index()
 
 
 # ── 应用设置 API ──────────────────────────────────────────

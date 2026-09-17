@@ -217,7 +217,7 @@ if __name__ == '__main__':
 
         # 从主程序 app 导入 Flask 实例与初始化
         from app import app
-        from backend.config import ensure_dirs
+        from backend.config import APP_TITLE, ensure_dirs
         import logging
 
         ensure_dirs()
@@ -294,7 +294,7 @@ if __name__ == '__main__':
 
         # 创建桌面端原生容器窗口
         window = webview.create_window(
-            title='自媒体内容采集工具',
+            title=APP_TITLE,
             url=f'http://127.0.0.1:{port}/',
             width=1280,
             height=800,

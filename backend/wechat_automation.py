@@ -1019,6 +1019,7 @@ def ensure_wechat_channels_available(
         browsers = find_wechat_browser_windows()
         manager = ProxyManager.get_instance()
         proxy_started = False
+        proxy_restarted = False
         browser_restored = False
         restore_attempted = set()
 
@@ -1042,6 +1043,7 @@ def ensure_wechat_channels_available(
                 **(details or {}),
                 "proxy_running": manager.running,
                 "proxy_started": proxy_started,
+                "proxy_restarted": proxy_restarted,
                 "monitoring_active": available,
                 "opened": opened,
                 "browser_open": bool(browsers) or opened,
@@ -1062,10 +1064,19 @@ def ensure_wechat_channels_available(
                     return restored
             return False
 
+        def recover_proxy():
+            try:
+                restarted = bool(manager.recover_if_unhealthy())
+                diagnostic("proxy_health_checked", restarted=restarted)
+                return restarted
+            except RuntimeError as exc:
+                diagnostic("proxy_recovery_failed", error=str(exc))
+                raise
+
         diagnostic("check_started", detection_timeout=detection_timeout, open_timeout=open_timeout)
         if not manager.running:
-            proxy_started = bool(manager.start())
-            if not proxy_started:
+            proxy_started = recover_proxy()
+            if not manager.running:
                 diagnostic("proxy_start_failed")
                 raise RuntimeError("微信极速同步助手启动失败，请检查本地代理端口")
 
@@ -1084,6 +1095,13 @@ def ensure_wechat_channels_available(
             ))
 
         diagnostic("heartbeat_timeout")
+        # A running thread does not prove its listener still accepts requests.
+        # Repair the local transport before attempting any further desktop UI.
+        proxy_restarted = recover_proxy()
+        if proxy_restarted:
+            page = wait_for_channels_page(checked_at, timeout=detection_timeout)
+            if page is not None:
+                return result(True, "采集代理已自动恢复，已复用现有视频号页面")
         # A browser or heartbeat can appear while detection is waiting. Restore
         # newly discovered minimized browsers and recheck before any navigation.
         browsers = find_wechat_browser_windows()

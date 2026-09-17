@@ -11,6 +11,8 @@ import json
 import time
 import threading
 import subprocess
+import http.client
+import uuid
 from pathlib import Path
 from backend.config import DATA_DIR
 from backend.proxy_logging import runtime_logger
@@ -519,6 +521,9 @@ def set_system_proxy(enabled, port=5202):
 class ChannelsAddon:
     """只对视频号 / 公众号两个域名做拦截与注入,其余流量透传。"""
 
+    def __init__(self, health_token=""):
+        self.health_token = health_token
+
     def _local_json(self, flow, status, payload_bytes):
         from mitmproxy import http
         flow.response = http.Response.make(
@@ -555,6 +560,12 @@ class ChannelsAddon:
         path = flow.request.path.split("?", 1)[0]
 
         if host == "channels.weixin.qq.com":
+            if path == "/__wx_channels_api/proxy-health":
+                # Answer locally: neither upstream access nor a page heartbeat.
+                self._local_json(flow, 200, json.dumps({
+                    "proxy_health": self.health_token,
+                }).encode("utf-8"))
+                return
             record_channels_activity(path)
             if path == "/__wx_channels_api/sync-feed":
                 try:
@@ -1626,6 +1637,64 @@ class ProxyManager:
         self._proxy_enabled = False
         self._no_proxy_set = False
         self.startup_timeout = 10.0
+        self._health_token = uuid.uuid4().hex
+        self._last_recovery_attempt = None
+        self.recovery_cooldown = 60.0
+
+    def is_healthy(self, timeout=1.0):
+        """Exercise accepting a new connection AND processing an HTTP request.
+
+        A Windows accept() failure can leave the master/worker alive with a
+        closed listening socket. A TCP connection alone also misses a stuck
+        event loop, so require a response from this manager's local addon.
+        """
+        if not self.running or not self.thread or not self.thread.is_alive():
+            return False
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=timeout)
+        try:
+            connection.request(
+                "GET", "http://channels.weixin.qq.com/__wx_channels_api/proxy-health",
+                headers={"Connection": "close"},
+            )
+            response = connection.getresponse()
+            return response.status == 200 and json.loads(response.read(512)) == {
+                "proxy_health": self._health_token,
+            }
+        except (OSError, http.client.HTTPException, ValueError):
+            return False
+        finally:
+            connection.close()
+
+    def recover_if_unhealthy(self):
+        """Start/rebuild an unusable listener without touching WeChat or jobs.
+
+        Serialize callers and throttle failed attempts too. Return True only
+        when a rebuilt listener has answered its own health probe; callers
+        must still wait for a real page heartbeat before resuming collection.
+        """
+        with self._lifecycle_lock:
+            if self.is_healthy():
+                return False
+            now = time.monotonic()
+            if self._last_recovery_attempt is not None:
+                remaining = self.recovery_cooldown - (now - self._last_recovery_attempt)
+                if remaining > 0:
+                    raise RuntimeError(f"采集代理尚未恢复，{int(remaining) + 1} 秒后可自动重试")
+            self._last_recovery_attempt = now
+            logger = runtime_logger(DATA_DIR)
+            logger.warning("Local proxy health check failed; rebuilding listener")
+            try:
+                self.stop()
+                self.start()
+                if not self.is_healthy():
+                    self.stop()
+                    raise RuntimeError("采集代理重建后仍无响应，将自动重试")
+            except Exception as exc:
+                self.last_error = redact_error(exc)
+                logger.exception("Automatic listener recovery failed")
+                raise RuntimeError(self.last_error) from exc
+            logger.info("Local proxy listener recovered; waiting for page heartbeat")
+            return True
 
     def start(self):
         # Serialize start/stop callers, without blocking the worker's cleanup.
@@ -1825,7 +1894,7 @@ class ProxyManager:
                 )
                 master = DumpMaster(opts, with_termlog=False, with_dumper=False)
                 self.master = master
-                master.addons.add(ChannelsAddon(), ReadyAddon())
+                master.addons.add(ChannelsAddon(self._health_token), ReadyAddon())
                 if self._stop_requested.is_set():
                     return
                 await master.run()

@@ -2,6 +2,8 @@ import re
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright
+from flask import Flask, render_template
+from backend.config import APP_TITLE, APP_VERSION
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,9 +28,11 @@ def test_default_route_and_visual_navigation_order_are_channels_first():
 
 
 def test_product_ui_uses_new_brand_and_has_no_source_repository_link():
-    index = (ROOT / "frontend" / "index.html").read_text(encoding="utf-8")
-    assert "<title>自媒体内容采集工具</title>" in index
-    assert "<h1>自媒体内容采集工具</h1>" in index
+    app = Flask(__name__, template_folder=str(ROOT / "frontend"))
+    with app.app_context():
+        index = render_template("index.html", app_title=APP_TITLE, app_version=APP_VERSION)
+    assert f"<title>{APP_TITLE}</title>" in index
+    assert f'<h1>自媒体内容采集工具 <span class="app-version">v{APP_VERSION}</span></h1>' in index
     assert "微信公众号文章下载管理工具" not in index
     assert "Media Tools" not in index
     assert "github.com/" not in index.lower()

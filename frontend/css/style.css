@@ -236,6 +236,16 @@ body {
     background-clip: text;
 }
 
+.logo-text .app-version {
+    display: block;
+    font-size: 0.7rem;
+    font-weight: 500;
+    line-height: 1.6;
+    letter-spacing: normal;
+    -webkit-text-fill-color: var(--text-muted);
+    color: var(--text-muted);
+}
+
 .logo-subtitle {
     font-size: 0.68rem;
     white-space: nowrap;
