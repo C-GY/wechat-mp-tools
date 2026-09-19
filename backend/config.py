@@ -14,7 +14,7 @@ from pathlib import Path
 from backend.runtime import app_dir
 
 # ── 版本号 ────────────────────────────────────────────────
-APP_VERSION = "2026.09.17.2"
+APP_VERSION = "2026.09.19.1"
 APP_NAME = "自媒体内容采集工具"
 APP_TITLE = f"{APP_NAME} v{APP_VERSION}"
 

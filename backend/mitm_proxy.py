@@ -1640,6 +1640,12 @@ class ProxyManager:
         self._health_token = uuid.uuid4().hex
         self._last_recovery_attempt = None
         self.recovery_cooldown = 60.0
+        self.watchdog_interval = 5.0
+        self.watchdog_probe_timeout = 1.0
+        self._monitoring_requested = False
+        self._watchdog_thread = None
+        self._watchdog_stop = threading.Event()
+        self._watchdog_wakeup = threading.Event()
 
     def is_healthy(self, timeout=1.0):
         """Exercise accepting a new connection AND processing an HTTP request.
@@ -1650,6 +1656,10 @@ class ProxyManager:
         """
         if not self.running or not self.thread or not self.thread.is_alive():
             return False
+        return self._probe_http_health(timeout)
+
+    def _probe_http_health(self, timeout=1.0):
+        # Also usable during startup, before any system traffic is redirected.
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=timeout)
         try:
             connection.request(
@@ -1665,6 +1675,40 @@ class ProxyManager:
         finally:
             connection.close()
 
+    def _ensure_watchdog_locked(self):
+        if (self._watchdog_thread and self._watchdog_thread.is_alive()
+                and not self._watchdog_stop.is_set()):
+            return
+        stop = self._watchdog_stop = threading.Event()
+        wakeup = self._watchdog_wakeup = threading.Event()
+        self._watchdog_thread = threading.Thread(
+            target=self._watch_proxy, args=(stop, wakeup),
+            daemon=True, name="ChannelsProxyWatchdog",
+        )
+        self._watchdog_thread.start()
+
+    def _watch_proxy(self, stop, wakeup):
+        # A separate OS thread is essential: a stalled/dead proxy event loop
+        # cannot monitor itself. No UI polling, job, or page heartbeat is needed.
+        while not stop.is_set():
+            wakeup.wait(self.watchdog_interval)
+            wakeup.clear()
+            if stop.is_set():
+                return
+            try:
+                with self._lifecycle_lock:
+                    # A stopped/replaced supervisor must never resurrect a
+                    # listener after the user has deliberately turned it off.
+                    if stop.is_set() or not self._monitoring_requested:
+                        return
+                    self.recover_if_unhealthy()
+            except RuntimeError:
+                # recover_if_unhealthy records actual attempts/failures. During
+                # cooldown keep the system proxy disabled and quietly retry.
+                continue
+            except Exception:
+                runtime_logger(DATA_DIR).exception("Proxy watchdog iteration failed")
+
     def recover_if_unhealthy(self):
         """Start/rebuild an unusable listener without touching WeChat or jobs.
 
@@ -1673,8 +1717,16 @@ class ProxyManager:
         must still wait for a real page heartbeat before resuming collection.
         """
         with self._lifecycle_lock:
-            if self.is_healthy():
+            if self.is_healthy(timeout=self.watchdog_probe_timeout):
                 return False
+            # Fail open BEFORE cooldown or a possibly slow worker shutdown.
+            # Browsers must never remain pointed at a known-dead listener.
+            with self._state_lock:
+                if self.running or self._proxy_enabled:
+                    runtime_logger(DATA_DIR).warning(
+                        "Proxy HTTP health check failed; disabling system proxy before recovery"
+                    )
+                self._deactivate_locked()
             now = time.monotonic()
             if self._last_recovery_attempt is not None:
                 remaining = self.recovery_cooldown - (now - self._last_recovery_attempt)
@@ -1684,38 +1736,46 @@ class ProxyManager:
             logger = runtime_logger(DATA_DIR)
             logger.warning("Local proxy health check failed; rebuilding listener")
             try:
-                self.stop()
-                self.start()
+                self._stop_worker_locked()
+                self._start_worker_locked()
                 if not self.is_healthy():
-                    self.stop()
+                    self._stop_worker_locked()
                     raise RuntimeError("采集代理重建后仍无响应，将自动重试")
             except Exception as exc:
                 self.last_error = redact_error(exc)
                 logger.exception("Automatic listener recovery failed")
                 raise RuntimeError(self.last_error) from exc
             logger.info("Local proxy listener recovered; waiting for page heartbeat")
+            self._monitoring_requested = True
+            self._ensure_watchdog_locked()
             return True
 
     def start(self):
         # Serialize start/stop callers, without blocking the worker's cleanup.
         with self._lifecycle_lock:
-            if self.running and self.thread and self.thread.is_alive():
-                return True
-            if self.thread and self.thread.is_alive():
-                raise RuntimeError("上一次监听服务仍在退出，请稍后重试。")
-            self.last_error = ""
-            logger = runtime_logger(DATA_DIR)
-            logger.info("Starting listener on 127.0.0.1:%s", self.port)
+            result = self._start_worker_locked()
+            self._monitoring_requested = True
+            self._ensure_watchdog_locked()
+            return result
+
+    def _start_worker_locked(self):
+        if self.running and self.thread and self.thread.is_alive():
+            return True
+        if self.thread and self.thread.is_alive():
+            raise RuntimeError("上一次监听服务仍在退出，请稍后重试。")
+        self.last_error = ""
+        logger = runtime_logger(DATA_DIR)
+        logger.info("Starting listener on 127.0.0.1:%s", self.port)
+        try:
+            return self._start()
+        except Exception as exc:
+            self.last_error = redact_error(exc)
+            logger.exception("Listener startup failed")
             try:
-                return self._start()
-            except Exception as exc:
-                self.last_error = redact_error(exc)
-                logger.exception("Listener startup failed")
-                try:
-                    self.stop()
-                except Exception:
-                    logger.exception("Listener startup rollback failed")
-                raise RuntimeError(self.last_error) from exc
+                self._stop_worker_locked()
+            except Exception:
+                logger.exception("Listener startup rollback failed")
+            raise RuntimeError(self.last_error) from exc
 
     def _start(self):
 
@@ -1794,6 +1854,7 @@ class ProxyManager:
         self._stop_requested.clear()
         self._finished.clear()
         self._ready = False
+        self._health_token = uuid.uuid4().hex
         self.master = None
         self.loop = None
         self.thread = threading.Thread(
@@ -1804,6 +1865,10 @@ class ProxyManager:
         # Never redirect WeChat traffic until mitmproxy has actually bound its socket.
         if not self._startup_event.wait(self.startup_timeout):
             raise RuntimeError(f"监听服务启动超时（端口 {self.port}），未开启系统代理。")
+        if not self._ready or self._finished.is_set() or not self.thread.is_alive():
+            raise RuntimeError(self.last_error or "监听服务在启动期间退出，未开启系统代理。")
+        if not self._probe_http_health(timeout=self.watchdog_probe_timeout):
+            raise RuntimeError("监听服务未通过 HTTP 健康检查，未开启系统代理。")
         with self._state_lock:
             if not self._ready or self._finished.is_set() or not self.thread.is_alive():
                 raise RuntimeError(self.last_error or "监听服务在启动期间退出，未开启系统代理。")
@@ -1819,27 +1884,39 @@ class ProxyManager:
 
     def stop(self):
         with self._lifecycle_lock:
-            self._stop_requested.set()
-            with self._state_lock:
-                self._deactivate_locked()
-                master = self.master
-            if master and self.thread and self.thread.is_alive():
-                try:
-                    master.shutdown()
-                except RuntimeError:
-                    pass  # The event loop may have finished concurrently.
-            if self.thread and self.thread.is_alive():
-                self.thread.join(timeout=5)
-            if self.thread and self.thread.is_alive():
-                # Keep the reference: another start must not race this worker.
-                raise RuntimeError("系统代理已关闭，但监听线程尚未退出，请稍后重试。")
-            self.master = self.loop = self.thread = None
-            reset_channels_pages()
-            cleanup_mitmproxy_logging_handlers()
-            runtime_logger(DATA_DIR).info("Listener stopped")
-            if self._proxy_enabled:
-                raise RuntimeError(self.last_error)
-            return True
+            self._monitoring_requested = False
+            self._watchdog_stop.set()
+            self._watchdog_wakeup.set()
+            watchdog = self._watchdog_thread
+            result = self._stop_worker_locked()
+        # Never join while holding the lifecycle lock: the supervisor might
+        # already be waiting for it. Each start gets a new cancellation event.
+        if watchdog and watchdog is not threading.current_thread():
+            watchdog.join(timeout=2)
+        return result
+
+    def _stop_worker_locked(self):
+        self._stop_requested.set()
+        with self._state_lock:
+            self._deactivate_locked()
+            master = self.master
+        if master and self.thread and self.thread.is_alive():
+            try:
+                master.shutdown()
+            except RuntimeError:
+                pass  # The event loop may have finished concurrently.
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=5)
+        if self.thread and self.thread.is_alive():
+            # Keep the reference: another start must not race this worker.
+            raise RuntimeError("系统代理已关闭，但监听线程尚未退出，请稍后重试。")
+        self.master = self.loop = self.thread = None
+        reset_channels_pages()
+        cleanup_mitmproxy_logging_handlers()
+        runtime_logger(DATA_DIR).info("Listener stopped")
+        if self._proxy_enabled:
+            raise RuntimeError(self.last_error)
+        return True
 
     def _deactivate_locked(self):
         self.running = False
@@ -1872,6 +1949,21 @@ class ProxyManager:
                     server = master.addons.get("proxyserver")
                     if not server or not any(addr[1] == owner.port for addr in server.listen_addrs()):
                         raise RuntimeError("代理未绑定预期监听端口")
+                    # Install after Master.run() has installed mitmproxy's
+                    # handler; setting it before run() is silently overridden.
+                    previous_handler = loop.get_exception_handler()
+
+                    def proxy_exception_handler(event_loop, context):
+                        # CPython closes the serving socket on AcceptEx errors
+                        # (e.g. WinError 64) but leaves the master alive.
+                        if context.get("message") == "Accept failed on a socket":
+                            owner._watchdog_wakeup.set()
+                        if previous_handler:
+                            previous_handler(event_loop, context)
+                        else:
+                            event_loop.default_exception_handler(context)
+
+                    loop.set_exception_handler(proxy_exception_handler)
                     with owner._state_lock:
                         if owner._stop_requested.is_set():
                             master.shutdown()
@@ -1912,10 +2004,12 @@ class ProxyManager:
             with self._state_lock:
                 self._finished.set()
                 if not self._stop_requested.is_set() and not self.last_error:
-                    self.last_error = "监听服务意外退出，请重新启动；详情见监听运行日志。"
+                    self.last_error = "监听服务意外退出，正在自动恢复；详情见监听运行日志。"
                     logger.error(self.last_error)
                 self._deactivate_locked()
                 self._startup_event.set()
+                if not self._stop_requested.is_set():
+                    self._watchdog_wakeup.set()
             reset_channels_pages()
             try:
                 if loop is not None:
