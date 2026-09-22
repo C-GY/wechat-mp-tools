@@ -13,8 +13,9 @@ const source = fs.readFileSync('injection_scripts/src/automation.js', 'utf8');
 const fn = source.slice(source.indexOf('  async function refreshFavoriteAuthor'), source.indexOf('  async function runRemoteFavoritesRefresh'));
 let cancelled=false, circuitOpen=false, my_username='', PAGE_JITTER_MS=0;
 const esc=x=>x, setPanel=()=>{}, noteFailure=()=>{};
+const sleep=async()=>{};
 let reports=[];
-const reportRemoteProgress=async(taskId,body)=>{reports.push(JSON.parse(JSON.stringify(body)));};
+let reportRemoteProgress=async(taskId,body)=>{reports.push(JSON.parse(JSON.stringify(body)));};
 let pages=[], inputs=[], saved=[], logs=[], waits=[], failSave=false, onWait=()=>{};
 const jitterSleep=async(ms)=>{waits.push(ms);onWait();};
 const logCall=(api,code,message,ms,extra)=>logs.push({api,code,message,...extra});
@@ -145,4 +146,55 @@ def test_storage_failure_is_not_retried_as_a_pagination_anomaly():
       assert.equal(error.captured_count,1);
       assert.equal(inputs.length,2);
       assert.deepEqual(saved,['a']);
+    """)
+
+
+def test_durable_receipt_reply_loss_does_not_restart_first_page():
+    replay("""
+      const sleep=async()=>{};
+      let writes=0, polls=0, checkpoints=0, receipt;
+      pages=[response(['a'],'next'),response(['b'],'')];
+      WXU.request=async(opt)=>{
+        if(opt.url.includes('refresh-resume')) return [null,{page_number:1,marker:'',complete:false,saved_ids:[]}];
+        if(opt.url.includes('sync-feed-status')) {polls++; return [null,receipt];}
+        if(opt.url.includes('refresh-checkpoint')) {checkpoints++; return [null,{status:'saved'}];}
+        writes++;
+        receipt={status:'saved',capture_task_id:'task',saved_ids:opt.body.feeds.map(v=>v.id)};
+        return [new Error('lost response after commit'),null];
+      };
+      assert.equal(await refreshFavoriteAuthor({username:'author'},'task',1,1,{completed:0,failed:0,videos:0},{capture_protocol:2,lease_token:'lease'}),2);
+      assert.deepEqual(inputs,['','next']);
+      assert.equal(writes,2); assert.equal(polls,2); assert.equal(checkpoints,2);
+    """)
+
+
+def test_durable_resume_starts_at_confirmed_cursor_and_recovers_checkpoint_reply():
+    replay("""
+      const sleep=async()=>{};
+      let checkpoint={page_number:2,marker:'next',complete:false,saved_ids:['a']};
+      pages=[response(['b'],'')];
+      WXU.request=async(opt)=>{
+        if(opt.url.includes('refresh-resume')) return [null,checkpoint];
+        if(opt.url.includes('refresh-checkpoint')) {
+          checkpoint={...opt.body,saved_ids:['a','b']};
+          return [new Error('checkpoint reply lost'),null];
+        }
+        return [null,{status:'saved',capture_task_id:'task',saved_ids:['b']}];
+      };
+      assert.equal(await refreshFavoriteAuthor({username:'author'},'task',1,1,{completed:0,failed:0,videos:0},{capture_protocol:2}),2);
+      assert.deepEqual(inputs,['next']);
+      assert.equal(checkpoint.complete,true);
+    """)
+
+
+def test_remote_finish_displays_backend_rejection_instead_of_false_success():
+    replay("""
+      let running=false, circuitFails=0, AUTHOR_JITTER_MS=0, displayed='';
+      const finish=message=>{displayed=message;};
+      reportRemoteProgress=async(task,body)=>body.status==='completed' ? {status:'failed',message:'采集落盘数量不一致'} : {};
+      const remote=source.slice(source.indexOf('  async function runRemoteFavoritesRefresh'),source.indexOf('  var running = false;'));
+      eval(remote);
+      pages=[response(['a'],'')];
+      await runRemoteFavoritesRefresh({task_id:'task',authors:[{username:'author'}]});
+      assert.equal(displayed,'采集落盘数量不一致');
     """)

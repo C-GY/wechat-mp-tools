@@ -12,12 +12,13 @@ import subprocess
 import urllib.parse
 import requests
 import struct
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 from flask import Blueprint, jsonify, request
 
 from backend.config import DATA_DIR, OUTPUT_DIR, get_settings, load_json, save_json
-from backend.channels_storage import locked_feeds, read_feeds, atomic_json
+from backend.channels_storage import locked_feeds, read_feeds, feed_store
 from backend.runtime import launch_chromium
 from backend.channels_favorites import (
     FAVORITES_LOCK, build_favorites_backup, merge_favorites,
@@ -30,10 +31,28 @@ CHANNELS_FAVORITES_FILE = DATA_DIR / "channels_favorites.json"
 CHANNELS_FEEDS_FILE = DATA_DIR / "channels_parsed_feeds.json"
 
 
+@channels_bp.get('/storage/status')
+def channels_storage_status():
+    return jsonify(feed_store(CHANNELS_FEEDS_FILE).status())
+
+
+@channels_bp.post('/storage/prepare')
+def channels_storage_prepare():
+    return jsonify(feed_store(CHANNELS_FEEDS_FILE).prepare_background())
+
+
+@channels_bp.post('/storage/<operation>')
+def channels_storage_maintenance(operation):
+    try:
+        return jsonify(feed_store(CHANNELS_FEEDS_FILE).start_maintenance(operation))
+    except ValueError as exc:
+        return jsonify({'error':str(exc)}), 400
+
+
 def build_authors_export_payload(favorites, feeds_db, username=None):
     """Build a complete, portable export for all favorites or one author."""
     favorites = favorites if isinstance(favorites, list) else []
-    feeds_db = feeds_db if isinstance(feeds_db, dict) else {}
+    feeds_db = feeds_db if isinstance(feeds_db, Mapping) else {}
     requested_username = str(username or "").strip()
 
     if requested_username:
@@ -580,10 +599,6 @@ def save_parsed_video_to_db(result):
         
     # 2. 把视频加到作者的作品库中 (CHANNELS_FEEDS_FILE)
     try:
-        feeds_db = read_feeds(CHANNELS_FEEDS_FILE)
-        if username not in feeds_db:
-            feeds_db[username] = []
-            
         feed_id = fi.get("id")
         if feed_id:
             description = fi.get("description") or ""
@@ -618,17 +633,7 @@ def save_parsed_video_to_db(result):
             if duration_seconds is not None:
                 item["duration_seconds"] = duration_seconds
             
-            exists = False
-            for ex_item in feeds_db[username]:
-                if ex_item.get("id") == feed_id:
-                    ex_item.update(item)
-                    exists = True
-                    break
-                    
-            if not exists:
-                feeds_db[username].append(item)
-                
-            atomic_json(CHANNELS_FEEDS_FILE, feeds_db)
+            feed_store(CHANNELS_FEEDS_FILE).merge(username, [item])
     except Exception as ev:
         print(f"自动保存视频到作者库失败: {ev}")
 
@@ -1071,12 +1076,7 @@ def remove_favorite(username):
         save_favorites_atomic(CHANNELS_FAVORITES_FILE, new_favorites)
 
     # 从 Feeds 数据库移除该作者的所有视频/同步数据
-    feeds_db = read_feeds(CHANNELS_FEEDS_FILE)
-    if username in feeds_db:
-        feeds_db.pop(username, None)
-    if nickname and nickname in feeds_db:
-        feeds_db.pop(nickname, None)
-    atomic_json(CHANNELS_FEEDS_FILE, feeds_db)
+    feed_store(CHANNELS_FEEDS_FILE).remove(username, nickname)
 
     return jsonify({"message": "已删除作者及同步数据", "favorites": new_favorites})
 
@@ -1104,24 +1104,9 @@ def add_author_video(username):
     if not feed_id:
         return jsonify({"error": "视频 ID 不能为空"}), 400
 
-    feeds_db = read_feeds(CHANNELS_FEEDS_FILE)
-    if username not in feeds_db:
-        feeds_db[username] = []
-
-    # 检查是否已存在该视频
-    exists = False
-    for item in feeds_db[username]:
-        if item.get("id") == feed_id:
-            # 存在则更新数据（如更新可能失效 of URL）
-            item.update(feed)
-            exists = True
-            break
-
-    if not exists:
-        feeds_db[username].append(feed)
-
-    atomic_json(CHANNELS_FEEDS_FILE, feeds_db)
-    return jsonify({"message": "视频已保存到作者作品列表", "videos": feeds_db[username]})
+    store = feed_store(CHANNELS_FEEDS_FILE)
+    store.merge(username, [feed])
+    return jsonify({"message": "视频已保存到作者作品列表", "videos": store.author(username)})
 
 
 @channels_bp.route("/export-authors", methods=["POST"])

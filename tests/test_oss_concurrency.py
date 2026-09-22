@@ -1,3 +1,4 @@
+from backend.channels_storage import read_feeds, feed_store, FeedStore
 """Exercise the real scheduler with controlled I/O and isolated local storage."""
 import json
 import threading
@@ -122,7 +123,7 @@ def test_independent_limits_overlap_and_bounded_backlog(transfer, monkeypatch, d
     assert counts["download_peak"] == download_limit
     assert counts["upload_peak"] == upload_limit
     assert all(task["status"] == "completed" for task in t.manager.tasks)
-    saved = oss.load_json(channels.CHANNELS_FEEDS_FILE)[AUTHOR["username"]]
+    saved = read_feeds(channels.CHANNELS_FEEDS_FILE)[AUTHOR["username"]]
     assert len([v for v in saved if v.get("oss_video_url")]) == len(t.videos)
     assert not list(t.root.glob("*.mp4"))
     assert all(s.close.call_count == 1 for s in t.sessions)
@@ -202,7 +203,7 @@ def test_out_of_order_completion_keeps_files_urls_and_authors_matched(transfer, 
     t.manager.start_selected_sync(AUTHOR, selected, transfer={"download_workers": 2, "upload_workers": 2})
     join(t.manager)
     assert completion_order.index("video-1") < completion_order.index("video-0")
-    saved = oss.load_json(channels.CHANNELS_FEEDS_FILE)
+    saved = read_feeds(channels.CHANNELS_FEEDS_FILE)
     assert saved["other-author"] == other_author
     assert len(saved[AUTHOR["username"]]) == len(selected)
     for video in saved[AUTHOR["username"]]:
@@ -246,7 +247,7 @@ def test_failures_and_remote_reuse_do_not_drop_other_results(transfer, monkeypat
                       "video-3": "failed", "video-4": "completed", "video-5": "completed"}
     assert set(downloads) == {"video-2", "video-3", "video-4", "video-5"}
     assert set(uploads) == {"video-3", "video-4", "video-5"}
-    saved = oss.load_json(channels.CHANNELS_FEEDS_FILE)[AUTHOR["username"]]
+    saved = read_feeds(channels.CHANNELS_FEEDS_FILE)[AUTHOR["username"]]
     assert saved[1]["oss_video_url"] == "https://existing.invalid/1.mp4"
     assert saved[4]["oss_video_url"].endswith("video-4.mp4")
     assert not list(t.root.glob("*.mp4"))

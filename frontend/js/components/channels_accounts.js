@@ -7,6 +7,7 @@ const ChannelsAccountsPage = {
     isParsing: false,
     activeRefreshTaskId: null,
     refreshPollTimer: null,
+    storagePollTimer: null,
 
     render() {
         return `
@@ -17,6 +18,16 @@ const ChannelsAccountsPage = {
 
 
 
+            <div class="card" style="margin-top:var(--spacing-lg);padding:16px;">
+                <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;">
+                    <strong>本地作品库</strong>
+                    <span id="channels-storage-status" role="status">正在检查历史作品…</span>
+                    <button class="btn btn-secondary" onclick="ChannelsAccountsPage.storageAction('backup')">备份作品库</button>
+                    <button class="btn btn-secondary" onclick="ChannelsAccountsPage.storageAction('export')">导出完整 JSON</button>
+                    <button class="btn btn-secondary" id="channels-storage-retry" style="display:none" onclick="ChannelsAccountsPage.refreshStorage(true)">重试迁移</button>
+                </div>
+                <div id="channels-storage-detail" style="margin-top:8px;font-size:0.85rem;color:var(--text-secondary);overflow-wrap:anywhere;"></div>
+            </div>
             <!-- 解析与添加区域 -->
             <div class="card animate-fade-in" style="margin-top: var(--spacing-lg); margin-bottom: var(--spacing-lg);">
                 <div class="card-header" style="display: flex; justify-content: space-between; align-items: center; padding-bottom: var(--spacing-sm); border-bottom: 1px solid rgba(0,0,0,0.05);">
@@ -116,6 +127,8 @@ const ChannelsAccountsPage = {
     },
 
     destroy() {
+        clearTimeout(this.storagePollTimer);
+        this.storagePollTimer = null;
         if (this.refreshPollTimer) {
             clearTimeout(this.refreshPollTimer);
             this.refreshPollTimer = null;
@@ -131,6 +144,7 @@ const ChannelsAccountsPage = {
     },
 
     async init() {
+        this.refreshStorage(true);
         await this.loadFavorites();
         try {
             const savedTaskId = localStorage.getItem('channelsFavoritesRefreshTaskId');
@@ -139,6 +153,34 @@ const ChannelsAccountsPage = {
                 this.setFavoritesRefreshButton(true);
                 this.pollFavoritesRefresh(savedTaskId);
             }
+        } catch (_) {}
+    },
+
+    async refreshStorage(prepare = false) {
+        clearTimeout(this.storagePollTimer);
+        try {
+            if (prepare) await API.post('/api/channels/storage/prepare', {}, {showError:false});
+            const state = await API.get('/api/channels/storage/status', {showError:false});
+            const status = document.getElementById('channels-storage-status');
+            if (!status) return;
+            status.textContent = state.message + (state.status === 'migrating' ? ` · 已迁移 ${state.records || 0} 条` : '');
+            document.getElementById('channels-storage-retry').style.display = state.status === 'failed' ? '' : 'none';
+            const action = state.maintenance || {};
+            document.getElementById('channels-storage-detail').textContent = action.message ||
+                (state.issues ? `已保留 ${state.issues} 条重复或缺少 ID 的历史记录。迁移前原文件已保留。` : '迁移前原文件会保留；导出完整 JSON 可保存当前全部作品。');
+            if (state.status !== 'ready' || action.status === 'running') {
+                if (state.status !== 'failed') this.storagePollTimer = setTimeout(() => this.refreshStorage(), 1500);
+            }
+        } catch (error) {
+            const status = document.getElementById('channels-storage-status');
+            if (status) status.textContent = error.message || '作品库状态暂时不可用';
+        }
+    },
+
+    async storageAction(operation) {
+        try {
+            await API.post('/api/channels/storage/' + operation, {});
+            this.refreshStorage();
         } catch (_) {}
     },
 

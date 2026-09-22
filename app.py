@@ -107,12 +107,15 @@ app.register_blueprint(creative_radar_bp)
 from backend.account_pool import migrate_legacy_config
 migrate_legacy_config()
 
-# Save old OSS successes outside the installation before starting schedulers.
+# Prepare history in the background so a large first migration cannot hide the UI.
 from backend.oss import upload_manager
-try:
-    upload_manager.migrate_upload_receipts()
-except Exception:
-    app.logger.exception("OSS 历史上传记录迁移失败；下次同步时将重试迁移")
+def prepare_channels_history():
+    try:
+        upload_manager.migrate_upload_receipts()
+    except Exception:
+        app.logger.exception("历史作品或 OSS 上传记录迁移失败；可在本地作品库面板重试")
+
+threading.Thread(target=prepare_channels_history, name="PrepareChannelsHistory", daemon=True).start()
 
 # 启动 RSS 自动抓取调度器
 from backend.rss_scheduler import rss_scheduler

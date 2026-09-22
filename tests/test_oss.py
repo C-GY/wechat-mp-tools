@@ -1,3 +1,4 @@
+from backend.channels_storage import read_feeds, feed_store, FeedStore
 import json
 import tempfile
 import unittest
@@ -316,7 +317,7 @@ class OSSUploadTests(unittest.TestCase):
 
             self.assertEqual(manager.tasks[0]["status"], "completed")
             self.assertEqual(manager.tasks[0]["progress"], 100)
-            saved_video = json.loads(feeds_file.read_text(encoding="utf-8"))["author-1"][0]
+            saved_video = read_feeds(feeds_file)["author-1"][0]
             self.assertEqual(saved_video["oss_video_url"], "https://oss.example/video-1.mp4")
             self.assertEqual(saved_video["oss_upload_status"], "completed")
             self.assertEqual(saved_video["oss_bucket"], "creator-library")

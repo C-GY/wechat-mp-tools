@@ -1,3 +1,4 @@
+from backend.channels_storage import read_feeds, feed_store, FeedStore
 """Reinstall regression through the real queue, uploader and receipt persistence."""
 from types import SimpleNamespace
 import pytest
@@ -8,6 +9,29 @@ from backend import channels, oss
 AUTHOR = {"username": "author-1", "nickname": "作者"}
 VIDEO = {"id": "video-1", "createtime": 1721174400, "video_url": "https://source.invalid/1"}
 MP4 = b"\x00\x00\x00\x20ftypisom" + b"x" * 20
+
+
+def test_migration_does_not_block_upload_status(sync, monkeypatch):
+    import threading
+    manager = sync.install('migration-slow')
+    entered, release = threading.Event(), threading.Event()
+    original = oss.read_feeds
+    def slow_read(path):
+        entered.set()
+        assert release.wait(5)
+        return original(path)
+    monkeypatch.setattr(oss,'read_feeds',slow_read)
+    worker = threading.Thread(target=manager.migrate_upload_receipts)
+    worker.start()
+    try:
+        assert entered.wait(2)
+        assert manager.lock.acquire(timeout=0.2), 'Status polling must not wait for migration'
+        manager.lock.release()
+        assert manager.snapshot()['running'] is False
+    finally:
+        release.set()
+        worker.join(5)
+    assert manager._receipts_migrated
 
 
 @pytest.fixture
@@ -78,7 +102,7 @@ def test_reinstall_and_clear_history_do_not_repeat_download_or_upload(sync, para
     assert sync.calls == [], "The same verified video must not be downloaded or uploaded again after reinstall"
     assert restored["status"] == "skipped"
     assert restored["oss_url"] == original["oss_url"]
-    saved = oss.load_json(channels.CHANNELS_FEEDS_FILE)[AUTHOR["username"]][0]
+    saved = read_feeds(channels.CHANNELS_FEEDS_FILE)[AUTHOR["username"]][0]
     assert saved["oss_video_url"] == original["oss_url"]
 
 
@@ -133,18 +157,16 @@ def test_failed_remote_verification_never_becomes_a_success_receipt(sync, parall
 @pytest.mark.parametrize("parallel", [False, True])
 def test_verified_upload_survives_feed_write_failure(sync, monkeypatch, parallel):
     first = sync.install("old")
-    original_write = oss.atomic_json
+    original_write = FeedStore.patch_existing
 
-    def fail_feed(path, data):
-        if path == channels.CHANNELS_FEEDS_FILE:
-            raise OSError("simulated capture disk failure")
-        return original_write(path, data)
+    def fail_feed(*args):
+        raise OSError("simulated capture disk failure")
 
-    monkeypatch.setattr(oss, "atomic_json", fail_feed)
+    monkeypatch.setattr(FeedStore, "patch_existing", fail_feed)
     failed = sync.run(first, parallel)[0]
     assert failed["status"] == "failed"
     assert "simulated capture disk failure" in failed["error"]
-    monkeypatch.setattr(oss, "atomic_json", original_write)
+    monkeypatch.setattr(FeedStore, "patch_existing", original_write)
     second = sync.install("new")
     sync.calls.clear()
     restored = sync.run(second, parallel)[0]

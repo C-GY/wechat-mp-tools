@@ -13,6 +13,7 @@ import threading
 import subprocess
 import http.client
 import uuid
+import asyncio
 from pathlib import Path
 from backend.config import DATA_DIR
 from backend.proxy_logging import runtime_logger
@@ -555,7 +556,15 @@ class ChannelsAddon:
         # DIAG: 记录所有 CONNECT 的目标域名,用于发现 bundle 实际所在 CDN
         print(f"[DIAG CONNECT] {flow.request.host}:{flow.request.port}", flush=True)
 
-    def request(self, flow):
+    async def request(self, flow):
+        # Health probes never wait for storage, legacy migration or Flask I/O.
+        if (flow.request.pretty_host == 'channels.weixin.qq.com' and
+                flow.request.path.split('?', 1)[0] == '/__wx_channels_api/proxy-health'):
+            self._local_json(flow, 200, json.dumps({'proxy_health':self.health_token}).encode('utf-8'))
+            return
+        await asyncio.to_thread(self._request, flow)
+
+    def _request(self, flow):
         host = flow.request.pretty_host
         path = flow.request.path.split("?", 1)[0]
 
@@ -570,7 +579,11 @@ class ChannelsAddon:
             if path == "/__wx_channels_api/sync-feed":
                 try:
                     payload = json.loads(flow.request.get_text())
-                    receipt = save_synced_feeds(payload.get("username"), payload.get("feeds", []), task_id=payload.get("task_id", ""))
+                    if payload.get('page_id'):
+                        from backend.channels_save_jobs import submit_page
+                        receipt = submit_page(payload)
+                    else:
+                        receipt = save_synced_feeds(payload.get("username"), payload.get("feeds", []), task_id=payload.get("task_id", ""))
                     self._local_json(
                         flow, 200,
                         json.dumps({"code": 0, "success": True, "data": receipt}).encode("utf-8"),
@@ -581,6 +594,21 @@ class ChannelsAddon:
                         flow, 500,
                         json.dumps({"code": 1, "success": False, "msg": str(ex), "error": str(ex)}).encode("utf-8"),
                     )
+                return
+            if path in ('/__wx_channels_api/sync-feed-status', '/__wx_channels_api/refresh-checkpoint', '/__wx_channels_api/refresh-resume', '/__wx_channels_api/refresh-reset'):
+                try:
+                    from backend.channels_save_jobs import page_status, save_checkpoint, resume_capture, reset_cursor
+                    if path.endswith('sync-feed-status'):
+                        result = page_status(dict(flow.request.query))
+                    elif path.endswith('refresh-resume'):
+                        result = resume_capture(dict(flow.request.query))
+                    elif path.endswith('refresh-reset'):
+                        result = reset_cursor(json.loads(flow.request.get_text()))
+                    else:
+                        result = save_checkpoint(json.loads(flow.request.get_text()))
+                    self._local_json(flow, 200, json.dumps({'code':0,'data':result}).encode('utf-8'))
+                except Exception as exc:
+                    self._local_json(flow, 409, json.dumps({'code':1,'msg':str(exc)}).encode('utf-8'))
                 return
             if path in ("/__wx_channels_api/error", "/__wx_channels_api/log-error"):
                 try:
@@ -620,7 +648,7 @@ class ChannelsAddon:
                 try:
                     from backend.config import load_json
                     from backend.channels import CHANNELS_FEEDS_FILE
-                    feeds_db = load_json(CHANNELS_FEEDS_FILE, {})
+                    feeds_db = read_feeds(CHANNELS_FEEDS_FILE)
                     body = json.dumps(
                         {"code": 0, "data": list(feeds_db.keys())}, ensure_ascii=False
                     ).encode("utf-8")
@@ -635,7 +663,7 @@ class ChannelsAddon:
                 try:
                     from backend.config import load_json
                     from backend.channels import CHANNELS_FEEDS_FILE
-                    feeds_db = load_json(CHANNELS_FEEDS_FILE, {})
+                    feeds_db = read_feeds(CHANNELS_FEEDS_FILE)
                     id_map = {
                         u: [it.get("id") for it in items if it.get("id")]
                         for u, items in feeds_db.items()
@@ -659,7 +687,20 @@ class ChannelsAddon:
                     flow.request.query.get("page_id", "legacy"), api_ready=api_ready
                 )
                 busy = flow.request.query.get("busy") == "1"
-                command = claim_refresh_command() if api_ready and not busy else None
+                from backend.channels import CHANNELS_FEEDS_FILE
+                store = feed_store(CHANNELS_FEEDS_FILE)
+                storage_ready = store.status()['status'] == 'ready'
+                if not storage_ready and store.status()['status'] != 'failed':
+                    store.prepare_background()
+                owner_page = flow.request.query.get('page_id') if flow.request.query.get('capture_protocol') == '2' else None
+                command = claim_refresh_command(owner_page) if api_ready and not busy and storage_ready else None
+                if busy and flow.request.query.get('task_id'):
+                    from backend.channels_refresh import get_refresh_status
+                    status = get_refresh_status(flow.request.query.get('task_id'))
+                    if (status and status.get('lease_token') and flow.request.query.get('lease_token') != status['lease_token']):
+                        command = {'terminal_task':{'status':'cancelled','message':'原采集页面已被接替，已停止旧页面任务'}}
+                    elif not status or status['status'] in {'completed','failed','cancelled'}:
+                        command = {'terminal_task':status or {'status':'failed','message':'原采集任务已结束或被替换'}}
                 body = json.dumps(
                     {"code": 0, "data": command}, ensure_ascii=False
                 ).encode("utf-8")
@@ -888,11 +929,11 @@ class ChannelsAddon:
 
 # ── Synced Data Saving (同步数据持久化) ──────────────────────────
 
-from backend.channels_storage import locked_feeds, read_feeds, atomic_json
+from backend.channels_storage import locked_feeds, read_feeds, feed_store
 
 
 @locked_feeds
-def save_synced_feeds(username, feeds, *, task_id=""):
+def save_synced_feeds(username, feeds, *, task_id="", page=None, lease_token=None):
     import urllib.parse
     from backend.channels_capture import capture_metadata
     from backend.config import load_json, save_json
@@ -908,10 +949,13 @@ def save_synced_feeds(username, feeds, *, task_id=""):
         raise ValueError("采集结果缺少作者或作品列表")
         
     username = urllib.parse.unquote(username)
-    from backend.channels_refresh import validate_capture, record_capture
-    validate_capture(task_id, username)
+    from backend.channels_refresh import validate_capture, record_capture, capture_write
+    validate_capture(task_id, username, lease_token)
+    store = feed_store(CHANNELS_FEEDS_FILE)
+    store.ensure_ready()
     if not feeds:
-        return {"saved_ids": [], "capture_task_id": task_id}
+        with capture_write(task_id, username, lease_token):
+            return store.merge(username, [], page=page) or {"saved_ids": [], "capture_task_id": task_id}
     saved_ids = set()
         
     first_feed = feeds[0]
@@ -972,27 +1016,8 @@ def save_synced_feeds(username, feeds, *, task_id=""):
             })
         save_favorites_atomic(CHANNELS_FAVORITES_FILE, favs)
     
-    # 2. Update/Merge Feeds DB
-    feeds_db = read_feeds(CHANNELS_FEEDS_FILE)
-    
-    # If there are old feeds saved under the nickname (placeholder), move/merge them
-    old_feeds = []
-    if nickname in feeds_db:
-        old_feeds = feeds_db.pop(nickname) # Extract and delete old key
-    if username in feeds_db and nickname != username:
-        pass
-        
-    if username not in feeds_db:
-        feeds_db[username] = []
-        
-    # Append old feeds if they are not already in the real list
-    for of in old_feeds:
-        of_id = of.get("id")
-        if not of_id:
-            continue
-        if not any(item.get("id") == of_id for item in feeds_db[username]):
-            feeds_db[username].append(of)
-        
+    items = []
+
     for feed in feeds:
         is_media = False
         if feed.get("type") == "media":
@@ -1067,18 +1092,12 @@ def save_synced_feeds(username, feeds, *, task_id=""):
         if duration_seconds is not None:
             item["duration_seconds"] = duration_seconds
         
-        found = False
-        for ex_item in feeds_db[username]:
-            if ex_item.get("id") == feed_id:
-                ex_item.update(item)
-                found = True
-                break
-        if not found:
-            feeds_db[username].append(item)
-            
-    atomic_json(CHANNELS_FEEDS_FILE, feeds_db)
-    record_capture(task_id, username, saved_ids)
-    return {"saved_ids": sorted(saved_ids), "capture_task_id": task_id}
+        items.append(item)
+
+    with capture_write(task_id, username, lease_token):
+        receipt = store.merge(username, items, alias=nickname, page=page)
+        record_capture(task_id, username, saved_ids, lease_token)
+    return receipt or {"saved_ids": sorted(saved_ids), "capture_task_id": task_id}
 
 
 # ── Custom Injected Script Content (注入 JS 模板) ───────────────

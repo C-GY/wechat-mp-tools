@@ -1,3 +1,4 @@
+import asyncio
 import json
 import tempfile
 import unittest
@@ -491,7 +492,7 @@ class ChannelsPageReadinessTests(unittest.TestCase):
             request=http.Request.make("GET", "https://channels.weixin.qq.com" + path),
             response=None,
         )
-        mitm_proxy.ChannelsAddon().request(flow)
+        asyncio.run(mitm_proxy.ChannelsAddon().request(flow))
         return flow
 
     def test_static_traffic_does_not_mean_collection_environment_is_available(self):
@@ -515,10 +516,24 @@ class ChannelsPageReadinessTests(unittest.TestCase):
         self.assertEqual(channels_refresh.get_refresh_status()["status"], "waiting")
 
     def test_ready_idle_page_can_claim_a_task(self):
+        from backend.channels import CHANNELS_FEEDS_FILE
+        from backend.channels_storage import feed_store
+        feed_store(CHANNELS_FEEDS_FILE).ensure_ready()
         channels_refresh.start_refresh_task([{"username": "author-a"}])
         self.request("/__wx_channels_api/refresh-command?page_id=a&api_ready=1&busy=0")
         self.assertIsNotNone(mitm_proxy.wait_for_channels_page(0, timeout=0))
         self.assertEqual(channels_refresh.get_refresh_status()["status"], "running")
+        self.assertFalse(channels_refresh.get_refresh_status().get('lease_token'))
+
+    def test_new_page_claim_uses_owner_lease(self):
+        from backend.channels import CHANNELS_FEEDS_FILE
+        from backend.channels_storage import feed_store
+        feed_store(CHANNELS_FEEDS_FILE).ensure_ready()
+        channels_refresh.start_refresh_task([{"username": "author-a"}])
+        response = self.request('/__wx_channels_api/refresh-command?page_id=a&capture_protocol=2&api_ready=1&busy=0')
+        command = json.loads(response.response.get_text())['data']
+        self.assertEqual(command['capture_protocol'],2)
+        self.assertTrue(command['lease_token'])
 
     def test_newer_not_ready_signal_invalidates_the_same_page(self):
         mitm_proxy.record_channels_page("page-a", api_ready=True)

@@ -4,7 +4,7 @@
  * 复用现有能力：
  *   - WXU.API4.finderGetFollowList  枚举「我关注的视频号」（见 docs 方案 §8）
  *   - WXU.API.finderUserPage        翻页拉取单个作者作品（与 profile.js 同步逻辑一致）
- *   - POST /__wx_channels_api/sync-feed       出口，落盘到 channels_parsed_feeds.json
+ *   - POST /__wx_channels_api/sync-feed       出口，增量保存到本地作品库
  *   - GET  /__wx_channels_api/synced-feed-ids 每作者已同步作品 id，用于增量「只采新作品」
  *   - POST /__wx_channels_api/call-log        调用埋点，供「测风控概率」分析
  *
@@ -205,22 +205,28 @@
   }
 
   // ---- 工具箱远程触发：全量刷新「已收藏创作者」----
+  var activeRemoteTaskId = "";
+  var remoteLeaseToken = "";
+  var remoteTerminalMessage = "";
   async function reportRemoteProgress(taskId, progress) {
     var body = progress || {};
     body.task_id = taskId;
     body.page_id = pageId;
+    body.lease_token = remoteLeaseToken;
     var result = await WXU.request({
       method: "POST", url: "/__wx_channels_api/refresh-progress", body: body, timeout: 30000,
     });
     if (result[0]) throw result[0];
-    if (result[1] && result[1].status === "cancelled" && body.status === "running") {
-      throw new Error(result[1].message || "刷新任务已取消");
+    if (result[1] && ["cancelled", "failed", "completed"].includes(result[1].status) && body.status === "running") {
+      throw new Error(result[1].message || "刷新任务已结束");
     }
     return result[1];
   }
 
   // 与作者主页「同步作品」保持一致：从第一页开始翻到末页，后端按 feed id 合并更新。
-  async function refreshFavoriteAuthor(author, taskId, authorIndex, authorCount, totals) {
+  async function refreshFavoriteAuthor(author, taskId, authorIndex, authorCount, totals, options) {
+    options = options || {};
+    var durable = options.capture_protocol >= 2;
     var marker = "";
     var authorVideos = 0;
     var pageNumber = 1;
@@ -229,7 +235,42 @@
     var hasMore = true;
     var seenIds = new Set();
     var seenMarkers = new Set();
+    var resumedCursor = false;
     var label = author.nickname || author.username;
+
+    function query(fields) {
+      return Object.keys(fields).map(function (key) { return encodeURIComponent(key) + "=" + encodeURIComponent(fields[key]); }).join("&");
+    }
+    async function requestValue(opt) {
+      var result = await WXU.request(opt);
+      if (result[0]) throw result[0];
+      return result[1];
+    }
+    async function savePage(feeds, requestId) {
+      var identity = {task_id:taskId, username:author.username, page_id:requestId, lease_token:options.lease_token || ""};
+      var body = Object.assign({feeds:feeds}, identity);
+      var deadline = Date.now() + 240000;
+      var submit = true, failures = 0;
+      while (Date.now() < deadline && !cancelled) {
+        var result;
+        try {
+          result = await requestValue(submit ? {method:"POST",url:"/__wx_channels_api/sync-feed",body:body,timeout:5000} :
+            {method:"GET",url:"/__wx_channels_api/sync-feed-status?" + query(identity),timeout:5000});
+          failures = 0;
+        } catch (error) {
+          // A lost HTTP reply is not proof that the transaction failed.
+          submit = false;
+          if (++failures >= 5) throw error;
+          await sleep(1000);
+          continue;
+        }
+        if (result && result.status === "saved") return [null,result];
+        if (result && result.status === "failed") throw new Error(result.message || "保存作品失败");
+        submit = !result || ["missing","busy","preparing"].includes(result.status);
+        await sleep(1000);
+      }
+      throw new Error(cancelled ? "采集已停止" : "等待作品保存回执超时，请查看本地作品库状态");
+    }
 
     function pageFlag(value) {
       if (value === true || value === 1 || value === "1" || value === "true") return true;
@@ -238,6 +279,16 @@
     }
 
     try {
+      if (durable) {
+        var resume = await requestValue({method:"GET",timeout:5000,url:"/__wx_channels_api/refresh-resume?" +
+          query({task_id:taskId,username:author.username,lease_token:options.lease_token || ""})});
+        marker = resume.marker || "";
+        pageNumber = resume.page_number || 1;
+        resumedCursor = !!marker;
+        seenIds = new Set(resume.saved_ids || []);
+        authorVideos = seenIds.size;
+        if (resume.complete) return authorVideos;
+      }
       while (hasMore && !cancelled && !circuitOpen) {
         pageAttempt++;
         var headline =
@@ -265,9 +316,17 @@
         }, { author: label, remoteRefresh: true, task_id: taskId, page_number: pageNumber, page_attempt: pageAttempt });
 
         if (!r || r.errCode !== 0) {
+          if (durable && resumedCursor) {
+            await requestValue({method:"POST",url:"/__wx_channels_api/refresh-reset",timeout:5000,
+              body:{task_id:taskId,username:author.username,lease_token:options.lease_token || ""}});
+            marker = ""; pageNumber = 1; pageAttempt = 0; resumedCursor = false; seenMarkers.clear();
+            setPanel("running", "原分页位置已失效，正在从第一页重新采集");
+            continue;
+          }
           noteFailure();
           throw new Error((r && r.errMsg) || "作者作品接口调用失败");
         }
+        resumedCursor = false;
 
         var data = r.data || {};
         var validList = Array.isArray(data.object);
@@ -275,8 +334,9 @@
         var rawVideoObjects = raw.filter(function (obj) {
           return obj && obj.objectDesc && obj.objectDesc.mediaType === 4;
         });
-        if (rawVideoObjects.length > 0) {
-          var receipt = await WXU.request({
+        var requestId = pageNumber + ":" + pageAttempt + ":" + Date.now().toString(36) + ":" + Math.random().toString(36).slice(2);
+        if (rawVideoObjects.length > 0 || durable) {
+          var receipt = durable ? await savePage(rawVideoObjects, requestId) : await WXU.request({
             method: "POST",
             url: "/__wx_channels_api/sync-feed",
             body: { username: author.username, feeds: rawVideoObjects, task_id: taskId },
@@ -292,6 +352,8 @@
           }
           saved.saved_ids.forEach(function (id) { seenIds.add(id); });
           authorVideos = seenIds.size;
+          setPanel("running", "正在刷新 " + authorIndex + "/" + authorCount + "：" + esc(label) +
+            "<br>第 " + pageNumber + " 页 · 已同步 " + authorVideos + " 个作品");
         }
 
         var nextMarker = typeof data.lastBuffer === "string" ? data.lastBuffer : "";
@@ -340,6 +402,20 @@
           error.pagination = diagnostic;
           throw error;
         }
+        if (durable) {
+          var checkpointBody = {task_id:taskId,username:author.username,page_id:requestId,lease_token:options.lease_token || "",
+            page_number:hasMore ? pageNumber + 1 : pageNumber,marker:hasMore ? nextMarker : "",complete:!hasMore};
+          try {
+            await requestValue({method:"POST",url:"/__wx_channels_api/refresh-checkpoint",timeout:5000,body:checkpointBody});
+          } catch (checkpointError) {
+            var confirmed = await requestValue({method:"GET",timeout:5000,url:"/__wx_channels_api/refresh-resume?" +
+              query({task_id:taskId,username:author.username,lease_token:options.lease_token || ""})});
+            if (confirmed.page_number !== checkpointBody.page_number || confirmed.marker !== checkpointBody.marker ||
+                confirmed.complete !== checkpointBody.complete) {
+              await requestValue({method:"POST",url:"/__wx_channels_api/refresh-checkpoint",timeout:5000,body:checkpointBody});
+            }
+          }
+        }
         if (hasMore) {
           seenMarkers.add(nextMarker);
           marker = nextMarker;
@@ -361,6 +437,9 @@
   async function runRemoteFavoritesRefresh(command) {
     if (running || !command || !command.task_id) return;
     running = true;
+    activeRemoteTaskId = command.task_id;
+    remoteLeaseToken = command.lease_token || "";
+    remoteTerminalMessage = "";
     cancelled = false;
     circuitFails = 0;
     circuitOpen = false;
@@ -399,7 +478,7 @@
         var author = authors[i];
         try {
           var count = await refreshFavoriteAuthor(
-            author, command.task_id, i + 1, authors.length, totals
+            author, command.task_id, i + 1, authors.length, totals, command
           );
           totals.videos += count;
           totals.completed++;
@@ -434,7 +513,7 @@
 
       if (cancelled) {
         stopHeartbeat();
-        await reportRemoteProgress(command.task_id, {
+        var stoppedStatus = await reportRemoteProgress(command.task_id, {
           status: "cancelled",
           completed_authors: totals.completed,
           failed_authors: totals.failed,
@@ -442,7 +521,7 @@
           author_results: authorResults,
           message: "刷新已停止",
         });
-        finish("已停止 · 已刷新 " + totals.completed + " 个作者");
+        finish(remoteTerminalMessage || (stoppedStatus && stoppedStatus.message) || "已停止 · 已刷新 " + totals.completed + " 个作者");
       } else if (circuitOpen) {
         stopHeartbeat();
         await reportRemoteProgress(command.task_id, {
@@ -459,7 +538,7 @@
           "刷新完成：成功 " + totals.completed + " 个作者，失败 " + totals.failed +
           " 个，同步作品 " + totals.videos + " 个";
         stopHeartbeat();
-        await reportRemoteProgress(command.task_id, {
+        var finalStatus = await reportRemoteProgress(command.task_id, {
           status: "completed",
           completed_authors: totals.completed,
           failed_authors: totals.failed,
@@ -469,23 +548,25 @@
           current_nickname: "",
           message: finalMessage,
         });
-        finish(finalMessage);
+        finish((finalStatus && finalStatus.message) || finalMessage);
       }
     } catch (ex) {
       var errorMessage = ex && ex.message ? ex.message : String(ex);
       stopHeartbeat();
-      await reportRemoteProgress(command.task_id, {
+      try { await reportRemoteProgress(command.task_id, {
         status: "failed",
         completed_authors: totals.completed,
         failed_authors: totals.failed,
         total_videos: totals.videos,
           author_results: authorResults,
         message: errorMessage,
-      });
-      finish("刷新失败：" + errorMessage);
+      }); } catch (_) {}
+      finish(remoteTerminalMessage || "刷新失败：" + errorMessage);
     } finally {
       stopHeartbeat();
       running = false;
+      activeRemoteTaskId = "";
+      remoteLeaseToken = "";
     }
   }
 
@@ -632,7 +713,7 @@
   }
 
   function finish(msg) {
-    setPanel("done", msg);
+    setPanel("done", esc(msg));
   }
 
   var remotePollBusy = false;
@@ -647,14 +728,21 @@
         method: "GET",
         timeout: 5000,
         url: "/__wx_channels_api/refresh-command?page_id=" + encodeURIComponent(pageId) +
-          "&api_ready=" + (apiReady ? "1" : "0") + "&busy=" + (running ? "1" : "0"),
+          "&capture_protocol=2&api_ready=" + (apiReady ? "1" : "0") + "&busy=" + (running ? "1" : "0") +
+          "&task_id=" + encodeURIComponent(activeRemoteTaskId) + "&lease_token=" + encodeURIComponent(remoteLeaseToken),
       });
       var command = ret && ret[1];
       // 兼容 request 包装器返回 data 或完整响应对象两种形式。
       if (command && command.code === 0 && Object.prototype.hasOwnProperty.call(command, "data")) {
         command = command.data;
       }
-      if (command && command.task_id) runRemoteFavoritesRefresh(command);
+      if (command && command.terminal_task && activeRemoteTaskId) {
+        cancelled = true;
+        remoteTerminalMessage = command.terminal_task.message || "采集任务已结束";
+        finish(remoteTerminalMessage);
+      } else if (command && command.task_id) {
+        runRemoteFavoritesRefresh(command).catch(function (error) { finish("刷新失败：" + (error.message || error)); });
+      }
     } catch (_) {
     } finally {
       remotePollBusy = false;

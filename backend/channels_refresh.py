@@ -4,6 +4,7 @@ import copy
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 
 
 _ACTIVE_STATUSES = {"waiting", "running"}
@@ -83,7 +84,7 @@ def _normalize_authors(authors):
     return normalized
 
 
-def start_refresh_task(authors, *, require_receipt=False):
+def start_refresh_task(authors, *, require_receipt=False, task_id=None, persisted_ids=None):
     """Create a refresh task, or return the currently active one."""
     global _refresh_task
     normalized = _normalize_authors(authors)
@@ -96,12 +97,12 @@ def start_refresh_task(authors, *, require_receipt=False):
 
         now = time.time()
         _refresh_task = {
-            "task_id": uuid.uuid4().hex,
+            "task_id": task_id or uuid.uuid4().hex,
             "status": "waiting",
             "authors": normalized,
             "claimed": False,
             "require_receipt": require_receipt,
-            "persisted_ids": {},
+            "persisted_ids": persisted_ids or {},
             "author_results": {},
             "total_authors": len(normalized),
             "completed_authors": 0,
@@ -116,7 +117,7 @@ def start_refresh_task(authors, *, require_receipt=False):
         return _public_task(_refresh_task), True
 
 
-def claim_refresh_command():
+def claim_refresh_command(page_id=None):
     """Claim the pending command once from an injected WeChat page."""
     global _refresh_task
     with _task_lock:
@@ -138,13 +139,16 @@ def claim_refresh_command():
             return None
 
         _refresh_task["claimed"] = True
+        _refresh_task['lease_token'] = uuid.uuid4().hex if page_id else ''
+        _refresh_task['owner_page'] = page_id or ''
         _refresh_task["status"] = "running"
         _refresh_task["message"] = "微信视频号页面已连接，准备刷新收藏创作者"
         _refresh_task["updated_at"] = now
         return {
             "task_id": _refresh_task["task_id"],
             "authors": copy.deepcopy(_refresh_task["authors"]),
-            "capture_protocol": 1,
+            "capture_protocol": 2 if page_id else 1,
+            "lease_token": _refresh_task['lease_token'],
         }
 
 
@@ -160,6 +164,8 @@ def update_refresh_task(payload):
 
         if _refresh_task["status"] in _TERMINAL_STATUSES:
             return _public_task(_refresh_task)
+        if payload.get('page_id') and _refresh_task.get('lease_token') and payload.get('lease_token') != _refresh_task['lease_token']:
+            raise ValueError('采集页面已被接替，请停止旧页面任务')
         status = payload.get("status")
         results = payload.get("author_results")
         if isinstance(results, dict):
@@ -214,7 +220,7 @@ def update_refresh_task(payload):
         return _public_task(_refresh_task)
 
 
-def validate_capture(task_id, username):
+def validate_capture(task_id, username, lease_token=None):
     if not task_id:
         return
     with _task_lock:
@@ -222,13 +228,15 @@ def validate_capture(task_id, username):
                 or _refresh_task["status"] not in _ACTIVE_STATUSES
                 or username not in {a["username"] for a in _refresh_task["authors"]}):
             raise ValueError("采集结果不属于当前刷新任务或作者")
+        if _refresh_task.get('lease_token') and lease_token != _refresh_task['lease_token']:
+            raise ValueError('采集页面已被接替，请停止旧页面任务')
 
 
-def record_capture(task_id, username, video_ids):
+def record_capture(task_id, username, video_ids, lease_token=None):
     if not task_id:
         return
     with _task_lock:
-        validate_capture(task_id, username)
+        validate_capture(task_id, username, lease_token)
         current = set(_refresh_task["persisted_ids"].get(username, []))
         current.update(str(value) for value in video_ids)
         _refresh_task["persisted_ids"][username] = sorted(current)
@@ -242,6 +250,14 @@ def get_refresh_status(task_id=None):
         if task_id and task_id != _refresh_task["task_id"]:
             return None
         return _public_task(_refresh_task)
+
+
+@contextmanager
+def capture_write(task_id, username, lease_token=None):
+    """Fence a short storage commit against cancellation/replacement."""
+    with _task_lock:
+        validate_capture(task_id, username, lease_token)
+        yield
 
 
 def reset_refresh_task():

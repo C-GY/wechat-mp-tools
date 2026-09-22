@@ -1176,7 +1176,16 @@ class PinchuangHub:
         from backend.channels_refresh import CaptureRefreshError, get_refresh_status, start_refresh_task, update_refresh_task
 
         require_receipt = getattr(self, "require_capture_receipt", False)
-        task, created = start_refresh_task([author], require_receipt=require_receipt)
+        from backend.channels_storage import feed_store
+        from backend.channels import CHANNELS_FEEDS_FILE
+        store = feed_store(CHANNELS_FEEDS_FILE)
+        self._update_run(run_id, phase='preparing_storage', message='正在准备本地作品库，迁移完成后开始采集')
+        store.ensure_ready()
+        # Same unfinished run/author resumes its durable page checkpoint after restart.
+        capture_id = uuid.uuid5(uuid.NAMESPACE_URL, f'{self.thread_prefix}:{run_id}:{author["username"]}').hex if require_receipt else None
+        saved = store.resume(capture_id,author['username'])['saved_ids'] if capture_id else []
+        task, created = start_refresh_task([author], require_receipt=require_receipt,
+                                          task_id=capture_id, persisted_ids={author['username']:saved})
         if not created:
             raise RuntimeError("另一个视频号刷新任务正在运行")
         task_id = task["task_id"]
@@ -1277,7 +1286,8 @@ class PinchuangHub:
     def _load_author_videos(author: dict) -> list[dict]:
         from backend import channels
 
-        feeds_db = load_json(channels.CHANNELS_FEEDS_FILE, {})
+        from backend.channels_storage import read_feeds
+        feeds_db = read_feeds(channels.CHANNELS_FEEDS_FILE)
         username = str(author.get("username") or "")
         nickname = str(author.get("nickname") or "")
         videos = feeds_db.get(username)
@@ -1368,6 +1378,38 @@ class PinchuangHub:
             "failures": item_failures[:100],
         }
 
+    def _notify_creator_failure(self, notifier, run, author_name, result):
+        stalled = any(f.get('capture_diagnostic', {}).get('timeout', {}).get('reason') == 'no_saved_progress'
+                      for f in result.get('failures', []) if isinstance(f, dict))
+        suffix = ''
+        if stalled:
+            with self.lock:
+                current = self.state.get('current_run') or {}
+                counts = current.setdefault('capture_stall_notices', [])
+                identity = result.get('author_id') or author_name
+                if identity not in counts:
+                    counts.append(identity)
+                    self._persist_state_locked()
+                if len(counts) > 1:
+                    return
+            suffix = '\n本批次后续同类采集停滞将合并汇总，逐作者明细保留在任务记录中。'
+        notifier.send(
+            f"{self.module_name}创作者{'同步失败' if result['status'] == 'failed' else '部分失败'}",
+            f"创作者：{author_name}\n批次：{run['sync_batch_id']}\n"
+            f"{self.failure_items_label}：{result['failed_items']} 条\n说明：{result.get('message', '')}{suffix}",
+        )
+
+    def _notify_stall_summary(self, notifier, run_id, batch_id):
+        with self.lock:
+            run = self.state.get('current_run') or {}
+            count = len(run.get('capture_stall_notices', []))
+            if run.get('run_id') != run_id or count < 2 or run.get('capture_stall_summary_sent'):
+                return
+        result = notifier.send(f'{self.module_name}采集停滞汇总',
+                              f'批次：{batch_id}\n共有 {count} 位创作者采集未完整结束。\n已保存结果保留，完整失败明细请查看任务记录。')
+        if isinstance(result, dict) and result.get('sent') is True:
+            self._update_run(run_id, capture_stall_summary_sent=True)
+
     def _run_pipeline(self, run_id: str):
         notifier = self._notifier()
         try:
@@ -1456,21 +1498,13 @@ class PinchuangHub:
                         totals["completed_creators"] += 1
                     else:
                         totals["failed_creators"] += 1
-                        notifier.send(
-                            f"{self.module_name}创作者{'同步失败' if result['status'] == 'failed' else '部分失败'}",
-                            f"创作者：{author_name}\n批次：{run['sync_batch_id']}\n"
-                            f"{self.failure_items_label}：{result['failed_items']} 条\n"
-                            f"说明：{result.get('message', '')}",
-                        )
+                        self._notify_creator_failure(notifier, run, author_name, result)
                 except _RunStopping:
                     raise
                 except Exception as exc:
                     totals["failed_creators"] += 1
                     result = self._creator_failure_result(author, exc, creator_started_at)
-                    notifier.send(
-                        f"{self.module_name}创作者同步失败",
-                        f"创作者：{author_name}\n批次：{run['sync_batch_id']}\n原因：{exc}",
-                    )
+                    self._notify_creator_failure(notifier, run, author_name, result)
                 self._creator_result(run_id, result)
                 for field in (
                     "refreshed_videos",
@@ -1501,6 +1535,7 @@ class PinchuangHub:
                 f"失败/部分失败 {totals['failed_creators']} 个，"
                 f"{self.storage_label}处理 {totals['database_written']} 条作品{self.processed_suffix}"
             )
+            self._notify_stall_summary(notifier, run_id, run['sync_batch_id'])
             self._finish_run(run_id, status, message)
         except _RunStopping:
             return

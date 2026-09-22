@@ -1,3 +1,5 @@
+import asyncio
+from backend.channels_storage import read_feeds, feed_store, FeedStore
 import json
 from pathlib import Path
 import subprocess
@@ -34,7 +36,7 @@ def finish(task_id, count=1, complete=True):
 def test_capture_ack_is_persisted_and_correlated_to_task(capture):
     receipt = mitm_proxy.save_synced_feeds("author", [feed()], task_id=capture)
     assert receipt == {"saved_ids": ["video-1"], "capture_task_id": capture}
-    saved = json.loads(channels.CHANNELS_FEEDS_FILE.read_text(encoding="utf-8"))
+    saved = read_feeds(channels.CHANNELS_FEEDS_FILE)
     assert saved["author"][0]["capture_task_id"] == capture
     assert saved["author"][0]["rpa_payload"] == feed()
     assert finish(capture)["status"] == "completed"
@@ -45,12 +47,12 @@ def test_actual_sync_endpoint_returns_receipt_and_reports_storage_failure(captur
     payload = json.dumps({"username": "author", "feeds": [feed()], "task_id": capture}).encode()
     def send():
         flow = SimpleNamespace(request=http.Request.make("POST", "https://channels.weixin.qq.com/__wx_channels_api/sync-feed", payload, {"Content-Type": "application/json"}), response=None)
-        mitm_proxy.ChannelsAddon().request(flow)
+        asyncio.run(mitm_proxy.ChannelsAddon().request(flow))
         return flow.response
     response = send()
     assert response.status_code == 200
     assert json.loads(response.content)["data"]["saved_ids"] == ["video-1"]
-    with patch.object(mitm_proxy, "atomic_json", side_effect=OSError("disk full")):
+    with patch.object(FeedStore, "merge", side_effect=OSError("disk full")):
         response = send()
     assert response.status_code == 500
     assert json.loads(response.content)["code"] != 0
@@ -64,7 +66,7 @@ def test_partial_or_unconfirmed_capture_cannot_finish(capture, count, complete):
 
 
 def test_save_failure_cannot_be_acknowledged(capture):
-    with patch.object(mitm_proxy, "atomic_json", side_effect=OSError("disk full")):
+    with patch.object(FeedStore, "merge", side_effect=OSError("disk full")):
         with pytest.raises(OSError, match="disk full"):
             mitm_proxy.save_synced_feeds("author", [feed()], task_id=capture)
     assert finish(capture)["status"] == "failed"
@@ -75,7 +77,7 @@ def test_wrong_task_and_corrupt_cache_never_overwrite_good_evidence(capture):
     with pytest.raises(ValueError, match="任务"):
         mitm_proxy.save_synced_feeds("author", [feed()], task_id="old-task")
     channels.CHANNELS_FEEDS_FILE.write_text('{"broken":', encoding="utf-8")
-    with pytest.raises(json.JSONDecodeError):
+    with pytest.raises(ValueError):
         mitm_proxy.save_synced_feeds("author", [feed()], task_id=capture)
     assert channels.CHANNELS_FEEDS_FILE.read_text(encoding="utf-8") == '{"broken":'
 
@@ -106,12 +108,11 @@ def test_capture_and_upload_receipt_do_not_overwrite_each_other(capture):
     mitm_proxy.save_synced_feeds("author", [feed()], task_id=capture)
     read, release, capture_started = threading.Event(), threading.Event(), threading.Event()
     errors = []
-    original_read = oss.read_feeds
-    def delayed_read(path):
-        data = original_read(path)
+    original_write = FeedStore.patch_existing
+    def delayed_write(store, *args):
         read.set()
         assert release.wait(3)
-        return data
+        return original_write(store, *args)
     def upload_receipt():
         try:
             oss.OSSUploadManager._save_video_result({"username": "author", "video_id": "video-1"},
@@ -124,7 +125,7 @@ def test_capture_and_upload_receipt_do_not_overwrite_each_other(capture):
             mitm_proxy.save_synced_feeds("author", [feed("video-2")], task_id=capture)
         except Exception as exc:
             errors.append(exc)
-    with patch.object(oss, "read_feeds", side_effect=delayed_read):
+    with patch.object(FeedStore, "patch_existing", delayed_write):
         first = threading.Thread(target=upload_receipt)
         second = threading.Thread(target=capture_page)
         first.start()
@@ -139,7 +140,7 @@ def test_capture_and_upload_receipt_do_not_overwrite_each_other(capture):
                 second.join(3)
     assert not first.is_alive() and not second.is_alive()
     assert not errors
-    rows = {v["id"]: v for v in json.loads(channels.CHANNELS_FEEDS_FILE.read_text(encoding="utf-8"))["author"]}
+    rows = {v["id"]: v for v in read_feeds(channels.CHANNELS_FEEDS_FILE)["author"]}
     assert set(rows) == {"video-1", "video-2"}
     assert rows["video-1"]["oss_video_url"].endswith("1.mp4")
 

@@ -1,3 +1,4 @@
+from backend.channels_storage import read_feeds, feed_store, FeedStore
 import json
 import tempfile
 import unittest
@@ -47,7 +48,7 @@ class ChannelsInteractionMetricsPersistenceTests(unittest.TestCase):
             ):
                 mitm_proxy.save_synced_feeds("author-a", [raw_feed])
 
-            stored = json.loads(feeds_file.read_text(encoding="utf-8"))
+            stored = read_feeds(feeds_file)
             video = stored["author-a"][0]
             self.assertEqual(video["like_count"], 1234)
             self.assertEqual(video["share_count"], 56)
@@ -70,7 +71,7 @@ class ChannelsInteractionMetricsPersistenceTests(unittest.TestCase):
                 del feed["commentCount"]
                 feed["likeCount"] = 0
                 mitm_proxy.save_synced_feeds("a", [feed])
-            video = json.loads(feeds_file.read_text(encoding="utf-8"))["a"][0]
+            video = read_feeds(feeds_file)["a"][0]
             video["oss_video_url"] = "https://oss.example/video.mp4"
             row = build_row({"username": "a", "nickname": "作者"}, video, "batch-1")
             self.assertEqual(row["like_count"], 0)

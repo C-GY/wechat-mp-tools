@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from backend import channels, channels_refresh, competitor_monitor as monitor, mitm_proxy, pinchuang
+from backend.channels_storage import feed_store
 
 
 AUTHOR = {"username": "author", "nickname": "作者"}
@@ -123,9 +124,11 @@ def test_unconfirmed_stale_or_cancelled_capture_does_not_start_transfer(scenario
     finish_capture(task_id, saved=() if case == "no_receipt" else ("v1", "v2"),
                    status="cancelled" if case == "cancelled" else "completed")
     if case == "missing_current_records":
-        channels.CHANNELS_FEEDS_FILE.write_text(json.dumps({"author": [{
+        store = feed_store(channels.CHANNELS_FEEDS_FILE)
+        store.remove('author')
+        store.merge('author', [{
             "id": "stale", "capture_task_id": "old-task", "collected_at": 9999999999,
-        }]}), encoding="utf-8")
+        }])
     if case == "wrong_task":
         def refresh(*args):
             hub._last_refresh_task_id = "different-task"

@@ -27,7 +27,8 @@ import requests
 from flask import Blueprint, jsonify, request
 
 from backend.config import DATA_DIR, OUTPUT_DIR, get_settings, load_json, save_json
-from backend.channels_storage import locked_feeds, read_feeds, atomic_json
+from backend.channels_storage import locked_feeds, read_feeds, atomic_json, feed_store
+from collections.abc import Mapping
 from backend.oss_receipts import UploadReceipts
 from backend.sync_errors import IncompleteDownload, TransferHTTPError, error_details, transient_transfer_error
 
@@ -430,13 +431,14 @@ class OSSUploadManager:
         self.active_batch_id = ""
         self.worker = None
         self._receipts_migrated = False
+        self._receipts_migration_lock = threading.Lock()
         self._load()
 
     def migrate_upload_receipts(self):
         """Backfill available old successes before history can be cleared."""
         from backend import channels
 
-        with self.lock:
+        with self._receipts_migration_lock:
             if self._receipts_migrated:
                 return
             feeds_db = read_feeds(channels.CHANNELS_FEEDS_FILE)
@@ -451,7 +453,9 @@ class OSSUploadManager:
                                                     video.get("oss_object_key"), video.get("oss_bucket"))
                     if result:
                         records.append((str(video["id"]), result))
-            for task in self.tasks:
+            with self.lock:
+                tasks = [dict(task) for task in self.tasks]
+            for task in tasks:
                 if task.get("status") not in {"completed", "skipped"}:
                     continue
                 result = _legacy_upload_receipt(task.get("video_id"), task.get("oss_url"),
@@ -530,8 +534,8 @@ class OSSUploadManager:
             }
 
     def clear_finished(self):
+        self.migrate_upload_receipts()
         with self.lock:
-            self.migrate_upload_receipts()
             running = bool(self.worker and self.worker.is_alive())
             self.tasks = [
                 task
@@ -564,7 +568,7 @@ class OSSUploadManager:
 
         favorites = load_json(channels.CHANNELS_FAVORITES_FILE, [])
         feeds_db = read_feeds(channels.CHANNELS_FEEDS_FILE)
-        if not isinstance(feeds_db, dict):
+        if not isinstance(feeds_db, Mapping):
             feeds_db = {}
         favorite = next(
             (
@@ -670,10 +674,10 @@ class OSSUploadManager:
             }
         if not get_oss_config()["configured"]:
             raise ValueError("请先完成 OSS 配置")
+        self.migrate_upload_receipts()
         with self.lock:
             if self.worker and self.worker.is_alive():
                 raise RuntimeError("OSS 同步任务正在进行中")
-            self.migrate_upload_receipts()
             self.tasks.extend(task for task, _ in candidates)
             self.tasks = self.tasks[-100000:]
             self.active_batch_id = batch_id
@@ -1062,21 +1066,12 @@ class OSSUploadManager:
         # Commit the verified receipt first, even if a fresh capture has no feed
         # row yet or mirroring the result back into the capture cache fails.
         upload_receipts().save(DEFAULT_OSS_ENDPOINT, DEFAULT_OSS_OBJECT_PREFIX, task["video_id"], result)
-        feeds_db = read_feeds(channels.CHANNELS_FEEDS_FILE)
         feed_key = task.get("feed_key") or task.get("username")
-        videos = feeds_db.get(feed_key)
-        if not isinstance(videos, list):
-            return
-        for video in videos:
-            if isinstance(video, dict) and str(video.get("id")) == task["video_id"]:
-                video["oss_video_url"] = result["url"]
-                video["oss_object_key"] = result["object_key"]
-                if result.get("bucket"):
-                    video["oss_bucket"] = result["bucket"]
-                video["oss_upload_status"] = "completed"
-                video["oss_uploaded_at"] = int(time.time())
-                break
-        atomic_json(channels.CHANNELS_FEEDS_FILE, feeds_db)
+        patch = {"oss_video_url":result["url"], "oss_object_key":result["object_key"],
+                 "oss_upload_status":"completed", "oss_uploaded_at":int(time.time())}
+        if result.get("bucket"):
+            patch["oss_bucket"] = result["bucket"]
+        feed_store(channels.CHANNELS_FEEDS_FILE).patch_existing(feed_key, task["video_id"], patch)
 
 
 upload_manager = OSSUploadManager()

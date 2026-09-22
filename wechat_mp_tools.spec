@@ -91,6 +91,8 @@ hiddenimports = [
     'backend.competitor_monitor_store',
     'backend.competitor_author_tags',
     'backend.channels_capture',
+    'backend.channels_storage',
+    'backend.channels_save_jobs',
     'backend.creative_radar',
     'backend.rss_scheduler',
     'backend.transcode',
