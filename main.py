@@ -36,9 +36,13 @@ import multiprocessing
 
 
 from backend.runtime import configure_runtime, log_file, write_startup_error
+from backend.desktop_diagnostics import start_desktop_diagnostics, stop_desktop_diagnostics
 
 # PyInstaller 打包时防止多进程死循环（Playwright 依赖 multiprocessing）
 multiprocessing.freeze_support()
+if __name__ == '__main__' and len(sys.argv) > 1 and sys.argv[1] == '--desktop-watchdog':
+    from backend.desktop_watchdog import watchdog_main
+    raise SystemExit(watchdog_main(sys.argv[2:]))
 configure_runtime()
 
 # ── 修复打包后白屏：当 console=False 时 stdout/stderr 为 None，
@@ -76,6 +80,7 @@ def wait_for_server(port, timeout=15):
 
 def on_closing():
     """窗口关闭回调，彻底杀死后台线程与整个进程"""
+    stop_desktop_diagnostics()
     try:
         from backend.mitm_proxy import ProxyManager
         ProxyManager.get_instance().stop()
@@ -89,6 +94,7 @@ def on_closing():
 
 if __name__ == '__main__':
     try:
+        diagnostics = start_desktop_diagnostics()
         # 启用环境变量标明运行在 PyWebview 容器下（备用逻辑）
         os.environ['USE_PYWEBVIEW'] = '1'
         browser_fallback_mode = False
@@ -217,10 +223,11 @@ if __name__ == '__main__':
 
         # 从主程序 app 导入 Flask 实例与初始化
         from app import app
-        from backend.config import APP_TITLE, ensure_dirs
+        from backend.config import APP_TITLE, APP_VERSION, ensure_dirs
         import logging
 
         ensure_dirs()
+        diagnostics.event('application_version', version=APP_VERSION)
 
         # 抑制 Werkzeug 请求日志，防止在无控制台环境下写入空流导致崩溃
         logging.getLogger('werkzeug').setLevel(logging.ERROR)
@@ -271,6 +278,7 @@ if __name__ == '__main__':
         time.sleep(0.5)
 
         if sys.platform == 'win32' and browser_fallback_mode:
+            diagnostics.event('browser_fallback_started')
             import webbrowser
             import ctypes
             # 弹窗提示用户已切换到浏览器模式
@@ -305,11 +313,14 @@ if __name__ == '__main__':
 
         # 监听关闭事件以完整关闭后台服务
         window.events.closing += on_closing
+        diagnostics.attach_window(window)
 
         # 启动 pywebview GUI 循环（阻塞主线程）
         # debug=False 确保在生成发布版本时完全静默无控制台
         webview.start(debug=False)
     except Exception as e:
+        if 'diagnostics' in locals():
+            diagnostics.event('application_startup_failed', error_type=type(e).__name__)
         write_startup_error(e)
         try:
             if sys.platform == 'win32' and 'browser_fallback_mode' in locals() and browser_fallback_mode:
@@ -331,3 +342,5 @@ if __name__ == '__main__':
                 webview.start()
         except Exception:
             raise
+    finally:
+        stop_desktop_diagnostics()

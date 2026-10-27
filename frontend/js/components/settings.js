@@ -213,6 +213,41 @@ const SettingsPage = {
             </div>
 
             <div class="card" style="margin-top: var(--spacing-lg);">
+                <div class="card-header">
+                    <h3 class="card-title">运行诊断日志</h3>
+                </div>
+                <div class="card-body" style="padding: 0 var(--spacing-md) var(--spacing-md);">
+                    <p class="form-hint">Windows 桌面版会自动记录内存和页面异常，日志按大小滚动保留。出现问题后可导出诊断包发给排查人员。</p>
+                    <div class="form-group">
+                        <label class="form-checkbox-label"><input type="checkbox" id="desktop-alert-enabled" /> 崩溃及内存风险飞书通知</label>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label" for="desktop-alert-source">复用已配置的飞书机器人</label>
+                        <select class="form-input" id="desktop-alert-source">
+                            <option value="auto">自动识别（相同机器人合并）</option>
+                            <option value="competitor">竞对监测</option>
+                        </select>
+                        <div class="form-hint" id="desktop-alert-target">正在读取机器人配置…</div>
+                    </div>
+                    <div class="grid grid-2" style="gap: var(--spacing-md);">
+                        <div class="form-group"><label class="form-label" for="desktop-alert-renderer">网页进程内存阈值（MiB）</label><input class="form-input" type="number" id="desktop-alert-renderer" min="128" max="131072" /></div>
+                        <div class="form-group"><label class="form-label" for="desktop-alert-app">主程序内存阈值（MiB）</label><input class="form-input" type="number" id="desktop-alert-app" min="128" max="131072" /></div>
+                        <div class="form-group"><label class="form-label" for="desktop-alert-commit">系统提交内存阈值（%）</label><input class="form-input" type="number" id="desktop-alert-commit" min="50" max="99" /></div>
+                        <div class="form-group"><label class="form-label" for="desktop-alert-sustain">持续超限时间（秒）</label><input class="form-input" type="number" id="desktop-alert-sustain" min="15" max="3600" /></div>
+                        <div class="form-group"><label class="form-label" for="desktop-alert-cooldown">同类告警间隔（秒）</label><input class="form-input" type="number" id="desktop-alert-cooldown" min="60" max="86400" /></div>
+                    </div>
+                    <p class="form-hint">内存持续超限时预警，页面崩溃或主进程异常退出时通知。内存预警不表示一定会崩溃；断网、断电或守护进程也被结束时，无法保证送达。</p>
+                    <p class="form-hint" id="desktop-alert-watchdog"></p>
+                    <div class="btn-group" style="margin-bottom: var(--spacing-md);">
+                        <button class="btn btn-secondary" id="desktop-alert-save" onclick="SettingsPage.saveDesktopAlerts()">保存告警设置</button>
+                        <button class="btn btn-secondary" id="desktop-alert-test" onclick="SettingsPage.testDesktopAlerts()">发送告警测试</button>
+                    </div>
+                    <button class="btn btn-secondary" id="diagnostics-export" onclick="SettingsPage.exportDiagnostics()">导出诊断日志</button>
+                    <p id="diagnostics-export-result" role="status" style="white-space: pre-wrap; word-break: break-all; margin-top: var(--spacing-sm);"></p>
+                </div>
+            </div>
+
+            <div class="card" style="margin-top: var(--spacing-lg);">
                 <div class="card-body" style="display: flex; justify-content: space-between; align-items: center;">
                     <div style="color: var(--text-muted); font-size: 0.88rem;">
                         💡 修改后的配置将在下一次抓取/下载任务中生效。
@@ -227,12 +262,90 @@ const SettingsPage = {
     },
 
     async init() {
-        await this.loadSettings();
+        await Promise.all([this.loadSettings(), this.loadDesktopAlerts()]);
+    },
+
+    showDesktopAlerts(data) {
+        document.getElementById('desktop-alert-enabled').checked = data.enabled;
+        const source = document.getElementById('desktop-alert-source');
+        source.querySelectorAll('[data-legacy]').forEach(option => option.remove());
+        for (const legacy of data.legacy_sources || []) {
+            const option = new Option(legacy.label, legacy.source);
+            option.dataset.legacy = 'true';
+            source.add(option);
+        }
+        if (['pinchuang', 'guangce', 'radar'].includes(data.source) && ![...source.options].some(option => option.value === data.source)) {
+            const option = new Option('原有通知配置（当前不可用）', data.source);
+            option.dataset.legacy = 'true';
+            source.add(option);
+        }
+        source.value = data.source;
+        for (const [id, key] of Object.entries({renderer: 'renderer_private_mib', app: 'application_private_mib', commit: 'system_commit_percent', sustain: 'sustain_seconds', cooldown: 'cooldown_seconds'})) {
+            document.getElementById(`desktop-alert-${id}`).value = data[key];
+        }
+        document.getElementById('desktop-alert-target').textContent = data.configured ? `当前目标：${data.target_label}` : data.configuration_error;
+        const statuses = {running: '运行中', starting: '正在启动', stopped: '已停止，请重启桌面版', failed: '启动失败，请导出诊断日志', not_started: '未启动，请使用已更新的 Windows 桌面版', unsupported: '当前平台不支持，请使用 Windows 桌面版'};
+        document.getElementById('desktop-alert-watchdog').textContent = `后台守护：${statuses[data.watchdog_status] || '状态未知'}`;
+    },
+
+    async loadDesktopAlerts() {
+        try { this.showDesktopAlerts(await API.get('/api/diagnostics/alerts')); }
+        catch (error) { document.getElementById('desktop-alert-target').textContent = '告警配置读取失败'; }
+    },
+
+    async saveDesktopAlerts() {
+        const button = document.getElementById('desktop-alert-save');
+        button.disabled = true;
+        try {
+            this.showDesktopAlerts(await API.post('/api/diagnostics/alerts', this.desktopAlertForm()));
+            Toast.success('告警设置已保存');
+        } catch (error) { /* API displays the validation error. */ }
+        finally { button.disabled = false; }
+    },
+
+    desktopAlertForm() {
+        const data = {enabled: document.getElementById('desktop-alert-enabled').checked, source: document.getElementById('desktop-alert-source').value};
+        for (const [id, key] of Object.entries({renderer: 'renderer_private_mib', app: 'application_private_mib', commit: 'system_commit_percent', sustain: 'sustain_seconds', cooldown: 'cooldown_seconds'})) {
+            data[key] = Number(document.getElementById(`desktop-alert-${id}`).value);
+        }
+        return data;
+    },
+
+    async testDesktopAlerts() {
+        const button = document.getElementById('desktop-alert-test');
+        button.disabled = true;
+        try {
+            await API.post('/api/diagnostics/alerts/test', this.desktopAlertForm());
+            Toast.success('告警测试消息已发送');
+        } catch (error) { /* API displays the delivery error. */ }
+        finally { button.disabled = false; }
+    },
+
+    async exportDiagnostics() {
+        const button = document.getElementById('diagnostics-export');
+        const result = document.getElementById('diagnostics-export-result');
+        if (button.disabled) return;
+        button.disabled = true;
+        button.textContent = '正在打包…';
+        result.textContent = '';
+        try {
+            const data = await API.post('/api/diagnostics/export', {});
+            result.textContent = `诊断包已生成，请将这个 ZIP 文件发送给排查人员：\n${data.path}`;
+            if (data.has_desktop_diagnostics === false) {
+                result.textContent += '\n未找到内置诊断记录，请确认已更新桌面版，并检查日志目录是否可写。';
+            }
+            Toast.success('诊断日志已打包');
+        } catch (error) {
+            result.textContent = '导出失败，请检查软件目录是否可写后重试。';
+        } finally {
+            button.disabled = false;
+            button.textContent = '导出诊断日志';
+        }
     },
 
     /** SPA 路由复用缓存页时调用，重新从后端拉取最新设置 */
     async onShow() {
-        await this.loadSettings();
+        await Promise.all([this.loadSettings(), this.loadDesktopAlerts()]);
     },
 
     destroy() {

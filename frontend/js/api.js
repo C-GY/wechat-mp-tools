@@ -229,14 +229,16 @@ const API = {
     // ── OSS API ─────────────────────────────────────
     oss: {
         getConfig() { return API.get('/api/oss/config', { showError: false }); },
-        saveConfig(accessKeyId, accessKeySecret = '', bucket) {
+        saveConfig(accessKeyId, accessKeySecret = '', bucket, endpoint) {
             return API.post('/api/oss/config', {
                 access_key_id: accessKeyId,
                 access_key_secret: accessKeySecret,
                 bucket,
+                endpoint,
             });
         },
         clearConfig() { return API.delete('/api/oss/config'); },
+        testConnection(config) { return API.post('/api/oss/test-connection', config, { showError: false }); },
         syncFavorites() { return API.post('/api/oss/sync-favorites'); },
         syncAuthor(username) { return API.post('/api/oss/sync-author', { username }); },
         getUploads() { return API.get('/api/oss/uploads', { showError: false }); },

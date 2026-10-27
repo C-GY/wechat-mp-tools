@@ -33,6 +33,7 @@ const ChannelsCompetitorMonitorPage = {
                     <div id="competitor_monitor-main-progress" style="height:100%; width:0; background:var(--primary); transition:width .25s;"></div>
                 </div>
                 <div id="competitor_monitor-run-message" style="font-size:.84rem; color:var(--text-secondary); margin-top:10px;">—</div>
+                <div id="competitor_monitor-run-publish-filter" style="font-size:.8rem; color:var(--text-muted); margin-top:6px;"></div>
                 <div id="competitor_monitor-recovery-actions" style="display:flex; gap:8px; margin-top:10px; flex-wrap:wrap;"></div>
                 <div id="competitor_monitor-current-creator" style="display:none; align-items:center; gap:10px; margin-top:12px; padding:10px 12px; border-radius:9px; background:rgba(37,99,235,.08); color:var(--text-secondary);">
                     <span id="competitor_monitor-current-creator-position" style="font-size:.78rem; white-space:nowrap;">当前创作者</span>
@@ -94,6 +95,30 @@ const ChannelsCompetitorMonitorPage = {
                     <button class="btn btn-primary" id="btn-competitor_monitor-save-schedule" onclick="ChannelsCompetitorMonitorPage.saveConfig()">保存定时配置</button>
                     <span style="font-size:.8rem; color:var(--text-muted);">添加、删除时间或修改间隔后，请点击保存。</span>
                 </div>
+            </div>
+
+            <div class="card animate-fade-in" style="margin-top:var(--spacing-lg);">
+                <div class="card-header" style="border-bottom:1px solid var(--border-color); padding-bottom:var(--spacing-md); margin-bottom:var(--spacing-md);">
+                    <h3 class="card-title" style="margin:0;">📅 发布时间截止配置</h3>
+                </div>
+                <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:14px;">
+                    <div class="form-group" style="margin:0;">
+                        <label class="form-label" for="competitor_monitor-publish-mode">只采集截止日期之前发布的作品</label>
+                        <select id="competitor_monitor-publish-mode" class="form-input" onchange="ChannelsCompetitorMonitorPage.updatePublishFilter()">
+                            <option value="all">不限发布时间</option>
+                            <option value="year">一年前</option><option value="half_year">半年前</option>
+                            <option value="three_months">3 个月前</option><option value="month">一个月前</option>
+                            <option value="week">一周前</option><option value="custom">自定义截止日期</option>
+                        </select>
+                    </div>
+                    <div class="form-group" id="competitor_monitor-publish-date-group" style="margin:0; display:none;">
+                        <label class="form-label" for="competitor_monitor-publish-before">截止日期（不含当天，北京时间）</label>
+                        <input id="competitor_monitor-publish-before" class="form-input" type="date" min="1000-01-01" max="9999-12-31" oninput="ChannelsCompetitorMonitorPage.updatePublishFilter()">
+                    </div>
+                </div>
+                <p id="competitor_monitor-publish-hint" style="font-size:.82rem; color:var(--text-muted); margin:12px 0; line-height:1.7;">不限制作品发布时间。</p>
+                <p style="font-size:.82rem; color:var(--text-muted); margin:12px 0; line-height:1.7;">快捷日期按每轮任务启动时的北京时间计算，保存后从下一轮生效；继续任务或重试失败项沿用原截止日期。启用限制后，无法确定发布时间的作品不会同步，会记录在失败明细中。</p>
+                <button class="btn btn-primary" id="btn-competitor_monitor-save-publish" onclick="ChannelsCompetitorMonitorPage.saveConfig()">保存发布时间配置</button>
             </div>
 
             <div class="card animate-fade-in" style="margin-top:var(--spacing-lg);">
@@ -189,6 +214,9 @@ const ChannelsCompetitorMonitorPage = {
             this.setValue('competitor_monitor-creator-interval', schedule.creator_interval_seconds ?? 10);
             this.setValue('competitor_monitor-download-workers', config.transfer?.download_workers ?? 2);
             this.setValue('competitor_monitor-upload-workers', config.transfer?.upload_workers ?? 2);
+            this.setValue('competitor_monitor-publish-mode', config.publish_filter?.mode || 'all');
+            this.setValue('competitor_monitor-publish-before', config.publish_filter?.before_date || '');
+            this.updatePublishFilter();
             const enabled = document.getElementById('competitor_monitor-schedule-enabled');
             if (enabled) enabled.checked = !!schedule.enabled;
             this.scheduleTimes = Array.isArray(schedule.times) ? [...schedule.times] : [];
@@ -218,8 +246,43 @@ const ChannelsCompetitorMonitorPage = {
         });
     },
 
+    publishCutoff(mode, now = new Date()) {
+        const today = new Intl.DateTimeFormat('sv-SE', {timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit'}).format(now);
+        const [year, month, day] = today.split('-').map(Number);
+        const cutoff = new Date(Date.UTC(year, month - 1, day));
+        if (mode === 'week') {
+            cutoff.setUTCDate(day - 7);
+        } else {
+            const months = {year: 12, half_year: 6, three_months: 3, month: 1}[mode];
+            if (!months) return '';
+            cutoff.setUTCDate(1);
+            cutoff.setUTCMonth(cutoff.getUTCMonth() - months);
+            const lastDay = new Date(Date.UTC(cutoff.getUTCFullYear(), cutoff.getUTCMonth() + 1, 0)).getUTCDate();
+            cutoff.setUTCDate(Math.min(day, lastDay));
+        }
+        return cutoff.toISOString().slice(0, 10);
+    },
+
+    updatePublishFilter() {
+        const mode = this.value('competitor_monitor-publish-mode') || 'all';
+        const input = document.getElementById('competitor_monitor-publish-before');
+        const group = document.getElementById('competitor_monitor-publish-date-group');
+        const hint = document.getElementById('competitor_monitor-publish-hint');
+        if (!input || !group || !hint) return;
+        group.style.display = mode === 'all' ? 'none' : 'block';
+        input.readOnly = mode !== 'custom';
+        if (!['all', 'custom'].includes(mode)) input.value = this.publishCutoff(mode);
+        hint.textContent = mode === 'all' ? '不限制作品发布时间。' : input.value
+            ? `只采集北京时间 ${input.value} 00:00 之前发布的作品，不含截止当天及之后；不符合条件的作品不下载、不上传 OSS、不写入监测数据库。`
+            : '请选择截止日期，仅采集该日期之前发布的作品。';
+    },
+
     collectConfig() {
         return {
+            publish_filter: {
+                mode: this.value('competitor_monitor-publish-mode') || 'all',
+                before_date: this.value('competitor_monitor-publish-mode') === 'custom' ? this.value('competitor_monitor-publish-before') : '',
+            },
             transfer: {
                 download_workers: Number(this.value('competitor_monitor-download-workers')),
                 upload_workers: Number(this.value('competitor_monitor-upload-workers')),
@@ -244,6 +307,11 @@ const ChannelsCompetitorMonitorPage = {
     },
 
     async saveConfig(showToast = true) {
+        if (this.value('competitor_monitor-publish-mode') === 'custom' && !this.value('competitor_monitor-publish-before')) {
+            Toast.warning('请选择发布时间截止日期');
+            document.getElementById('competitor_monitor-publish-before')?.focus();
+            return false;
+        }
         for (const id of ['competitor_monitor-download-workers', 'competitor_monitor-upload-workers']) {
             const input = document.getElementById(id);
             const count = Number(input?.value);
@@ -257,6 +325,7 @@ const ChannelsCompetitorMonitorPage = {
             [document.getElementById('btn-competitor_monitor-save'), '保存全部配置'],
             [document.getElementById('btn-competitor_monitor-save-schedule'), '保存定时配置'],
             [document.getElementById('btn-competitor_monitor-save-transfer'), '保存并发配置'],
+            [document.getElementById('btn-competitor_monitor-save-publish'), '保存发布时间配置'],
         ].filter(([button]) => !!button);
         try {
             buttons.forEach(([button]) => {
@@ -458,6 +527,9 @@ const ChannelsCompetitorMonitorPage = {
         const currentCreatorName = document.getElementById('competitor_monitor-current-creator-name');
         if (title) title.textContent = run.run_id ? `${this.statusLabel(run.status)} · ${this.phaseLabel(run.phase)}` : '尚未执行';
         if (message) message.textContent = run.message || '保存配置后可手动执行或等待定时触发';
+        const scope = run.publish_filter;
+        this.text('competitor_monitor-run-publish-filter', !run.run_id ? '' : scope?.before_date && scope.mode !== 'all'
+            ? `本轮发布时间：${scope.before_date} 之前（不含当天，北京时间）` : '本轮发布时间：不限');
         if (progress) progress.style.width = `${Math.max(0, Math.min(100, percent))}%`;
         if (next) next.textContent = status.next_scheduled_at ? `下次执行：${status.next_scheduled_at}（北京时间）` : '下次执行：未启用或未配置';
         if (button) button.disabled = !!status.running;

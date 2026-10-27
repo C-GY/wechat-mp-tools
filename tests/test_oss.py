@@ -51,11 +51,11 @@ class OSSConfigTests(unittest.TestCase):
                 saved = oss.save_oss_config("upload-user", "test-secret", bucket="creator-library")
                 self.assertEqual(saved["access_key_id"], "upload-user")
                 self.assertEqual(saved["bucket"], "creator-library")
-                self.assertEqual(saved["storage_base_url"], "https://oss.fandow.com/creator-library")
+                self.assertEqual(saved["storage_base_url"], "https://minio.fandow.com/creator-library")
                 self.assertEqual(oss.get_oss_config()["bucket"], "creator-library")
                 self.assertEqual(
                     oss.build_oss_public_url("wechat_channel/video-1.mp4"),
-                    "https://oss.fandow.com/creator-library/wechat_channel/video-1.mp4",
+                    "https://minio.fandow.com/creator-library/wechat_channel/video-1.mp4",
                 )
                 self.assertNotIn("access_key_secret", saved)
                 changed = oss.save_oss_config("upload-user", "", bucket="next-library")
@@ -123,13 +123,13 @@ class OSSConfigTests(unittest.TestCase):
                 for value in ("Library_01.v2", "library-02", "a" * 256):
                     with self.subTest(value=value):
                         config = oss.save_oss_config("upload-user", "test-secret", bucket=value)
-                        self.assertEqual(config["storage_base_url"], f"https://oss.fandow.com/{value}")
+                        self.assertEqual(config["storage_base_url"], f"https://minio.fandow.com/{value}")
                 with self.assertRaises(ValueError):
                     oss.save_oss_config("a" * 257, "test-secret")
                 oss.clear_oss_config()
                 config = oss.get_oss_config()
                 self.assertFalse(config["configured"])
-                self.assertEqual(config["storage_base_url"], "https://oss.fandow.com/marketing-video-dashboard")
+                self.assertEqual(config["storage_base_url"], "https://minio.fandow.com/marketing-video-dashboard")
 
     def test_config_is_saved_outside_installation_and_secret_is_not_returned(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -172,7 +172,7 @@ class OSSConfigTests(unittest.TestCase):
                 self.assertTrue(response.get_json()["has_secret"])
                 self.assertEqual(response.get_json()["bucket"], "independent-library")
                 self.assertEqual(client.get("/api/oss/config").get_json()["storage_base_url"],
-                                 "https://oss.fandow.com/independent-library")
+                                 "https://minio.fandow.com/independent-library")
                 self.assertNotIn("top-secret", response.get_data(as_text=True))
                 self.assertNotIn("top-secret", client.get("/api/oss/config").get_data(as_text=True))
                 invalid = client.post("/api/oss/config", json={
@@ -222,7 +222,7 @@ class OSSUploadTests(unittest.TestCase):
                 result = service.find_uploaded_video("video-1", 1721174400)
                 self.assertEqual(bool(result), found)
                 if found:
-                    self.assertEqual(result["url"], "https://oss.fandow.com/video-library/wechat_channel/2024-07-17/video-1.mp4")
+                    self.assertEqual(result["url"], "https://minio.fandow.com/video-library/wechat_channel/2024-07-17/video-1.mp4")
                     self.assertEqual(result["size"], size)
                 session.put.assert_not_called()
 
@@ -244,7 +244,7 @@ class OSSUploadTests(unittest.TestCase):
             self.assertEqual(result["object_key"], "wechat_channel/2024-07-17/video-1.mp4")
             self.assertEqual(
                 result["url"],
-                "https://oss.fandow.com/video-library/wechat_channel/2024-07-17/video-1.mp4",
+                "https://minio.fandow.com/video-library/wechat_channel/2024-07-17/video-1.mp4",
             )
             self.assertEqual(result["bucket"], "video-library")
             self.assertEqual([call[0] for call in session.calls], ["PUT", "HEAD", "GET"])
@@ -259,15 +259,15 @@ class OSSUploadTests(unittest.TestCase):
             video = root / "video.mp4"
             video.write_bytes(b"video-content")
             with patch.object(oss, "OSS_CONFIG_FILE", root / "oss.json"):
-                oss.save_oss_config("upload-user", "first-secret", bucket="first-library")
+                oss.save_oss_config("upload-user", "first-secret", bucket="first-library", endpoint="https://oss.fandow.com")
                 existing_service = oss.OSSService.from_saved_config()
                 existing_service.session = _Session(video.stat().st_size)
-                oss.save_oss_config("upload-user", "", bucket="next-library")
+                oss.save_oss_config("upload-user", "", bucket="next-library", endpoint="minio.fandow.com")
                 next_service = oss.OSSService.from_saved_config()
                 next_service.session = _Session(video.stat().st_size)
-                for service, bucket in ((existing_service, "first-library"), (next_service, "next-library")):
+                for service, bucket, endpoint in ((existing_service, "first-library", "https://oss.fandow.com"), (next_service, "next-library", "https://minio.fandow.com")):
                     result = service.upload_video(video, "video-1")
-                    self.assertEqual(result["url"], f"https://oss.fandow.com/{bucket}/wechat_channel/video-1.mp4")
+                    self.assertEqual(result["url"], f"{endpoint}/{bucket}/wechat_channel/video-1.mp4")
                     self.assertIn("Credential=upload-user/", service.session.calls[0][2]["Authorization"])
 
     def test_queue_completion_is_persisted_back_to_the_video_feed(self):

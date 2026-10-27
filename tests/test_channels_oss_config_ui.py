@@ -30,24 +30,30 @@ class ChannelsOSSConfigUiTests(unittest.TestCase):
                 endpoint: 'https://oss.fandow.com',
             };
             window.__saves = [];
+            window.__checks = [];
             window.__warnings = [];
             window.Toast = {
                 success() {}, warning: message => window.__warnings.push(message),
             };
             window.API = { oss: {
                 getConfig: async () => ({ ...window.__config }),
-                saveConfig: async (id, secret, bucket) => {
-                    window.__saves.push({ id, secret, bucket });
-                    window.__config = { ...window.__config, access_key_id: id, bucket };
+                saveConfig: async (id, secret, bucket, endpoint) => {
+                    window.__saves.push({ id, secret, bucket, endpoint });
+                    window.__config = { ...window.__config, access_key_id: id, bucket, endpoint };
                     return { message: 'saved' };
                 },
                 clearConfig: async () => {
                     window.__config = {
                         ...window.__config, access_key_id: 'marketing-video-dashboard',
                         bucket: 'marketing-video-dashboard',
+                        endpoint: 'https://minio.fandow.com',
                         has_secret: false, configured: false,
                     };
                     return { message: 'cleared' };
+                },
+                testConnection: async config => {
+                    window.__checks.push(config);
+                    return {verified: true, message: 'upload/read/cleanup verified'};
                 },
             }};
             document.getElementById('app').innerHTML = ChannelsOSSConfigPage.render();
@@ -71,7 +77,7 @@ class ChannelsOSSConfigUiTests(unittest.TestCase):
         self.page.fill("#oss-access-key-secret", "new-test-secret")
         self.page.evaluate("() => ChannelsOSSConfigPage.save()")
         self.assertEqual(self.page.evaluate("window.__saves"), [
-            {"id": "Creator_02.v2", "secret": "new-test-secret", "bucket": "Creator_02.v2"},
+            {"id": "Creator_02.v2", "secret": "new-test-secret", "bucket": "Creator_02.v2", "endpoint": "https://oss.fandow.com"},
         ])
         self.assertEqual(preview.text_content(), "https://oss.fandow.com/Creator_02.v2")
         self.assertEqual(self.page.locator("#oss-access-key-secret").input_value(), "")
@@ -86,7 +92,7 @@ class ChannelsOSSConfigUiTests(unittest.TestCase):
         self.page.fill("#oss-access-key-id", "saved-library")
         self.page.fill("#oss-bucket", "changed-bucket")
         self.page.evaluate("() => ChannelsOSSConfigPage.save()")
-        self.assertEqual(self.page.evaluate("window.__saves"), [{"id": "saved-library", "secret": "", "bucket": "changed-bucket"}])
+        self.assertEqual(self.page.evaluate("window.__saves"), [{"id": "saved-library", "secret": "", "bucket": "changed-bucket", "endpoint": "https://oss.fandow.com"}])
         self.assertEqual(self.page.locator("#oss-bucket").input_value(), "changed-bucket")
         self.assertEqual(self.page.locator("#oss-storage-base-url").text_content(), "https://oss.fandow.com/changed-bucket")
 
@@ -95,7 +101,7 @@ class ChannelsOSSConfigUiTests(unittest.TestCase):
         self.page.evaluate("() => ChannelsOSSConfigPage.load()")
         self.assertEqual(self.page.locator("#oss-storage-base-url").text_content(), "https://oss.fandow.com/saved-bucket")
         self.page.evaluate("() => ChannelsOSSConfigPage.clear()")
-        self.assertEqual(self.page.locator("#oss-storage-base-url").text_content(), "https://oss.fandow.com/marketing-video-dashboard")
+        self.assertEqual(self.page.locator("#oss-storage-base-url").text_content(), "https://minio.fandow.com/marketing-video-dashboard")
         self.assertEqual(self.page.locator("#oss-access-key-id").input_value(), "marketing-video-dashboard")
         self.assertEqual(self.page.locator("#oss-bucket").input_value(), "marketing-video-dashboard")
         self.assertIn("请填写", self.page.locator("#oss-config-status").text_content())
@@ -118,6 +124,37 @@ class ChannelsOSSConfigUiTests(unittest.TestCase):
         self.assertIn("OSS_BUCKET 格式不合法", self.page.locator("#oss-config-status").text_content())
         self.page.fill("#oss-bucket", "fixed-library")
         self.assertEqual(self.page.locator("#oss-storage-base-url").text_content(), "https://oss.fandow.com/fixed-library")
+
+    def test_domain_is_editable_and_keeps_saved_secret_when_id_is_unchanged(self):
+        self.assertEqual(self.page.locator('#oss-endpoint').input_value(), 'https://oss.fandow.com')
+        self.page.fill('#oss-endpoint', 'minio.fandow.com')
+        self.assertEqual(self.page.locator('#oss-storage-base-url').text_content(), 'https://minio.fandow.com/saved-bucket')
+        self.assertEqual(self.page.evaluate('window.__saves'), [])
+        self.page.evaluate('() => ChannelsOSSConfigPage.save()')
+        self.assertEqual(self.page.evaluate('window.__saves[0]'), {
+            'id': 'saved-library', 'secret': '', 'bucket': 'saved-bucket', 'endpoint': 'https://minio.fandow.com'})
+        self.assertEqual(self.page.locator('#oss-endpoint').input_value(), 'https://minio.fandow.com')
+
+    def test_invalid_domain_is_not_saved_or_verified(self):
+        for value in ('*.fandow.com', 'https://host/path', 'https://user:pass@host', 'ftp://host'):
+            self.page.fill('#oss-endpoint', value)
+            self.page.evaluate('() => ChannelsOSSConfigPage.save()')
+            self.page.evaluate('() => ChannelsOSSConfigPage.testConnection()')
+        self.assertEqual(self.page.evaluate('window.__saves'), [])
+        self.assertEqual(self.page.evaluate('window.__checks'), [])
+
+    def test_verification_uses_unsaved_endpoint_and_displays_authentication_failure(self):
+        self.page.fill('#oss-endpoint', 'minio.fandow.com')
+        self.page.evaluate('() => ChannelsOSSConfigPage.testConnection()')
+        self.assertEqual(self.page.evaluate('window.__checks[0].endpoint'), 'https://minio.fandow.com')
+        self.assertEqual(self.page.evaluate('window.__checks[0].access_key_secret'), '')
+        self.assertEqual(self.page.evaluate('window.__config.endpoint'), 'https://oss.fandow.com')
+        self.assertEqual(self.page.evaluate('window.__saves'), [])
+        self.assertIn('verified', self.page.locator('#oss-config-status').text_content())
+        self.page.evaluate("() => { API.oss.testConnection = async () => {throw new Error('InvalidAccessKeyId');}; }")
+        self.page.evaluate('() => ChannelsOSSConfigPage.testConnection()')
+        self.assertIn('InvalidAccessKeyId', self.page.locator('#oss-config-status').text_content())
+        self.assertTrue(self.page.locator('#btn-test-oss-connection').is_enabled())
 
 
 if __name__ == "__main__":

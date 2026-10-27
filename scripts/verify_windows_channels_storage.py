@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 
 CHILD = r'''
-import http.client, json, socket, sys, threading, time, traceback
+import http.client, json, os, socket, sys, threading, time, traceback
 from pathlib import Path
 root = Path(sys.executable).parent
 report = {'ok':False, 'frozen':bool(getattr(sys,'frozen',False))}
@@ -19,7 +19,7 @@ proxy = None
 try:
     from backend import config, channels, channels_refresh, channels_save_jobs, mitm_proxy
     from backend.channels_storage import feed_store, FeedStore
-    assert sys.frozen and config.APP_VERSION == '2026.09.22.1'
+    assert sys.frozen and config.APP_VERSION == os.environ['COLLECTOR_EXPECTED_VERSION']
     assert Path(channels_save_jobs.__file__).is_relative_to(Path(sys._MEIPASS))
     source = channels.CHANNELS_FEEDS_FILE
     source.parent.mkdir(parents=True, exist_ok=True)
@@ -118,11 +118,8 @@ try:
         # A slow startup migration must not delay serving the window or status.
         from backend import oss
         from backend.rss_scheduler import rss_scheduler
-        from backend.pinchuang import pinchuang_hub
-        from backend.guangce import guangce_hub
         from backend.competitor_monitor import competitor_monitor_hub
-        from backend.creative_radar import creative_radar_hub
-        for scheduler in (rss_scheduler,pinchuang_hub,guangce_hub,competitor_monitor_hub,creative_radar_hub):
+        for scheduler in (rss_scheduler,competitor_monitor_hub):
             scheduler.start=lambda:None
         entered,release=threading.Event(),threading.Event()
         def wait_migration():
@@ -157,6 +154,7 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--bundle',type=Path,required=True)
     parser.add_argument('--output',type=Path,required=True)
+    parser.add_argument('--version',required=True,help='Expected version embedded in the frozen bundle')
     args=parser.parse_args()
     root=args.output.resolve()
     if root.exists():
@@ -180,7 +178,7 @@ def main():
         for name in ('first','restart'):
             process=mp.get_context('spawn').Process(target=builtins.exec,args=(CHILD,{}))
             try:
-                with patch.dict(os.environ,{'APPDATA':str(root/'profile')}), \
+                with patch.dict(os.environ,{'APPDATA':str(root/'profile'), 'COLLECTOR_EXPECTED_VERSION':args.version}), \
                      patch.object(spawn,'get_preparation_data',prepare), \
                      patch.object(spawn,'get_command_line',command_line):
                     process.start()

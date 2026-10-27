@@ -154,6 +154,13 @@ def video_tags(video, raw, description):
     return result
 
 
+def published_at(video):
+    """Use the original observation's publish time for storage and filtering."""
+    raw = video.get("rpa_payload")
+    raw = raw if isinstance(raw, dict) else video
+    return _datetime(raw.get("createtime", video.get("createtime")))
+
+
 def build_row(author, video, sync_batch_id, *, existing_video_url="", synced_at=None):
     key, external_id = source_key(video)
     raw = video.get("rpa_payload")
@@ -189,7 +196,7 @@ def build_row(author, video, sync_batch_id, *, existing_video_url="", synced_at=
         "video_title": description[:500] or None,
         "video_url": _url(existing_video_url or video.get("oss_video_url"), "OSS 视频链接", True),
         "cover_url": _url(media.get("coverUrl") or raw.get("coverUrl") or raw.get("cover_url") or video.get("cover_url"), "封面链接"),
-        "published_at": _datetime(raw.get("createtime", video.get("createtime"))),
+        "published_at": published_at(video),
         "duration_ms": duration_ms, **metrics,
         "last_synced_at": observed, "synced_at": observed,
         "sync_batch_id": _text(sync_batch_id, 64, "同步批次 ID", True),

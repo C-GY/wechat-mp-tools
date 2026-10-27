@@ -40,11 +40,15 @@
 | 模块 | 责任 | 关键接口与调用关系 |
 |---|---|---|
 | `main.py` | 桌面应用启动器 | `ensure_virtualenv()`、`find_free_port()`、`wait_for_server()`、`on_closing()`；导入 `app.py` 的 `app`，在 daemon thread 中 `app.run()`，再启动 pywebview |
-| `app.py` | Flask 应用、静态 SPA、浏览器模式入口 | 注册 18 个蓝图；`/` 与 `/<path:path>` 返回 `frontend/index.html` 或静态文件；`main()` 解析 `--host/--port/--no-browser/--debug` 并 `app.run(threaded=True)` |
+| `app.py` | Flask 应用、静态 SPA、浏览器模式入口 | 注册当前启用的业务与诊断蓝图；`/` 与 `/<path:path>` 返回 `frontend/index.html` 或静态文件；`main()` 解析 `--host/--port/--no-browser/--debug` 并 `app.run(threaded=True)` |
 | `backend/runtime.py` | 源码与 PyInstaller 运行时差异适配 | `resource_dir()`、`app_dir()`、`log_file()`、`configure_runtime()`、`launch_chromium()`、`launch_persistent_context()`、`write_startup_error()`；修正 CA、Playwright 浏览器路径、ffmpeg 搜索路径 |
+| `backend/desktop_diagnostics.py`、`backend/windows_memory.py` | 随桌面启动的诊断线程与 Windows 原生内存读取 | `main.py` 启停并注册窗口；每 15 秒采样本进程树/系统内存，WebView2 回调在 UI 线程绑定，故障事件保存最后一次快照，日志独立轮转；导入模块本身不启动线程或业务服务 |
+| `backend/desktop_alerts.py`、`backend/desktop_watchdog.py` | Windows 桌面崩溃通知与内存风险预警 | `main.py --desktop-watchdog` 在 GUI/业务初始化前分支，继承主进程句柄并按会话读取日志；正常关闭标记抑制退出告警；持续超限计时、分类冷却、复用已有飞书机器人；仅读取相关配置，不导入业务中枢或连接数据库 |
+| `backend/feishu_notifier.py`、`backend/profile_paths.py` | 无业务副作用的飞书发送与配置位置 | 竞对监测与桌面告警共用同一通知类；守护进程独立读取用户配置路径，使用带签名、重试的交互卡片；告警发送独立绕过系统/环境代理，避免依赖已退出的本机代理 |
+| `backend/diagnostics_export.py` | 内置诊断日志导出及告警设置接口 | `POST /api/diagnostics/export` 仅打包固定白名单日志与守护回执并脱敏，写入 `data/diagnostics/`；`GET/POST /alerts` 读取/保存阈值并返回守护状态，`POST /alerts/test` 使用表单所选已有机器人发送测试但不保存；不导出配置、数据库或浏览器 Profile |
 | `backend/config.py` | 设置、存储路径和代理调度 | `DEFAULT_SETTINGS`、`ensure_dirs()`、`get_settings()/save_settings()`、`get_proxy_url()`、`report_proxy_status()`；所有主要 JSON 状态文件路径在此集中声明 |
 
-`app.py` 依次注册认证、公众号、文章、代理、账号池、抖音、快手、视频号、转码、小红书、B 站、OSS、品创中枢、广策中枢和创意雷达蓝图。每个 `backend/*.py` 蓝图自带 `url_prefix`，因此路由归属可以直接从模块开头的 `Blueprint(...)` 判断。
+`app.py` 依次注册认证、公众号、文章、代理、账号池、抖音、快手、视频号、转码、小红书、B 站、OSS、竞对监测和诊断蓝图。每个 `backend/*.py` 蓝图自带 `url_prefix`，因此路由归属可以直接从模块开头的 `Blueprint(...)` 判断。
 
 ### 共享领域服务
 
@@ -52,9 +56,9 @@
 |---|---|---|
 | `backend/account_pool.py` | 微信读书凭证池 | `acquire()` 按 `(failures, last_used)` 选择 active 账号；`report()` 处理 401/429/200013 与普通失败；`start_keepalive()` 每 15 分钟心跳，超过 45 分钟做浏览器刷新；全局 `account_pool` 在模块导入时启动 |
 | `backend/rss_scheduler.py` | 公众号订阅抓取与上传 | 全局 `rss_scheduler` daemon 循环每 30 秒 `_tick()`；`ThreadPoolExecutor(max_workers=50)` 执行 `_fetch_for_account()`；下载历史中未上传条目可批量 POST 到设置的上传网关 |
-| `backend/pinchuang.py` | 品创中枢定时同步 | `PinchuangHub` 按北京时间匹配多个每日触发点；每位创作者依次执行视频号健康检查、全量刷新、MySQL 差异比对、仅新增作品 OSS 上传和快照写入；飞书异常通知最多重试 3 次 |
-| `backend/guangce.py` | 广策中枢定时同步 | `GuangceHub` 继承完整的 `PinchuangHub` MySQL 快照流程，独立配置、备份类型、调度线程和运行状态；数据库名称默认留空，接口为 `/api/guangce` |
-| `backend/creative_radar.py` | 创意雷达 API 定时同步 | `CreativeRadarHub` 复用品创中枢调度、刷新、OSS、通知和状态流程，每轮将全部已准备作品按 200 条分批提交，由服务端处理幂等；接口为 `/api/creative-radar` |
+| `backend/pinchuang.py` | 竞对监测依赖的公共同步引擎 | 保留 `PinchuangHub` 基类、配置校验、调度/暂停/恢复和 MySQL 适配工具；历史 `pinchuang_hub` 不再实例化，应用不注册其蓝图或启动其调度 |
+| `backend/oss.py`、`backend/oss_receipts.py` | 可配置 S3 域名、上传队列和持久回执 | 默认 `https://minio.fandow.com`；配置保存 `endpoint`，服务及并发批次固定域名/桶/凭据；回执按实际域名隔离，历史链接和旧域名保持不变；`POST /api/oss/test-connection` 使用表单但不保存，通过唯一临时对象完成 PUT、HEAD、公开 GET、DELETE 验证，错误只返回安全的 S3 错误码和说明 |
+| `backend/competitor_monitor.py`、`backend/competitor_recovery.py`、`backend/competitor_monitor_store.py` | 竞对监测三表同步与恢复 | 独立配置和日志；`publish_filter` 按北京时间严格筛选截止日期之前的作品，在数据库比对及 OSS 传输前执行，与 `published_at` 使用同一原文时间解析；快捷选项在任务创建时固定为实际日期，续跑和失败补偿保留该日期，旧任务/配置默认不限；未知发布时间保留失败明细；不需要数据库结构变更 |
 | `backend/downloader.py` | 微信公众号文章离线化 | `download_single_article()` 用 requests 拉文章、解析正文/封面/视频、把资源写到 `media/`，生成 `*.html`、`*_raw.html`、`data.json`、`content.txt`、`metadata.json` |
 | `backend/mitm_proxy.py` | 视频号 HTTPS 拦截与页面注入 | `ChannelsAddon` 只拦截 `channels.weixin.qq.com`、`mp.weixin.qq.com`、`res.wx.qq.com`；`ProxyManager.start()/stop()` 管理 CA、系统代理、NO_PROXY、mitmproxy 线程 |
 | `backend/transcode.py` | FFmpeg 元信息与转码队列 | `get_video_metadata()` 调 ffprobe；`job_queue` 是 `queue.Queue`，`start_worker()` 启动单线程 `_transcode_worker()`，`_execute_transcode()` 构造 ffmpeg 命令并解析 `-progress` 输出 |
@@ -132,9 +136,7 @@
 | 浏览器自动打开 | `app.py::open_browser()` | daemon thread 延迟 1 秒 | 一次性 |
 | 微信读书保活 | `backend/account_pool.py` 导入全局单例 | daemon thread，15 秒后每 15 分钟 | 进程内守护，不独立持久化 |
 | RSS 调度 | `app.py` 导入时 `rss_scheduler.start()` | daemon loop 每 30 秒 + 最多 50 worker 线程 | `stop()` 设置 Event 并 shutdown executor |
-| 品创中枢调度 | `app.py` 导入时 `pinchuang_hub.start()` | daemon loop 每 15 秒检查多时点计划；每轮单 worker、按创作者串行处理；视频号环境失败按 15/30/60 秒退避并持续重试 | 环境等待保留原批次与创作者计划，重启自动续跑、跳过已有结果；等待时的定时触发合并补跑；其他异常退出下次启动标记 interrupted |
-| 广策中枢调度 | `app.py` 导入时 `guangce_hub.start()` | 继承相同的多时点计划与同步流程，使用独立 worker 和暂停/继续控制 | 配置与最近 100 次运行独立持久化，共用创作者、视频号环境和 OSS |
-| 创意雷达调度 | `app.py` 导入时 `creative_radar_hub.start()` | 复用品创中枢调度器，使用独立配置、worker 与状态；每轮全量分批提交，API 每批最多 200 条；`api.timeout_seconds` 控制每批响应超时，默认 600 秒（10 分钟）、可配置 1–600 秒 | 持久化批次受理、明确失败及待确认结果；逐条回执可缺省；问题批次不阻止后续批次和创作者；运行历史独立持久化 |
+| 竞对监测调度 | `app.py` 导入时 `competitor_monitor_hub.start()` | daemon loop 每 15 秒检查多时点计划；每轮按创作者串行处理、固定发布时间截止日期与传输限制，连接恢复使用退避重试 | 保存当前批次、作者计划、分页回执和传输进度；重启续跑及失败补偿保持原批次范围 |
 | 文章下载 | `backend/articles.py` | 每个任务一个 daemon thread，状态字典加锁 | completed/failed/cancelled |
 | 平台批量下载 | `backend/douyin.py`、`backend/kuaishou.py`、`backend/xiaohongshu.py`、`backend/bilibili.py`、`backend/channels.py` | 平台级单任务或 task id 字典 + daemon thread/Event | 可取消，写平台历史 |
 | 视频号代理 | `backend/mitm_proxy.py::ProxyManager` | 单例状态 + mitmproxy daemon thread | 还原系统代理、关闭 master、恢复 NO_PROXY |
@@ -155,9 +157,8 @@
 | `data/articles_full/` | 文章目录、媒体、离线 HTML、纯文本和元数据 | `backend/downloader.py` |
 | `data/rss_articles.json`、`data/rss_subscriptions.json`、`data/rss_upload_log.json` | RSS 缓存、订阅、上传审计 | `backend/rss_scheduler.py` |
 | `data/channels_*` | 视频号历史、收藏、feed、调用日志 | `backend/channels.py`、`backend/mitm_proxy.py` |
-| 系统用户配置目录下 `pinchuang_hub_config.json`、`pinchuang_hub_state.json` | 品创中枢数据库/计划/飞书配置与运行历史，覆盖安装后保留 | `backend/pinchuang.py` |
-| 系统用户配置目录下 `guangce_hub_config.json`、`guangce_hub_state.json` | 广策中枢数据库/计划/飞书配置与运行历史，覆盖安装后保留 | `backend/guangce.py` |
-| 系统用户配置目录下 `creative_radar_config.json`、`creative_radar_state.json` | 创意雷达 API/计划/飞书配置、运行历史及批次结果；旧 `creative_radar_state_sync_cache.json` 不再读写 | `backend/creative_radar.py` |
+| 系统用户配置目录下 `competitor_monitor_config.json`、`competitor_monitor_state.json`、对应 journal SQLite | 竞对监测配置、运行历史与恢复检查点 | `backend/competitor_monitor.py`、`backend/competitor_recovery.py`、`backend/monitor_journal.py` |
+| 系统用户配置目录下旧 `pinchuang_hub_*`、`guangce_hub_*`、`creative_radar_*` 文件 | 已下线模块的历史配置和记录，不再初始化或更新；已有飞书配置仅供桌面告警兼容读取 | 旧版本留存；`backend/desktop_alerts.py` 仅读取通知凭据 |
 | `data/douyin_downloads/`、`data/douyin_history.json` | 抖音文件与历史 | `backend/douyin.py` |
 | `data/kuaishou_downloads/`、`data/kuaishou_history.json` | 快手文件与历史 | `backend/kuaishou.py` |
 | `data/xhs_downloads/`、`data/xhs_accounts.json`、`data/xhs_history.json` | 小红书输出、博主与历史 | `backend/xiaohongshu.py` |
@@ -165,7 +166,7 @@
 | `data/temp_uploads/`、`data/transcoded/` | 外部上传缓存和转码输出 | `backend/transcode.py` |
 | `data/ca.*`、`data/certs/`、`data/mitm/`、`data/frontend_errors.log`、`data/parse_debug.log` | mitmproxy 证书、配置、前端错误和解析诊断 | `backend/mitm_proxy.py`、`backend/channels.py` |
 
-除品创中枢和广策中枢通过 PyMySQL 写入外部 MySQL 8 快照表外，本地持久化主要是普通 JSON 和文件目录；并发保护是模块内 `threading.Lock`，不是文件锁。多个应用实例同时写同一个 `DATA_DIR` 或系统用户配置目录时应先避免这种操作。
+竞对监测通过 PyMySQL 写入外部 MySQL 8；本地作品库与恢复 journal 使用 SQLite，其余主要是 JSON 和文件目录；并发保护是模块内 `threading.Lock`，不是文件锁。多个应用实例同时写同一个 `DATA_DIR` 或系统用户配置目录时应先避免这种操作。
 
 ## 构建与自动化
 

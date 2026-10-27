@@ -242,7 +242,7 @@ def test_remote_reuse_populates_the_same_persistent_cache(sync, monkeypatch):
 
 def test_receipts_are_scoped_to_endpoint_and_prefix(sync, monkeypatch):
     sync.run(sync.install("old"))
-    monkeypatch.setattr(oss, "DEFAULT_OSS_ENDPOINT", "https://other-oss.invalid")
+    oss.save_oss_config('test-user', '', 'test-bucket', 'https://other-oss.invalid')
     assert sync.run(sync.install("new-endpoint"))[0]["status"] == "completed"
     monkeypatch.setattr(oss, "DEFAULT_OSS_OBJECT_PREFIX", "other-prefix")
     assert sync.run(sync.install("new-prefix"))[0]["status"] == "completed"

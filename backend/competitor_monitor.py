@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import copy
+import calendar
+from datetime import date, datetime, timedelta
 import re
 import time
 
@@ -15,7 +17,7 @@ from backend.channels_refresh import CaptureRefreshError
 from backend.competitor_recovery import CompetitorRecovery
 from backend.sync_errors import error_details
 from backend.competitor_author_tags import CompetitorAuthorTagStore
-from backend.competitor_monitor_store import CompetitorMySQLAdapter, TABLES, build_row, source_key
+from backend.competitor_monitor_store import CompetitorMySQLAdapter, TABLES, build_row, published_at, source_key
 from backend.oss import persistent_config_dir, upload_manager, validate_transfer_workers
 
 
@@ -24,6 +26,49 @@ CONFIG_FILE = persistent_config_dir() / "competitor_monitor_config.json"
 STATE_FILE = persistent_config_dir() / "competitor_monitor_state.json"
 DEFAULT_DATABASE = "competitor_monitor"
 DEFAULT_TRANSFER = {"download_workers": 2, "upload_workers": 2}
+DEFAULT_PUBLISH_FILTER = {"mode": "all", "before_date": ""}
+_PUBLISH_MONTHS = {"year": 12, "half_year": 6, "three_months": 3, "month": 1}
+
+
+def _publish_date(value):
+    if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        raise ValueError("发布时间截止日期必须为 YYYY-MM-DD 格式")
+    try:
+        result = date.fromisoformat(value)
+    except ValueError:
+        raise ValueError("发布时间截止日期无效") from None
+    if result.year < 1000:
+        raise ValueError("发布时间截止日期年份不能早于 1000 年")
+    return result
+
+
+def normalize_publish_filter(value, current=None):
+    if not isinstance(value, dict):
+        raise ValueError("发布时间配置必须是一个对象")
+    result = {**DEFAULT_PUBLISH_FILTER, **(current or {}), **value}
+    mode = result["mode"]
+    if not isinstance(mode, str) or mode not in ("all", "custom", "week", *_PUBLISH_MONTHS):
+        raise ValueError("发布时间快捷选项无效")
+    before = _publish_date(result["before_date"]).isoformat() if mode == "custom" else ""
+    return {"mode": mode, "before_date": before}
+
+
+def resolve_publish_filter(value, now):
+    """Freeze a Beijing midnight cutoff once per run; strictly before that day."""
+    result = normalize_publish_filter(value)
+    mode = result["mode"]
+    if mode in {"all", "custom"}:
+        return result
+    today = now.replace(tzinfo=pinchuang.BEIJING_TZ) if now.tzinfo is None else now.astimezone(pinchuang.BEIJING_TZ)
+    today = today.date()
+    if mode == "week":
+        cutoff = today - timedelta(days=7)
+    else:
+        month_index = today.year * 12 + today.month - 1 - _PUBLISH_MONTHS[mode]
+        year, month = divmod(month_index, 12)
+        month += 1
+        cutoff = date(year, month, min(today.day, calendar.monthrange(year, month)[1]))
+    return {"mode": mode, "before_date": cutoff.isoformat()}
 
 
 def _index_observations(videos):
@@ -48,6 +93,8 @@ def merged_config(raw: dict | None) -> dict:
     })
     transfer = raw.get("transfer") if isinstance(raw.get("transfer"), dict) else {}
     result["transfer"] = {**DEFAULT_TRANSFER, **transfer}
+    publish_filter = raw.get("publish_filter") if isinstance(raw.get("publish_filter"), dict) else {}
+    result["publish_filter"] = {**DEFAULT_PUBLISH_FILTER, **publish_filter}
     return result
 
 
@@ -67,6 +114,7 @@ def normalize_config(payload: dict, current: dict | None = None) -> dict:
         key: validate_transfer_workers(transfer.get(key, current["transfer"][key]), label)
         for key, label in (("download_workers", "下载并发数"), ("upload_workers", "上传并发数"))
     }
+    result["publish_filter"] = normalize_publish_filter(payload.get("publish_filter", {}), current["publish_filter"])
     return result
 
 
@@ -76,6 +124,7 @@ def public_config(config: dict) -> dict:
     result.pop("table", None)
     result["tables"] = list(TABLES)
     result["transfer"] = dict(merged_config(config)["transfer"])
+    result["publish_filter"] = dict(merged_config(config)["publish_filter"])
     return result
 
 
@@ -105,13 +154,21 @@ class CompetitorMonitorHub(CompetitorRecovery, pinchuang.PinchuangHub):
         return CompetitorMySQLAdapter((config if config is not None else self.config)["database"])
 
     def import_config_backup(self, payload):
-        # Backups made before transfer settings existed remain importable.
+        # Backups made before transfer/publish filters existed remain importable.
         if isinstance(payload, dict):
             config = payload.get("config") if "config" in payload else payload
-            if isinstance(config, dict) and set(config) == {"database", "schedule", "feishu"}:
-                config = {**config, "transfer": dict(DEFAULT_TRANSFER)}
+            if (isinstance(config, dict) and {"database", "schedule", "feishu"} <= set(config)
+                    and set(config) <= {"database", "schedule", "feishu", "transfer", "publish_filter"}):
+                config = {"transfer": dict(DEFAULT_TRANSFER), "publish_filter": dict(DEFAULT_PUBLISH_FILTER), **config}
                 payload = {**payload, "config": config} if "config" in payload else config
         return super().import_config_backup(payload)
+
+    def start_run(self, *, trigger="manual", scheduled_time="", run_options=None):
+        with self.lock:
+            options = copy.deepcopy(run_options or {})
+            if "publish_filter" not in options:
+                options["publish_filter"] = resolve_publish_filter(self.config["publish_filter"], self.now())
+            return super().start_run(trigger=trigger, scheduled_time=scheduled_time, run_options=options)
 
     def _run_pipeline(self, run_id):
         with self.lock:
@@ -119,6 +176,8 @@ class CompetitorMonitorHub(CompetitorRecovery, pinchuang.PinchuangHub):
             if run.get("run_id") == run_id:
                 # Keep one set of limits for every creator, including recovered runs.
                 run.setdefault("transfer", dict(self.config["transfer"]))
+                # A pre-feature saved run originally had no date restriction.
+                run.setdefault("publish_filter", dict(DEFAULT_PUBLISH_FILTER))
                 self._persist_state_locked()
         return super()._run_pipeline(run_id)
 
@@ -191,6 +250,8 @@ class CompetitorMonitorHub(CompetitorRecovery, pinchuang.PinchuangHub):
         checkpoint = self.journal.checkpoint(run_id, author_id)
         with self.lock:
             run = dict(self.state.get("current_run") or {})
+        scope = run.get("publish_filter", DEFAULT_PUBLISH_FILTER)
+        cutoff = datetime.combine(_publish_date(scope["before_date"]), datetime.min.time()) if scope["mode"] != "all" else None
         selection = run.get("retry_selection", {}).get(author_id, {})
         source = self.journal.checkpoint(run["retry_source_run_id"], author_id) if run.get("retry_source_run_id") else {}
         started_at = checkpoint.get("started_at") or pinchuang.format_beijing(self.now())
@@ -244,6 +305,14 @@ class CompetitorMonitorHub(CompetitorRecovery, pinchuang.PinchuangHub):
                     for field in ("video_url", "video_url_h264", "video_url_h265", "decode_key", "decrypt_key"):
                         if field in transport.get(key, {}):
                             observation[field] = transport[key][field]
+                    # A retry may repair a previously missing publication time;
+                    # keep the original interaction metrics and observation time.
+                    if published_at(observation) is None:
+                        fresh_published = published_at(transport.get(key, {}))
+                        if fresh_published is not None:
+                            raw = observation.get("rpa_payload")
+                            raw = raw if isinstance(raw, dict) else observation
+                            raw["createtime"] = fresh_published.isoformat()
                     if source.get("uploads", {}).get(key):
                         observation["oss_video_url"] = source["uploads"][key]
                         observation["oss_upload_status"] = "completed"
@@ -265,7 +334,18 @@ class CompetitorMonitorHub(CompetitorRecovery, pinchuang.PinchuangHub):
                 failures[failure.get("video_id") or f"__capture_{i}__"] = failure
         videos = copy.deepcopy(captured)
         keyed = {}
+        filtered_count = 0
         for video in videos:
+            if cutoff is not None:
+                published = published_at(video)
+                if published is None:
+                    key = str(video.get("id") or "未知作品")
+                    failures[key] = {"video_id": key, "stage": "validation", "error_type": "UnknownPublishTime",
+                                     "error": "发布时间缺失或无效，无法确认早于截止日期，未同步该作品"}
+                    continue
+                if published >= cutoff:
+                    filtered_count += 1
+                    continue
             try:
                 key, _ = source_key(video)
                 keyed[key] = video
@@ -342,12 +422,15 @@ class CompetitorMonitorHub(CompetitorRecovery, pinchuang.PinchuangHub):
             status = "partial" if written else "failed"
             message = (f"{'部分失败' if written else '同步失败'}：本轮采集 {len(videos)} 条，"
                        f"已入库 {written} 条；采集异常：" + "；".join(capture_errors))
+        if cutoff is not None:
+            message += f"；仅同步 {scope['before_date']} 之前（不含当天）的作品，按发布时间跳过 {filtered_count} 条"
         return {
             "author_id": author_id, "author_name": str(author.get("nickname") or author_id),
             "status": status,
             "message": message + ("；" + "；".join(warnings) if warnings else ""),
             "started_at": started_at, "finished_at": pinchuang.format_beijing(self.now()),
             "refreshed_videos": len(videos), "existing_videos": len(existing),
+            "filtered_videos": filtered_count,
             "new_videos": len(keyed) - len(existing), "uploaded_videos": uploaded,
             "database_written": written, "failed_items": len(failures),
             "failures": list(failures.values()), "warnings": warnings, "timings": timings,

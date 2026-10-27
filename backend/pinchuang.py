@@ -1,4 +1,4 @@
-"""Pinchuang hub: scheduled WeChat Channels -> OSS -> MySQL synchronization.
+"""Shared synchronization engine retained for competitor monitoring.
 
 The public interface of this module is deliberately small: configure the hub,
 start a run, and inspect its durable status.  The orchestration itself stays in
@@ -7,9 +7,7 @@ the backend so scheduled work does not depend on which SPA page is open.
 
 from __future__ import annotations
 
-import base64
 import hashlib
-import hmac
 import json
 import re
 import sys
@@ -21,10 +19,10 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 from urllib.parse import urlparse, urlunparse
 
-import requests
 from flask import Blueprint, jsonify, request
 
 from backend.config import load_json
+from backend.feishu_notifier import FeishuNotifier
 from backend.oss import get_oss_config, persistent_config_dir, upload_manager
 
 
@@ -525,90 +523,6 @@ class MySQLSnapshotAdapter:
             raise
         finally:
             connection.close()
-
-
-class FeishuNotifier:
-    def __init__(self, webhook_url: str, secret: str = "", session=None):
-        self.webhook_url = str(webhook_url or "").strip()
-        self.secret = str(secret or "").strip()
-        self.session = session or requests.Session()
-
-    def configured(self) -> bool:
-        return bool(self.webhook_url)
-
-    @staticmethod
-    def _card_markdown(message: str) -> str:
-        lines = []
-        for line in str(message or "").splitlines():
-            stripped = line.strip()
-            if not stripped:
-                lines.append("")
-                continue
-            if "：" in stripped:
-                label, value = stripped.split("：", 1)
-                lines.append(f"**{label}：** {value.strip()}")
-            else:
-                lines.append(stripped)
-        return "\n".join(lines)
-
-    def _payload(self, title: str, message: str) -> dict:
-        payload: dict[str, Any] = {
-            "msg_type": "interactive",
-            "card": {
-                "config": {
-                    "wide_screen_mode": True,
-                    "enable_forward": True,
-                },
-                "header": {
-                    "template": "blue",
-                    "title": {
-                        "tag": "plain_text",
-                        "content": f"【{title}】",
-                    },
-                },
-                "elements": [
-                    {
-                        "tag": "div",
-                        "text": {
-                            "tag": "lark_md",
-                            "content": self._card_markdown(message),
-                        },
-                    }
-                ],
-            },
-        }
-        if self.secret:
-            timestamp = str(int(time.time()))
-            string_to_sign = f"{timestamp}\n{self.secret}".encode("utf-8")
-            signature = hmac.new(
-                string_to_sign, digestmod=hashlib.sha256
-            ).digest()
-            payload["timestamp"] = timestamp
-            payload["sign"] = base64.b64encode(signature).decode("utf-8")
-        return payload
-
-    def send(self, title: str, message: str, attempts: int = 3) -> dict:
-        if not self.configured():
-            return {"sent": False, "skipped": True, "reason": "未配置飞书机器人"}
-        last_error = ""
-        for attempt in range(1, max(1, attempts) + 1):
-            try:
-                response = self.session.post(
-                    self.webhook_url,
-                    json=self._payload(title, message),
-                    timeout=(5, 10),
-                )
-                response.raise_for_status()
-                body = response.json()
-                code = body.get("code", body.get("StatusCode", 0))
-                if code not in (0, "0", None):
-                    raise RuntimeError(body.get("msg") or body.get("StatusMessage") or str(body))
-                return {"sent": True, "attempts": attempt}
-            except Exception as exc:
-                last_error = str(exc)
-                if attempt < attempts:
-                    time.sleep(attempt)
-        return {"sent": False, "attempts": attempts, "error": last_error}
 
 
 def ensure_wechat_channels_available(detection_timeout=20.0, open_timeout=8.0, *, recover_browser=False) -> dict:
@@ -1548,7 +1462,9 @@ class PinchuangHub:
             )
 
 
-pinchuang_hub = PinchuangHub()
+# The retired module is not registered or scheduled by the application.
+# Do not construct its historical state when importing the shared engine.
+pinchuang_hub = None
 
 
 @pinchuang_bp.route("/config", methods=["GET"])

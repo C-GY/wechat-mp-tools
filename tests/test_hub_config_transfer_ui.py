@@ -192,16 +192,17 @@ class HubConfigTransferUiTests(HubConfigFixture):
         self.assertEqual(backup["config"]["transfer"], hub.config["transfer"])
         self.assertEqual(errors, [])
 
-    def test_guangce_navigation_save_progress_and_pause_are_independent(self):
+    def test_retired_navigation_is_absent_and_competitor_still_saves_and_pauses(self):
         page = self.browser.new_page(viewport={"width": 1440, "height": 1000})
         self.addCleanup(page.close)
-        errors = []
+        errors, requests = [], []
         page.on("pageerror", lambda error: errors.append(str(error)))
 
         def handle(route):
             request = route.request
             path = urlsplit(request.url).path
-            if path.startswith(("/api/guangce/", "/api/pinchuang/")):
+            requests.append(path)
+            if path.startswith("/api/competitor_monitor/"):
                 response = self.client.open(path, method=request.method, data=request.post_data, content_type="application/json")
                 route.fulfill(status=response.status_code, content_type="application/json", body=response.data)
             elif path.startswith("/api/"):
@@ -214,49 +215,42 @@ class HubConfigTransferUiTests(HubConfigFixture):
                     route.fulfill(status=404)
 
         page.route("https://hub-app.test/**", handle)
-        page.goto("https://hub-app.test/#channels_guangce")
-        page.wait_for_function("document.getElementById('guangce-db-host')?.value === 'guangce.example.invalid'")
-        self.assertEqual(page.locator(".page-title:visible").inner_text(), "广策中枢系统")
-        self.assertIn("active", page.locator("#nav-channels_guangce").get_attribute("class"))
-        self.assertEqual(page.locator(".guangce-stats-row .stat-card").count(), 7)
-        self.assertEqual(page.locator(".guangce-stats-row").evaluate("el => getComputedStyle(el).display"), "grid")
-        original_config = self.hubs["pinchuang"].config_path.read_bytes()
-        page.locator("#guangce-db-host").fill("new-guangce.example.invalid")
-        page.locator("#guangce-new-time").fill("22:15")
-        page.get_by_role("button", name="＋ 添加时间").click()
-        page.locator("#guangce-creator-interval").fill("45")
-        with page.expect_response("**/api/guangce/config") as saved:
-            page.locator("#btn-guangce-save-schedule").click()
+        page.goto("https://hub-app.test/#channels_competitor_monitor")
+        page.wait_for_function("document.getElementById('competitor_monitor-db-host')?.value === 'competitor.example.invalid'")
+        self.assertEqual(page.locator(".page-title:visible").inner_text(), "竞对监测系统")
+        for name in ('pinchuang', 'guangce', 'creative_radar'):
+            self.assertEqual(page.locator(f"#nav-channels_{name}").count(), 0)
+            self.assertFalse(page.evaluate("key => key in Router.routes", 'channels_' + name))
+            self.assertNotIn(f'/js/components/channels_{name}.js', requests)
+        self.assertEqual(page.evaluate("typeof ChannelsPinchuangPage"), 'undefined')
+        self.assertEqual(page.evaluate("typeof ChannelsGuangcePage"), 'undefined')
+        self.assertEqual(page.evaluate("typeof ChannelsCreativeRadarPage"), 'undefined')
+        original = {key: hub.config_path.read_bytes() for key, hub in self.hubs.items() if key != 'competitor_monitor'}
+        page.locator("#competitor_monitor-db-host").fill("new-competitor.example.invalid")
+        page.locator("#competitor_monitor-publish-mode").select_option('custom')
+        page.locator("#competitor_monitor-publish-before").fill('2026-09-01')
+        with page.expect_response("**/api/competitor_monitor/config") as saved:
+            page.locator("#btn-competitor_monitor-save-publish").click()
         self.assertEqual(saved.value.status, 200)
-        hub = self.hubs["guangce"]
-        self.assertEqual(hub.config["schedule"]["times"], ["09:00", "18:30", "22:15"])
-        self.assertEqual(hub.config["schedule"]["creator_interval_seconds"], 45)
-        self.assertEqual(hub.config["database"]["host"], "new-guangce.example.invalid")
-
+        hub = self.hubs['competitor_monitor']
+        self.assertEqual(hub.config['publish_filter'], {'mode': 'custom', 'before_date': '2026-09-01'})
         hub.worker = MagicMock()
         hub.worker.is_alive.return_value = True
         hub.state["current_run"] = {
-            "run_id": "guangce-ui-run", "status": "running", "phase": "uploading_oss",
+            "run_id": "competitor-ui-run", "sync_batch_id": "fixture-batch", "status": "running", "phase": "uploading_oss",
             "message": "正在同步 OSS：2/3", "total_creators": 2, "completed_creators": 1,
-            "current_creator_index": 2, "current_creator_name": "广策测试作者", "uploaded_videos": 2,
+            "current_creator_index": 2, "current_creator_name": "测试作者", "uploaded_videos": 2,
         }
-        page.evaluate("() => ChannelsGuangcePage.loadStatus()")
-        self.assertEqual(page.locator("#guangce-stat-creators").inner_text(), "2/2")
-        self.assertEqual(page.locator("#guangce-stat-creator-name").inner_text(), "广策测试作者")
-        self.assertEqual(page.locator("#guangce-stat-uploaded").inner_text(), "2")
-        with page.expect_response("**/api/guangce/runs/pause"):
-            page.locator("#btn-guangce-pause").click()
-        page.wait_for_function("document.getElementById('btn-guangce-pause').dataset.action === 'resume'")
-        self.assertEqual(hub.state["current_run"]["status"], "pausing")
-        with page.expect_response("**/api/guangce/runs/resume"):
-            page.locator("#btn-guangce-pause").click()
-        self.assertEqual(hub.state["current_run"]["status"], "running")
-
-        page.locator("#nav-channels_pinchuang").click()
-        page.wait_for_function("document.getElementById('pinchuang-db-host')?.value === 'db.example.invalid'")
-        page.locator("#nav-channels_guangce").click()
-        page.wait_for_function("Router.currentKey === 'channels_guangce'")
-        self.assertEqual(page.locator("#guangce-db-host").input_value(), "new-guangce.example.invalid")
-        self.assertEqual(self.hubs["pinchuang"].config_path.read_bytes(), original_config)
-        self.assertEqual(page.evaluate("() => { const ids = [...document.querySelectorAll('[id]')].map(el => el.id); return ids.length - new Set(ids).size; }"), 0)
+        page.evaluate("() => ChannelsCompetitorMonitorPage.loadStatus()")
+        self.assertEqual(page.locator("#competitor_monitor-stat-creator-name").inner_text(), "测试作者")
+        with page.expect_response("**/api/competitor_monitor/runs/pause"):
+            page.locator("#btn-competitor_monitor-pause").click()
+        page.wait_for_function("document.getElementById('btn-competitor_monitor-pause').dataset.action === 'resume'")
+        self.assertEqual(hub.state['current_run']['status'], 'pausing')
+        with page.expect_response("**/api/competitor_monitor/runs/resume"):
+            page.locator("#btn-competitor_monitor-pause").click()
+        self.assertEqual(hub.state['current_run']['status'], 'running')
+        self.assertFalse(any(path.startswith(('/api/pinchuang/', '/api/guangce/', '/api/creative-radar/')) for path in requests))
+        for key, before in original.items():
+            self.assertEqual(self.hubs[key].config_path.read_bytes(), before)
         self.assertEqual(errors, [])

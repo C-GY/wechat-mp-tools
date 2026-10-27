@@ -123,7 +123,8 @@ class CompetitorRecovery:
             if not plan:
                 raise ValueError("该任务没有可重试的失败项")
             return self.start_run(trigger="retry", run_options={"creator_plan": plan, "retry_selection": selected,
-                                  "retry_source_run_id": run_id, "sync_batch_id": source["sync_batch_id"]})
+                                  "retry_source_run_id": run_id, "sync_batch_id": source["sync_batch_id"],
+                                  "publish_filter": copy.deepcopy(source.get("publish_filter", {"mode": "all", "before_date": ""}))})
 
     def failure_page(self, run_id, author_id=None, offset=0, limit=50):
         with self.lock:

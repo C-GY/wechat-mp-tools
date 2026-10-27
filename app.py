@@ -38,7 +38,7 @@ import threading
 from pathlib import Path
 
 
-from flask import Flask, render_template, send_from_directory
+from flask import Flask, abort, render_template, send_from_directory
 from flask_cors import CORS
 
 from backend.runtime import configure_runtime, resource_dir
@@ -63,10 +63,8 @@ from backend.xiaohongshu_login import xhs_login_bp
 from backend.bilibili import bilibili_bp
 from backend.bilibili_login import bilibili_login_bp
 from backend.oss import oss_bp
-from backend.pinchuang import pinchuang_bp
-from backend.guangce import guangce_bp
 from backend.competitor_monitor import competitor_monitor_bp
-from backend.creative_radar import creative_radar_bp
+from backend.diagnostics_export import diagnostics_bp
 
 # ── Flask 应用 ────────────────────────────────────────────
 static_folder_path = resource_dir() / "frontend"
@@ -97,10 +95,8 @@ app.register_blueprint(xhs_login_bp)
 app.register_blueprint(bilibili_bp)
 app.register_blueprint(bilibili_login_bp)
 app.register_blueprint(oss_bp)
-app.register_blueprint(pinchuang_bp)
-app.register_blueprint(guangce_bp)
 app.register_blueprint(competitor_monitor_bp)
-app.register_blueprint(creative_radar_bp)
+app.register_blueprint(diagnostics_bp)
 
 
 # 账号池旧数据迁移
@@ -121,15 +117,9 @@ threading.Thread(target=prepare_channels_history, name="PrepareChannelsHistory",
 from backend.rss_scheduler import rss_scheduler
 rss_scheduler.start()
 
-# 启动各同步模块的多时点调度器（配置保存在系统用户目录）
-from backend.pinchuang import pinchuang_hub
-pinchuang_hub.start()
-from backend.guangce import guangce_hub
-guangce_hub.start()
+# 启动竞对监测的多时点调度器（配置保存在系统用户目录）
 from backend.competitor_monitor import competitor_monitor_hub
 competitor_monitor_hub.start()
-from backend.creative_radar import creative_radar_hub
-creative_radar_hub.start()
 
 
 
@@ -149,6 +139,8 @@ def serve_index():
 @app.route("/<path:path>")
 def serve_static(path):
     """静态文件"""
+    if path.startswith('api/'):
+        abort(404)
     file_path = Path(app.static_folder) / path
     if file_path.exists():
         return send_from_directory(app.static_folder, path)

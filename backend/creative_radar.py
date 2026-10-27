@@ -394,7 +394,8 @@ class CreativeRadarHub(pinchuang.PinchuangHub):
         }
 
 
-creative_radar_hub = CreativeRadarHub()
+# Historical implementation only; no application registration or startup.
+creative_radar_hub = None
 
 
 @creative_radar_bp.get("/config")

@@ -1,6 +1,6 @@
 """OSS configuration, upload service, and WeChat Channels sync queue.
 
-The endpoint is fixed; the bucket and access credentials are configured
+The endpoint, bucket and access credentials are configured
 independently. Configuration and successful-upload receipts live in the user's
 profile so reinstalling the application does not wipe them.
 """
@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import re
@@ -30,13 +31,15 @@ from backend.config import DATA_DIR, OUTPUT_DIR, get_settings, load_json, save_j
 from backend.channels_storage import locked_feeds, read_feeds, atomic_json, feed_store
 from collections.abc import Mapping
 from backend.oss_receipts import UploadReceipts
+from backend.profile_paths import persistent_config_dir
 from backend.sync_errors import IncompleteDownload, TransferHTTPError, error_details, transient_transfer_error
 
 
 oss_bp = Blueprint("oss", __name__, url_prefix="/api/oss")
 
 DEFAULT_OSS_ACCESS_KEY_ID = "marketing-video-dashboard"
-DEFAULT_OSS_ENDPOINT = "https://oss.fandow.com"
+DEFAULT_OSS_ENDPOINT = "https://minio.fandow.com"
+LEGACY_OSS_ENDPOINT = "https://oss.fandow.com"
 DEFAULT_OSS_REGION = "oss-cn-hangzhou"
 # Object-key-only records from older versions used this fixed bucket.
 LEGACY_OSS_BUCKET = "marketing-video-dashboard"
@@ -52,17 +55,6 @@ def validate_transfer_workers(value, label):
     if type(value) is not int or not 1 <= value <= 8:
         raise ValueError(f"{label}必须是 1 到 8 之间的整数")
     return value
-
-
-def persistent_config_dir() -> Path:
-    """Return a per-user config directory independent from the installation."""
-    if sys.platform == "win32":
-        base = Path(os.environ.get("APPDATA") or (Path.home() / "AppData" / "Roaming"))
-        return base / "Fandow" / "SelfMediaContentCollector"
-    if sys.platform == "darwin":
-        return Path.home() / "Library" / "Application Support" / "SelfMediaContentCollector"
-    base = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
-    return base / "self-media-content-collector"
 
 
 OSS_CONFIG_FILE = persistent_config_dir() / "oss_config.json"
@@ -86,19 +78,25 @@ def get_oss_config(*, include_secret: bool = False) -> dict:
     # became independent from the access key ID.
     bucket = str(raw.get("bucket", access_key_id) or "").strip()
     secret = str(raw.get("access_key_secret") or "").strip()
+    endpoint = str(raw.get("endpoint") or DEFAULT_OSS_ENDPOINT).strip()
     configuration_error = ""
+    endpoint_valid = False
     try:
+        endpoint = normalize_oss_endpoint(endpoint)
+        endpoint_valid = True
         _validate_access_key_id(access_key_id)
-        storage_base_url = build_oss_storage_url(bucket)
+        storage_base_url = build_oss_storage_url(bucket, endpoint)
     except ValueError as exc:
         # Keep old invalid configurations readable so the user can correct them.
         storage_base_url = ""
         configuration_error = str(exc)
+        if not endpoint_valid:
+            endpoint = DEFAULT_OSS_ENDPOINT
     result = {
         "access_key_id": access_key_id,
         "has_secret": bool(secret),
         "configured": bool(storage_base_url and secret),
-        "endpoint": DEFAULT_OSS_ENDPOINT,
+        "endpoint": endpoint,
         "bucket": bucket,
         "storage_base_url": storage_base_url,
         "configuration_error": configuration_error,
@@ -133,11 +131,37 @@ def _validate_bucket(value: str) -> str:
     return value
 
 
-def build_oss_storage_url(bucket: str) -> str:
-    return f"{DEFAULT_OSS_ENDPOINT}/{_validate_bucket(bucket)}"
+def normalize_oss_endpoint(value: str) -> str:
+    value = str(value or '').strip()
+    if not value or len(value) > 2048 or any(c.isspace() or c in '\\?#@%' for c in value):
+        raise ValueError("OSS 服务域名无效：仅支持 HTTP/HTTPS 域名和可选端口，不含账号、路径、参数或通配符")
+    try:
+        parsed = urlsplit(value if '://' in value else 'https://' + value)
+        if parsed.scheme not in {'http', 'https'} or parsed.path not in {'', '/'} or not parsed.hostname:
+            raise ValueError
+        port = parsed.port
+        if parsed.netloc.endswith(':') or (port is not None and not 1 <= port <= 65535):
+            raise ValueError
+        if (parsed.scheme, port) in {('https', 443), ('http', 80)}:
+            port = None
+        hostname = parsed.hostname.rstrip('.').encode('idna').decode('ascii').lower()
+        try:
+            address = ipaddress.ip_address(hostname)
+            hostname = f'[{address.compressed}]' if address.version == 6 else address.compressed
+        except ValueError:
+            if len(hostname) > 253 or any(not re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?', label) for label in hostname.split('.')):
+                raise ValueError
+        return f'{parsed.scheme}://{hostname}' + (f':{port}' if port is not None else '')
+    except (ValueError, UnicodeError):
+        raise ValueError("OSS 服务域名无效：请填写有效域名或 HTTP/HTTPS 地址，可包含端口，不包含路径或通配符") from None
 
 
-def save_oss_config(access_key_id: str, access_key_secret: str = "", bucket: str | None = None) -> dict:
+def build_oss_storage_url(bucket: str, endpoint: str = DEFAULT_OSS_ENDPOINT) -> str:
+    return f"{normalize_oss_endpoint(endpoint)}/{_validate_bucket(bucket)}"
+
+
+def prepare_oss_config(access_key_id: str, access_key_secret: str = "", bucket: str | None = None,
+                       endpoint: str | None = None) -> dict:
     access_key_id = _validate_access_key_id(access_key_id)
     current = get_oss_config(include_secret=True)
     if bucket is None:
@@ -145,6 +169,7 @@ def save_oss_config(access_key_id: str, access_key_secret: str = "", bucket: str
         # otherwise retain their former access-key-based destination.
         bucket = _read_raw_config().get("bucket", access_key_id)
     bucket = _validate_bucket(bucket)
+    endpoint = normalize_oss_endpoint(current['endpoint'] if endpoint is None else endpoint)
     secret = str(access_key_secret or "").strip()
     if not secret:
         if current["has_secret"] and current["access_key_id"] == access_key_id:
@@ -152,12 +177,18 @@ def save_oss_config(access_key_id: str, access_key_secret: str = "", bucket: str
         else:
             raise ValueError("请填写 OSS_ACCESS_KEY_SECRET")
     secret = _validate_credential(secret, "OSS_ACCESS_KEY_SECRET", 1024)
+    return {"access_key_id": access_key_id, "access_key_secret": secret, "bucket": bucket, "endpoint": endpoint}
+
+
+def save_oss_config(access_key_id: str, access_key_secret: str = "", bucket: str | None = None,
+                    endpoint: str | None = None) -> dict:
+    updated = prepare_oss_config(access_key_id, access_key_secret, bucket, endpoint)
 
     OSS_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
     temporary = OSS_CONFIG_FILE.with_suffix(f".{uuid.uuid4().hex}.tmp")
     temporary.write_text(
         json.dumps(
-            {"access_key_id": access_key_id, "access_key_secret": secret, "bucket": bucket},
+            updated,
             ensure_ascii=False,
             indent=2,
         ),
@@ -194,11 +225,13 @@ def build_oss_object_key(material_id: str, scraped_at=None) -> str:
     return f"{DEFAULT_OSS_OBJECT_PREFIX}/{material_id}.mp4"
 
 
-def build_oss_public_url(object_key: str, bucket: str | None = None) -> str:
-    if bucket is None:
-        bucket = get_oss_config()["bucket"]
+def build_oss_public_url(object_key: str, bucket: str | None = None, endpoint: str | None = None) -> str:
+    if bucket is None or endpoint is None:
+        config = get_oss_config()
+        bucket = config['bucket'] if bucket is None else bucket
+        endpoint = config['endpoint'] if endpoint is None else endpoint
     encoded_key = quote(str(object_key).strip("/"), safe="/-_.~")
-    return f"{build_oss_storage_url(bucket)}/{encoded_key}"
+    return f"{build_oss_storage_url(bucket, endpoint)}/{encoded_key}"
 
 
 def _legacy_upload_receipt(video_id, url, object_key="", bucket="", size=0):
@@ -207,8 +240,9 @@ def _legacy_upload_receipt(video_id, url, object_key="", bucket="", size=0):
     if not _SAFE_IDENTIFIER.fullmatch(video_id):
         return None
     try:
-        parsed, endpoint = urlsplit(url), urlsplit(DEFAULT_OSS_ENDPOINT)
-        if (parsed.scheme, parsed.netloc) != (endpoint.scheme, endpoint.netloc) or parsed.query or parsed.fragment:
+        parsed = urlsplit(url)
+        endpoint = normalize_oss_endpoint(f'{parsed.scheme}://{parsed.netloc}')
+        if parsed.query or parsed.fragment:
             return None
         url_bucket, key = unquote(parsed.path).lstrip("/").split("/", 1)
         _validate_bucket(url_bucket)
@@ -218,7 +252,7 @@ def _legacy_upload_receipt(video_id, url, object_key="", bucket="", size=0):
                 or key.rsplit("/", 1)[-1] != video_id + ".mp4"
                 or any(part in {".", "..", ""} for part in key.split("/"))):
             return None
-        return {"bucket": url_bucket, "object_key": key, "url": build_oss_public_url(key, url_bucket),
+        return {"endpoint": endpoint, "bucket": url_bucket, "object_key": key, "url": build_oss_public_url(key, url_bucket, endpoint),
                 "size": max(0, int(size or 0))}
     except (TypeError, ValueError):
         return None
@@ -246,9 +280,11 @@ class _ProgressFile:
 class OSSService:
     """Small dependency-free S3-compatible uploader using AWS Signature V4."""
 
-    def __init__(self, access_key_id: str, access_key_secret: str, session=None, *, bucket: str | None = None):
+    def __init__(self, access_key_id: str, access_key_secret: str, session=None, *, bucket: str | None = None,
+                 endpoint: str = DEFAULT_OSS_ENDPOINT):
         self.access_key_id = _validate_access_key_id(access_key_id)
         self.bucket = _validate_bucket(self.access_key_id if bucket is None else bucket)
+        self.endpoint = normalize_oss_endpoint(endpoint)
         self.access_key_secret = _validate_credential(
             access_key_secret, "OSS_ACCESS_KEY_SECRET", 1024
         )
@@ -261,7 +297,7 @@ class OSSService:
             raise ValueError(config["configuration_error"])
         if not config["configured"]:
             raise ValueError("请先配置 OSS_ACCESS_KEY_SECRET")
-        return cls(config["access_key_id"], config["access_key_secret"], bucket=config["bucket"])
+        return cls(config["access_key_id"], config["access_key_secret"], bucket=config["bucket"], endpoint=config.get("endpoint", DEFAULT_OSS_ENDPOINT))
 
     @staticmethod
     def _sha256_hex(value: bytes) -> str:
@@ -327,6 +363,73 @@ class OSSService:
             + (f": {body}" if body else ""), response.status_code
         )
 
+    @staticmethod
+    def _check_connection_response(response, operation):
+        if 200 <= response.status_code < 300:
+            return
+        match = re.search(r'<Code>([A-Za-z0-9]+)</Code>', str(getattr(response, 'text', '') or '')[:8192])
+        code = match.group(1) if match else ''
+        explanation = {
+            'InvalidAccessKeyId': '该服务不识别当前 Access Key，请核实账号是否已在此 MinIO 服务配置',
+            'SignatureDoesNotMatch': '签名不匹配，请核实 Secret 及电脑时间',
+            'AccessDenied': '当前账号或公开链接没有所需访问权限',
+            'NoSuchBucket': '配置的存储桶不存在',
+        }.get(code, '')
+        error = RuntimeError(f'OSS {operation}失败：HTTP {response.status_code}'
+                             + (f'（{code}）' if code else '') + (f'；{explanation}' if explanation else ''))
+        error.status_code, error.s3_error_code = response.status_code, code
+        raise error
+
+    def verify_connection(self):
+        """Upload only a unique diagnostic object, verify it, then remove it."""
+        key = f'{DEFAULT_OSS_OBJECT_PREFIX}/.connection-check/{uuid.uuid4().hex}.txt'
+        url = build_oss_public_url(key, self.bucket, self.endpoint)
+        content = b'SelfMediaContentCollector OSS connectivity check\n'
+        empty_hash = hashlib.sha256(b'').hexdigest()
+        may_exist, failure, cleanup_failure = False, None, None
+        try:
+            headers = self._sign_headers('PUT', url, hashlib.sha256(content).hexdigest(), 'text/plain')
+            may_exist = True
+            with self.session.put(url, data=content, headers=headers, timeout=(5, 15), allow_redirects=False) as response:
+                if response.status_code in (400, 401, 403, 404):
+                    may_exist = False  # A definitive rejection created no object.
+                self._check_connection_response(response, '临时文件上传')
+            with self.session.head(url, headers=self._sign_headers('HEAD', url, empty_hash),
+                                   timeout=(5, 10), allow_redirects=False) as response:
+                self._check_connection_response(response, '上传后校验')
+                if int(response.headers.get('Content-Length', -1)) != len(content):
+                    raise RuntimeError('OSS 上传后校验失败：远端文件大小与测试内容不一致')
+            with self.session.get(url, stream=True, timeout=(5, 10), allow_redirects=False) as response:
+                self._check_connection_response(response, '公开链接读取')
+                received = b''
+                for chunk in response.iter_content(chunk_size=512):
+                    received += chunk
+                    if len(received) > len(content):
+                        break
+                if received != content:
+                    raise RuntimeError('OSS 公开链接校验失败：读取内容与测试内容不一致')
+        except requests.RequestException as exc:
+            failure = RuntimeError(f'OSS 连接请求失败（{type(exc).__name__}），请检查服务地址、网络和证书')
+        except Exception as exc:
+            failure = exc
+        finally:
+            if may_exist:
+                try:
+                    with self.session.delete(url, headers=self._sign_headers('DELETE', url, empty_hash),
+                                             timeout=(5, 10), allow_redirects=False) as response:
+                        if response.status_code != 404:
+                            self._check_connection_response(response, '临时文件清理')
+                except Exception as exc:
+                    cleanup_failure = exc
+        if cleanup_failure:
+            # Never remove any business object to compensate for failed cleanup.
+            raise RuntimeError(f'OSS 临时文件清理未确认（{type(cleanup_failure).__name__}）；请检查测试对象 {key}'
+                               + (f'；{failure}' if failure else '')) from None
+        if failure:
+            raise failure
+        return {'verified': True, 'endpoint': self.endpoint, 'bucket': self.bucket,
+                'upload': True, 'read': True, 'cleanup': True, 'bytes': len(content)}
+
     def find_uploaded_video(self, material_id: str, scraped_at=None):
         """Reuse an existing public MP4 when this machine has no upload record.
 
@@ -334,7 +437,7 @@ class OSSService:
         back to the ordinary upload path; they never become stored video URLs.
         """
         object_key = build_oss_object_key(material_id, scraped_at)
-        target_url = build_oss_public_url(object_key, self.bucket)
+        target_url = build_oss_public_url(object_key, self.bucket, self.endpoint)
         try:
             with self.session.head(target_url, timeout=(5, 10)) as response:
                 if response.status_code != 200:
@@ -361,7 +464,7 @@ class OSSService:
             raise ValueError("待上传视频超过 OSS 单次 PUT 的 5 GiB 上限")
         object_key = build_oss_object_key(material_id, scraped_at)
         # Keep the target and signing credentials from the same config snapshot.
-        target_url = build_oss_public_url(object_key, self.bucket)
+        target_url = build_oss_public_url(object_key, self.bucket, self.endpoint)
 
         digest = hashlib.sha256()
         with file_path.open("rb") as source:
@@ -463,7 +566,11 @@ class OSSUploadManager:
                                                 task.get("total_bytes"))
                 if result:
                     records.append((str(task["video_id"]), result))
-            upload_receipts().save_many(DEFAULT_OSS_ENDPOINT, DEFAULT_OSS_OBJECT_PREFIX, records)
+            by_endpoint = {}
+            for video_id, result in records:
+                by_endpoint.setdefault(result['endpoint'], []).append((video_id, result))
+            for endpoint, grouped in by_endpoint.items():
+                upload_receipts().save_many(endpoint, DEFAULT_OSS_OBJECT_PREFIX, grouped)
             self._receipts_migrated = True
 
     def _load(self):
@@ -741,7 +848,7 @@ class OSSUploadManager:
 
         def service_for_thread():
             if not hasattr(local, "service"):
-                local.service = OSSService(access_key_id, secret, bucket=bucket)
+                local.service = OSSService(access_key_id, secret, bucket=bucket, endpoint=endpoint)
                 with self.lock:
                     services.append(local.service)
             return local.service
@@ -751,7 +858,7 @@ class OSSUploadManager:
             if existing and video.get("oss_upload_status") in (None, "", "completed"):
                 return None, {"url": existing, "object_key": video.get("oss_object_key", ""),
                               "bucket": video.get("oss_bucket", "")}
-            cached = upload_receipts().get(DEFAULT_OSS_ENDPOINT, bucket, DEFAULT_OSS_OBJECT_PREFIX, task["video_id"])
+            cached = upload_receipts().get(endpoint, bucket, DEFAULT_OSS_OBJECT_PREFIX, task["video_id"])
             if cached:
                 self._update(task["id"], reuse_source="local_cache")
                 return None, cached
@@ -789,6 +896,7 @@ class OSSUploadManager:
             initial = OSSService.from_saved_config()
             try:
                 access_key_id, secret, bucket = initial.access_key_id, initial.access_key_secret, initial.bucket
+                endpoint = initial.endpoint
             finally:
                 initial.session.close()
             with (ThreadPoolExecutor(max_workers=download_limit, thread_name_prefix="oss-download") as download_pool,
@@ -919,7 +1027,7 @@ class OSSUploadManager:
             temp_path = None
             stage = "persist"
             try:
-                cached = upload_receipts().get(DEFAULT_OSS_ENDPOINT, getattr(service, "bucket", None),
+                cached = upload_receipts().get(getattr(service, "endpoint", DEFAULT_OSS_ENDPOINT), getattr(service, "bucket", None),
                                                DEFAULT_OSS_OBJECT_PREFIX, task["video_id"])
                 if cached:
                     self._save_video_result(task, cached)
@@ -1065,10 +1173,12 @@ class OSSUploadManager:
 
         # Commit the verified receipt first, even if a fresh capture has no feed
         # row yet or mirroring the result back into the capture cache fails.
-        upload_receipts().save(DEFAULT_OSS_ENDPOINT, DEFAULT_OSS_OBJECT_PREFIX, task["video_id"], result)
+        parsed = urlsplit(result['url'])
+        endpoint = normalize_oss_endpoint(f'{parsed.scheme}://{parsed.netloc}')
+        upload_receipts().save(endpoint, DEFAULT_OSS_OBJECT_PREFIX, task["video_id"], result)
         feed_key = task.get("feed_key") or task.get("username")
         patch = {"oss_video_url":result["url"], "oss_object_key":result["object_key"],
-                 "oss_upload_status":"completed", "oss_uploaded_at":int(time.time())}
+                 "oss_upload_status":"completed", "oss_uploaded_at":int(time.time()), "oss_endpoint": endpoint}
         if result.get("bucket"):
             patch["oss_bucket"] = result["bucket"]
         feed_store(channels.CHANNELS_FEEDS_FILE).patch_existing(feed_key, task["video_id"], patch)
@@ -1090,6 +1200,7 @@ def save_config_endpoint():
             data.get("access_key_id") or data.get("accessKeyId"),
             data.get("access_key_secret") or data.get("accessKeySecret") or "",
             bucket=data.get("bucket"),
+            endpoint=data.get("endpoint"),
         )
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
@@ -1100,6 +1211,26 @@ def save_config_endpoint():
 def clear_config_endpoint():
     clear_oss_config()
     return jsonify({"message": "OSS 配置已清除", **get_oss_config()})
+
+
+@oss_bp.post('/test-connection')
+def test_connection_endpoint():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify(error='OSS 配置必须是一个对象'), 400
+    try:
+        config = prepare_oss_config(data.get('access_key_id'), data.get('access_key_secret', ''),
+                                    data.get('bucket'), data.get('endpoint'))
+        service = OSSService(config['access_key_id'], config['access_key_secret'], bucket=config['bucket'], endpoint=config['endpoint'])
+        try:
+            result = service.verify_connection()
+        finally:
+            service.session.close()
+        return jsonify(**result, message='OSS 验证通过：上传、公开读取和临时文件清理均成功')
+    except (ValueError, RuntimeError) as exc:
+        return jsonify(error=str(exc)), 400
+    except Exception as exc:
+        return jsonify(error=f'OSS 验证失败（{type(exc).__name__}）'), 500
 
 
 @oss_bp.route("/sync-favorites", methods=["POST"])

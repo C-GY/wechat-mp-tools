@@ -57,7 +57,8 @@ class GuangceHub(pinchuang.PinchuangHub):
         super().__init__(config_path, state_path, now=now)
 
 
-guangce_hub = GuangceHub()
+# Historical implementation only; no application registration or startup.
+guangce_hub = None
 
 
 @guangce_bp.get("/config")
